@@ -13,4 +13,6 @@ public interface LoginService extends IService<Users> {
     AuthVO login(LoginDTO loginDTO);
 
     UsersVO uploadAvatar(MultipartFile file) throws Exception;
+
+    String uploadArticleImage(MultipartFile file) throws Exception;
 }

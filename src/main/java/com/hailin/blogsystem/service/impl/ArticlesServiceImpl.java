@@ -24,6 +24,7 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
 
         Page<Articles> pageResult = lambdaQuery()
                 .eq(Articles::getStatus,BlogConstants.ArticlesStatus.PUBLISHED)
+                .eq(Articles::getStatus,BlogConstants.ArticlesStatus.PUBLISHED)
                 .orderByDesc(Articles::getCreatedAt)
                 .page(new Page<>(page,pageSize));
 
@@ -32,7 +33,7 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
                 .map(ArticleDetailVO::from)
                 .toList();
 
-        return new PageVO<ArticleDetailVO>(
+        return new PageVO<>(
                 list,
                 pageResult.getTotal(),
                 page,

@@ -40,7 +40,7 @@ public class UsersServiceImpl extends ServiceImpl<UsersMapper, Users>
     private final ArticlesService articlesService;
 
     @Override //获取我自己的文章列表，包含草稿和隐藏文章
-    public PageVO<ArticleDetailVO> getMyArticles(Long page,Long pageSize) {
+    public PageVO<ArticleDetailVO> getMyArticles(Long page,Long pageSize,Long status) {
         Long userId = UserContext.get();
 
         if(userId == null){
@@ -54,6 +54,7 @@ public class UsersServiceImpl extends ServiceImpl<UsersMapper, Users>
 
         Page<Articles> pageResult = articlesService.lambdaQuery()
                 .eq(Articles::getAuthorId,userId)
+                .eq(status!=null,Articles::getStatus,status)
                 .orderByDesc(Articles::getCreatedAt)
                 .page(new Page<>(page,pageSize));
 

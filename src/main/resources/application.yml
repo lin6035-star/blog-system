@@ -31,5 +31,5 @@ mybatis-plus:
 aliyun:
   oss:
     endpoint: https://oss-cn-beijing.aliyuncs.com
-    bucketName: java-webitheima
+    bucketName: blog-system-26
     region: cn-beijing

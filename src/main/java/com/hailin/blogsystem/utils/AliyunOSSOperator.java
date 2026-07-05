@@ -50,6 +50,34 @@ public class AliyunOSSOperator {
         return endpoint.split("//")[0] + "//" + bucketName + "." + endpoint.split("//")[1] + "/" + objectName;
     }
 
+    public String uploadArticleImage(Long userId,byte[] content,String originalFilename) throws Exception{
+        EnvironmentVariableCredentialsProvider credentialsProvider =
+                CredentialsProviderFactory.newEnvironmentVariableCredentialsProvider();
+
+        String extension = getExtension(originalFilename);
+        // 和头像的区别：上传到 articles/ 目录，而不是 avatars/
+        String objectName = "articles/" + userId + "/" + UUID.randomUUID() + extension;
+
+        ClientBuilderConfiguration config = new ClientBuilderConfiguration();
+        config.setSignatureVersion(SignVersion.V4);
+
+        OSS ossClient = OSSClientBuilder.create()
+                .endpoint(endpoint)
+                .credentialsProvider(credentialsProvider)
+                .clientConfiguration(config)
+                .region(region)
+                .build();
+
+        try {
+            ossClient.putObject(bucketName, objectName, new ByteArrayInputStream(content));
+        } finally {
+            ossClient.shutdown();
+        }
+
+        // 拼出完整的 OSS 访问 URL
+        return endpoint.split("//")[0] + "//" + bucketName + "." + endpoint.split("//")[1] + "/" + objectName;
+    }
+
     private String getExtension(String originalFilename) {
         if (originalFilename == null || !originalFilename.contains(".")) {
             return ".jpg";

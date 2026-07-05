@@ -28,8 +28,9 @@ public class UsersController {
 
     @GetMapping("/articles")  //2.获取我自己的文章列表，包含草稿和隐藏文章
     public Result<PageVO<ArticleDetailVO>> getMyArticles(@RequestParam(defaultValue = "1") Long page,
-                                                         @RequestParam(defaultValue = "10") Long pageSize){
-        PageVO<ArticleDetailVO> articleDetailVOList = usersService.getMyArticles(page,pageSize);
+                                                         @RequestParam(defaultValue = "10") Long pageSize,
+                                                         @RequestParam(required = false) Long status){
+        PageVO<ArticleDetailVO> articleDetailVOList = usersService.getMyArticles(page,pageSize,status);
 
         return Result.success(articleDetailVOList);
     }

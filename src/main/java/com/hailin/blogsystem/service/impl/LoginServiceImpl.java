@@ -12,6 +12,7 @@ import com.hailin.blogsystem.mapper.LoginMapper;
 import com.hailin.blogsystem.service.LoginService;
 import com.hailin.blogsystem.utils.AliyunOSSOperator;
 import com.hailin.blogsystem.utils.JwtUtil;
+import com.hailin.blogsystem.utils.Result;
 import com.hailin.blogsystem.utils.UserContext;
 import lombok.RequiredArgsConstructor;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
@@ -109,6 +110,39 @@ public class LoginServiceImpl extends ServiceImpl<LoginMapper, Users>
         updateById(user);
 
         return UsersVO.from(user);
+    }
+
+
+    @Override
+    public String uploadArticleImage(MultipartFile file) throws Exception {
+
+        Long userId = UserContext.get();
+
+        if (userId == null) {
+            throw new BusinessException(BlogConstants.ErrorCode.UNAUTHORIZED,"请先登录");
+        }
+
+        if (file == null || file.isEmpty()) {
+            throw new BusinessException(BlogConstants.ErrorCode.BAD_REQUEST,"请选择图片文件");
+        }
+
+        //只允许图片上传
+        String contentType = file.getContentType();
+        if(contentType == null || !contentType.startsWith("image/")){
+            throw new BusinessException(BlogConstants.ErrorCode.BAD_REQUEST,"只能上传图片文件");
+        }
+
+        //大小限制
+        if(file.getSize() > 10*1024*1024){
+            throw new BusinessException(BlogConstants.ErrorCode.BAD_REQUEST,"图片不能超过 10MB");
+        }
+
+        String url = aliyunOSSOperator.uploadArticleImage(
+                userId,
+                file.getBytes(),
+                file.getOriginalFilename()
+        );
+        return url;
     }
 
 

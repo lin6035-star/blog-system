@@ -9,5 +9,5 @@ import com.hailin.blogsystem.entity.vo.UsersVO;
 public interface UsersService extends IService<Users> {
     UsersVO getUsersInfo();
 
-    PageVO<ArticleDetailVO> getMyArticles(Long page,Long pageSize);
+    PageVO<ArticleDetailVO> getMyArticles(Long page,Long pageSize,Long status);
 }
