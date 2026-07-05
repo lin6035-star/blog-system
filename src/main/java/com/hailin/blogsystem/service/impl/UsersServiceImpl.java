@@ -2,6 +2,7 @@ package com.hailin.blogsystem.service.impl;
 
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.hailin.blogsystem.constants.BlogConstants;
 import com.hailin.blogsystem.entity.Articles;
 import com.hailin.blogsystem.entity.Users;
 import com.hailin.blogsystem.entity.vo.ArticleDetailVO;
@@ -55,6 +56,7 @@ public class UsersServiceImpl extends ServiceImpl<UsersMapper, Users>
         Page<Articles> pageResult = articlesService.lambdaQuery()
                 .eq(Articles::getAuthorId,userId)
                 .eq(status!=null,Articles::getStatus,status)
+                .ne(status==null,Articles::getStatus,BlogConstants.ArticlesStatus.DRAFT)
                 .orderByDesc(Articles::getCreatedAt)
                 .page(new Page<>(page,pageSize));
 

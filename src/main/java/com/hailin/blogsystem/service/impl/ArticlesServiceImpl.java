@@ -20,12 +20,15 @@ import java.util.List;
 public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> implements ArticlesService {
 
     @Override
-    public PageVO<ArticleDetailVO> getArticles(Long page, Long pageSize) {  //1.获取公开文章列表
+    public PageVO<ArticleDetailVO> getArticles(Long page, Long pageSize, String keyword, Long categoryId, String sort) {  //1.获取公开文章列表
 
         Page<Articles> pageResult = lambdaQuery()
-                .eq(Articles::getStatus,BlogConstants.ArticlesStatus.PUBLISHED)
-                .eq(Articles::getStatus,BlogConstants.ArticlesStatus.PUBLISHED)
-                .orderByDesc(Articles::getCreatedAt)
+                .eq(Articles::getStatus, BlogConstants.ArticlesStatus.PUBLISHED)
+                .like(keyword != null, Articles::getTitle, keyword)
+                .eq(categoryId != null, Articles::getCategoryId, categoryId)
+                .orderByDesc("recommend".equals(sort), Articles::getViewCount)
+                .orderByDesc(!"recommend".equals(sort), Articles::getPublishedAt)
+                .orderByDesc(Articles::getId)
                 .page(new Page<>(page,pageSize));
 
         List<ArticleDetailVO> list = pageResult.getRecords()
@@ -47,6 +50,15 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
                 .eq(Articles::getId, id)
                 .eq(Articles::getStatus, BlogConstants.ArticlesStatus.PUBLISHED)
                 .one();
+
+        if (article != null) {
+            Long userId = UserContext.get();
+            if (userId != null && !userId.equals(article.getAuthorId())) {
+                int viewCount = article.getViewCount() == null ? 0 : article.getViewCount();
+                article.setViewCount(viewCount + 1);
+                updateById(article);
+            }
+        }
 
         return ArticleDetailVO.from(article);
     }
@@ -73,7 +85,7 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
 
 
     @Override
-    public void writeArticle(ArticlesDTO articlesDTO) {
+    public Long writeArticle(ArticlesDTO articlesDTO) {
         Articles articles = new Articles();
         BeanUtil.copyProperties(articlesDTO,articles);
 
@@ -82,6 +94,7 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
         articles.setUpdatedAt(LocalDateTime.now());
 
         save(articles);
+        return articles.getId();
     }
 
 

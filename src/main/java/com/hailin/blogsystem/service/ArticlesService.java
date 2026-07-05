@@ -12,11 +12,11 @@ import java.util.List;
 public interface ArticlesService extends IService<Articles>{
     ArticleDetailVO getPublicArticleById(Long id);
 
-    PageVO<ArticleDetailVO> getArticles(Long page, Long pageSize);
+    PageVO<ArticleDetailVO> getArticles(Long page, Long pageSize, String keyword, Long categoryId, String sort);
 
     ArticleDetailVO getArticlesById(Long id);
 
-    void writeArticle(ArticlesDTO articlesDTO);
+    Long writeArticle(ArticlesDTO articlesDTO);
 
     void updateArticle(Long id, ArticlesDTO articlesDTO);
 

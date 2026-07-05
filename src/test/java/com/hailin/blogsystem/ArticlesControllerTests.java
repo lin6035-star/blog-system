@@ -1,5 +1,9 @@
 package com.hailin.blogsystem;
 
+import com.hailin.blogsystem.entity.Articles;
+import com.hailin.blogsystem.service.ArticlesService;
+import com.hailin.blogsystem.utils.JwtUtil;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
@@ -18,6 +22,19 @@ class ArticlesControllerTests {
     @Autowired
     private MockMvc mockMvc;
 
+    @Autowired
+    private ArticlesService articlesService;
+
+    @Autowired
+    private JwtUtil jwtUtil;
+
+    @BeforeEach
+    void resetViewCounts() {
+        Articles article = articlesService.getById(1L);
+        article.setViewCount(12);
+        articlesService.updateById(article);
+    }
+
     @Test
     void getsPublishedArticlesPage() throws Exception {
         mockMvc.perform(get("/api/articles")
@@ -25,11 +42,55 @@ class ArticlesControllerTests {
                         .param("pageSize", "10"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.code").value(0))
-                .andExpect(jsonPath("$.data.list", hasSize(1)))
-                .andExpect(jsonPath("$.data.list[0].id").value(1))
-                .andExpect(jsonPath("$.data.total").value(1))
+                .andExpect(jsonPath("$.data.list", hasSize(3)))
+                .andExpect(jsonPath("$.data.list[0].id").value(4))
+                .andExpect(jsonPath("$.data.total").value(3))
                 .andExpect(jsonPath("$.data.page").value(1))
                 .andExpect(jsonPath("$.data.pageSize").value(10));
+    }
+
+    @Test
+    void filtersPublishedArticlesByCategoryId() throws Exception {
+        mockMvc.perform(get("/api/articles")
+                        .param("page", "1")
+                        .param("pageSize", "10")
+                        .param("categoryId", "10"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(0))
+                .andExpect(jsonPath("$.data.list", hasSize(3)))
+                .andExpect(jsonPath("$.data.total").value(3));
+
+        mockMvc.perform(get("/api/articles")
+                        .param("page", "1")
+                        .param("pageSize", "10")
+                        .param("categoryId", "2"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(0))
+                .andExpect(jsonPath("$.data.list", hasSize(0)))
+                .andExpect(jsonPath("$.data.total").value(0));
+    }
+
+    @Test
+    void sortsPublishedArticlesWithinCategory() throws Exception {
+        mockMvc.perform(get("/api/articles")
+                        .param("page", "1")
+                        .param("pageSize", "10")
+                        .param("categoryId", "10")
+                        .param("sort", "recommend"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(0))
+                .andExpect(jsonPath("$.data.list[0].id").value(3))
+                .andExpect(jsonPath("$.data.list[0].viewCount").value(100));
+
+        mockMvc.perform(get("/api/articles")
+                        .param("page", "1")
+                        .param("pageSize", "10")
+                        .param("categoryId", "10")
+                        .param("sort", "latest"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(0))
+                .andExpect(jsonPath("$.data.list[0].id").value(4))
+                .andExpect(jsonPath("$.data.list[0].publishedAt").value("2026-07-03T10:00:00"));
     }
 
     @Test
@@ -40,6 +101,42 @@ class ArticlesControllerTests {
                 .andExpect(jsonPath("$.data.id").value(1))
                 .andExpect(jsonPath("$.data.title").value("Published Article"))
                 .andExpect(jsonPath("$.data.content").value("Published content"));
+    }
+
+    @Test
+    void doesNotIncreaseViewCountForAnonymousVisitor() throws Exception {
+        mockMvc.perform(get("/api/articles/1"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(0));
+
+        Articles article = articlesService.getById(1L);
+        org.assertj.core.api.Assertions.assertThat(article.getViewCount()).isEqualTo(12);
+    }
+
+    @Test
+    void doesNotIncreaseViewCountForAuthor() throws Exception {
+        String authorToken = jwtUtil.generateToken(100L);
+
+        mockMvc.perform(get("/api/articles/1")
+                        .header("Authorization", "Bearer " + authorToken))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(0));
+
+        Articles article = articlesService.getById(1L);
+        org.assertj.core.api.Assertions.assertThat(article.getViewCount()).isEqualTo(12);
+    }
+
+    @Test
+    void increasesViewCountForLoggedInNonAuthor() throws Exception {
+        String readerToken = jwtUtil.generateToken(101L);
+
+        mockMvc.perform(get("/api/articles/1")
+                        .header("Authorization", "Bearer " + readerToken))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(0));
+
+        Articles article = articlesService.getById(1L);
+        org.assertj.core.api.Assertions.assertThat(article.getViewCount()).isEqualTo(13);
     }
 
     @Test

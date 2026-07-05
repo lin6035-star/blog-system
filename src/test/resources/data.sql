@@ -14,6 +14,22 @@ INSERT INTO articles (
     0, 0, NULL, '2026-07-02 09:00:00', '2026-07-02 09:30:00', NULL
 );
 
+INSERT INTO articles (
+    id, category_id, author_id, title, summary, content, cover_url,
+    status, view_count, published_at, created_at, updated_at, deleted_at
+) VALUES (
+    3, 10, 100, 'Popular Article', 'Popular summary', 'Popular content', NULL,
+    1, 100, '2026-07-01 10:00:00', '2026-07-01 09:00:00', '2026-07-01 09:30:00', NULL
+);
+
+INSERT INTO articles (
+    id, category_id, author_id, title, summary, content, cover_url,
+    status, view_count, published_at, created_at, updated_at, deleted_at
+) VALUES (
+    4, 10, 100, 'Latest Article', 'Latest summary', 'Latest content', NULL,
+    1, 1, '2026-07-03 10:00:00', '2026-07-03 09:00:00', '2026-07-03 09:30:00', NULL
+);
+
 INSERT INTO categories (id, name, code, description, sort_order, created_at, updated_at)
 VALUES (1, 'Backend', 'backend', 'Java backend content', 2, '2026-07-02 09:00:00', '2026-07-02 09:00:00');
 

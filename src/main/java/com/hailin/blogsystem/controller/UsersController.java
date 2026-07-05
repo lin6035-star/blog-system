@@ -44,9 +44,8 @@ public class UsersController {
 
     @PostMapping("/articles")  //4.创建文章
     public Result writeArticle(@RequestBody ArticlesDTO articlesDTO){
-        articlesService.writeArticle(articlesDTO);
-
-        return Result.success();
+        Long id = articlesService.writeArticle(articlesDTO);
+        return Result.success(id);
     }
 
     @PutMapping("/articles/{id}")  //5.更新自己的文章

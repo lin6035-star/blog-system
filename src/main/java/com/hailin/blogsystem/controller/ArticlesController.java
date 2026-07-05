@@ -17,8 +17,11 @@ public class ArticlesController {
 
     @GetMapping("/articles")
     public Result<PageVO<ArticleDetailVO>> getArticles(@RequestParam(defaultValue = "1") Long page,
-                                                       @RequestParam(defaultValue = "10") Long pageSize){  //1.获取公开文章列表
-        PageVO<ArticleDetailVO> data = articlesService.getArticles(page,pageSize);
+                                                       @RequestParam(defaultValue = "10") Long pageSize,
+                                                       @RequestParam(required = false) String keyword,
+                                                       @RequestParam(required = false) Long categoryId,
+                                                       @RequestParam(defaultValue = "latest") String sort){  //1.获取公开文章列表
+        PageVO<ArticleDetailVO> data = articlesService.getArticles(page,pageSize,keyword,categoryId,sort);
 
         return Result.success(data);
     }
