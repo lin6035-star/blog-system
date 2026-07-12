@@ -5,19 +5,32 @@ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hailin.blogsystem.constants.BlogConstants;
 import com.hailin.blogsystem.entity.Articles;
+import com.hailin.blogsystem.entity.Category;
+import com.hailin.blogsystem.entity.Users;
 import com.hailin.blogsystem.entity.dto.ArticlesDTO;
 import com.hailin.blogsystem.entity.vo.PageVO;
 import com.hailin.blogsystem.mapper.ArticlesMapper;
+import com.hailin.blogsystem.mapper.CategoryMapper;
+import com.hailin.blogsystem.mapper.UsersMapper;
 import com.hailin.blogsystem.service.ArticlesService;
 import com.hailin.blogsystem.entity.vo.ArticleDetailVO;
 import com.hailin.blogsystem.utils.UserContext;
+import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 @Service
+@RequiredArgsConstructor
 public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> implements ArticlesService {
+
+    private final UsersMapper usersMapper;
+    private final CategoryMapper categoryMapper;
 
     @Override
     public PageVO<ArticleDetailVO> getArticles(Long page, Long pageSize, String keyword, Long categoryId, String sort) {  //1.获取公开文章列表
@@ -35,6 +48,7 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
                 .stream()
                 .map(ArticleDetailVO::from)
                 .toList();
+        fillArticleMeta(list);
 
         return new PageVO<>(
                 list,
@@ -60,7 +74,9 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
             }
         }
 
-        return ArticleDetailVO.from(article);
+        ArticleDetailVO vo = ArticleDetailVO.from(article);
+        fillArticleMeta(vo);
+        return vo;
     }
 
 
@@ -83,6 +99,53 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
         return articlesVO;
     }
 
+    private void fillArticleMeta(ArticleDetailVO article) {
+        if (article == null) {
+            return;
+        }
+        fillArticleMeta(List.of(article));
+    }
+
+    private void fillArticleMeta(List<ArticleDetailVO> articles) {
+        if (articles == null || articles.isEmpty()) {
+            return;
+        }
+
+        List<Long> authorIds = articles.stream()
+                .map(ArticleDetailVO::getAuthorId)
+                .filter(Objects::nonNull)
+                .distinct()
+                .toList();
+        List<Long> categoryIds = articles.stream()
+                .map(ArticleDetailVO::getCategoryId)
+                .filter(Objects::nonNull)
+                .distinct()
+                .toList();
+
+        Map<Long, Users> usersById = authorIds.isEmpty()
+                ? Map.of()
+                : usersMapper.selectBatchIds(authorIds)
+                .stream()
+                .collect(Collectors.toMap(Users::getId, Function.identity()));
+        Map<Long, Category> categoriesById = categoryIds.isEmpty()
+                ? Map.of()
+                : categoryMapper.selectBatchIds(categoryIds)
+                .stream()
+                .collect(Collectors.toMap(Category::getId, Function.identity()));
+
+        for (ArticleDetailVO article : articles) {
+            Users author = usersById.get(article.getAuthorId());
+            if (author != null) {
+                article.setAuthorName(author.getNickname());
+            }
+
+            Category category = categoriesById.get(article.getCategoryId());
+            if (category != null) {
+                article.setCategoryName(category.getName());
+            }
+        }
+    }
+
 
     @Override
     public Long writeArticle(ArticlesDTO articlesDTO) {
@@ -92,6 +155,8 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
         articles.setAuthorId(UserContext.get());
         articles.setCreatedAt(LocalDateTime.now());
         articles.setUpdatedAt(LocalDateTime.now());
+        articles.setPublishedAt(null);
+        syncPublishedAt(articles);
 
         save(articles);
         return articles.getId();
@@ -110,10 +175,13 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
             throw new IllegalArgumentException("无权操作该文章");
         }
 
+        LocalDateTime previousPublishedAt = articles.getPublishedAt();
         BeanUtil.copyProperties(articlesDTO,articles);
 
         articles.setUpdatedAt(LocalDateTime.now());
         articles.setAuthorId(UserContext.get());
+        articles.setPublishedAt(previousPublishedAt);
+        syncPublishedAt(articles);
 
         updateById(articles);
     }
@@ -170,5 +238,12 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
         articles.setPublishedAt(LocalDateTime.now());
 
         updateById(articles);
+    }
+
+    private void syncPublishedAt(Articles articles) {
+        if (Objects.equals(articles.getStatus(), BlogConstants.ArticlesStatus.PUBLISHED)
+                && articles.getPublishedAt() == null) {
+            articles.setPublishedAt(LocalDateTime.now());
+        }
     }
 }

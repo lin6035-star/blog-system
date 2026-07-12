@@ -2,6 +2,7 @@ package com.hailin.blogsystem.utils;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import javax.crypto.Mac;
@@ -14,7 +15,11 @@ import java.util.Base64;
 @Component
 public class JwtUtil {
 
-    private static final String SECRET = "blog-system-dev-secret-change-later";
+    private final String secret;
+
+    public JwtUtil(@Value("${jwt.secret}") String secret) {
+        this.secret = secret;
+    }
     private static final Duration EXPIRE_TIME = Duration.ofDays(7);
     private static final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -67,7 +72,7 @@ public class JwtUtil {
     private String sign(String data) {
         try {
             Mac mac = Mac.getInstance("HmacSHA256");
-            SecretKeySpec keySpec = new SecretKeySpec(SECRET.getBytes(StandardCharsets.UTF_8), "HmacSHA256");
+            SecretKeySpec keySpec = new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256");
             mac.init(keySpec);
             byte[] signature = mac.doFinal(data.getBytes(StandardCharsets.UTF_8));
             return Base64.getUrlEncoder().withoutPadding().encodeToString(signature);

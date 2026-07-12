@@ -8,10 +8,12 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
 
 import static org.hamcrest.Matchers.hasSize;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -44,9 +46,46 @@ class ArticlesControllerTests {
                 .andExpect(jsonPath("$.code").value(0))
                 .andExpect(jsonPath("$.data.list", hasSize(3)))
                 .andExpect(jsonPath("$.data.list[0].id").value(4))
+                .andExpect(jsonPath("$.data.list[0].authorName").value("Author Nick"))
+                .andExpect(jsonPath("$.data.list[0].categoryName").value("Backend"))
                 .andExpect(jsonPath("$.data.total").value(3))
                 .andExpect(jsonPath("$.data.page").value(1))
                 .andExpect(jsonPath("$.data.pageSize").value(10));
+    }
+
+    @Test
+    void createsPublishedArticleWithPublishedAt() throws Exception {
+        String authorToken = jwtUtil.generateToken(100L);
+
+        try {
+            mockMvc.perform(post("/api/users/me/articles")
+                            .header("Authorization", "Bearer " + authorToken)
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content("""
+                                    {
+                                      "categoryId": 1,
+                                      "title": "New Published Article",
+                                      "summary": "New summary",
+                                      "content": "New content",
+                                      "coverUrl": "",
+                                      "status": 1
+                                    }
+                                    """))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.code").value(0))
+                    .andExpect(jsonPath("$.data").isNumber());
+
+            Articles article = articlesService.lambdaQuery()
+                    .eq(Articles::getTitle, "New Published Article")
+                    .one();
+
+            org.assertj.core.api.Assertions.assertThat(article.getStatus()).isEqualTo(1);
+            org.assertj.core.api.Assertions.assertThat(article.getPublishedAt()).isNotNull();
+        } finally {
+            articlesService.lambdaUpdate()
+                    .eq(Articles::getTitle, "New Published Article")
+                    .remove();
+        }
     }
 
     @Test
@@ -54,7 +93,7 @@ class ArticlesControllerTests {
         mockMvc.perform(get("/api/articles")
                         .param("page", "1")
                         .param("pageSize", "10")
-                        .param("categoryId", "10"))
+                        .param("categoryId", "1"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.code").value(0))
                 .andExpect(jsonPath("$.data.list", hasSize(3)))
@@ -75,7 +114,7 @@ class ArticlesControllerTests {
         mockMvc.perform(get("/api/articles")
                         .param("page", "1")
                         .param("pageSize", "10")
-                        .param("categoryId", "10")
+                        .param("categoryId", "1")
                         .param("sort", "recommend"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.code").value(0))
@@ -85,7 +124,7 @@ class ArticlesControllerTests {
         mockMvc.perform(get("/api/articles")
                         .param("page", "1")
                         .param("pageSize", "10")
-                        .param("categoryId", "10")
+                        .param("categoryId", "1")
                         .param("sort", "latest"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.code").value(0))
@@ -100,6 +139,8 @@ class ArticlesControllerTests {
                 .andExpect(jsonPath("$.code").value(0))
                 .andExpect(jsonPath("$.data.id").value(1))
                 .andExpect(jsonPath("$.data.title").value("Published Article"))
+                .andExpect(jsonPath("$.data.authorName").value("Author Nick"))
+                .andExpect(jsonPath("$.data.categoryName").value("Backend"))
                 .andExpect(jsonPath("$.data.content").value("Published content"));
     }
 

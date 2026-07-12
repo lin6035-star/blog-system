@@ -27,6 +27,10 @@ mybatis-plus:
     map-underscore-to-camel-case: true
     log-impl: org.apache.ibatis.logging.stdout.StdOutImpl # 可选：打印SQL，方便调试
 
+# JWT
+jwt:
+  secret: blog-system-dev-secret-change-later
+
 # 阿里云OSS
 aliyun:
   oss:

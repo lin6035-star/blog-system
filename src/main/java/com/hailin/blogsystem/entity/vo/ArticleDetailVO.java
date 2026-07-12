@@ -11,6 +11,8 @@ public class ArticleDetailVO {
     private Long id;
     private Long categoryId;
     private Long authorId;
+    private String authorName;
+    private String categoryName;
     private String title;
     private String summary;
     private String content;
