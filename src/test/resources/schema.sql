@@ -1,4 +1,6 @@
 DROP TABLE IF EXISTS article_tags;
+DROP TABLE IF EXISTS comment_likes;
+DROP TABLE IF EXISTS article_comments;
 DROP TABLE IF EXISTS articles;
 DROP TABLE IF EXISTS categories;
 DROP TABLE IF EXISTS users;
@@ -40,4 +42,26 @@ CREATE TABLE users (
     created_at TIMESTAMP,
     updated_at TIMESTAMP,
     deleted_at TIMESTAMP
+);
+
+CREATE TABLE article_comments (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    article_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    content VARCHAR(2000) NOT NULL,
+    root_id BIGINT,
+    parent_id BIGINT,
+    ip VARCHAR(45),
+    ip_location VARCHAR(100),
+    like_count BIGINT,
+    created_at TIMESTAMP,
+    deleted_at TIMESTAMP,
+    deleted_by BIGINT
+);
+
+CREATE TABLE comment_likes (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    comment_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    created_at TIMESTAMP
 );

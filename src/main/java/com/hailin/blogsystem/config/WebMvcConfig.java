@@ -20,10 +20,16 @@ public class WebMvcConfig implements WebMvcConfigurer {
     @Override
     public void addInterceptors(InterceptorRegistry registry) {
         registry.addInterceptor(optionalJwtInterceptor)
-                .addPathPatterns("/api/articles/**");
+                .addPathPatterns(
+                        "/api/articles/**",
+                        "/api/comments/*/replies"
+                );
 
         registry.addInterceptor(jwtInterceptor)
-                .addPathPatterns("/api/users/me/**")   // 需要登录的接口
-                .excludePathPatterns();                  // 子路径内没有例外
+                .addPathPatterns(
+                        "/api/users/me/**",
+                        "/api/comments/**"
+                )
+                .excludePathPatterns("/api/comments/*/replies");
     }
 }
