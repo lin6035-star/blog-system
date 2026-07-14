@@ -5,13 +5,12 @@ import com.hailin.blogsystem.entity.dto.CommentDTO;
 import com.hailin.blogsystem.entity.vo.CommentsVO;
 import com.hailin.blogsystem.entity.vo.PageVO;
 import com.hailin.blogsystem.service.CommentsService;
+import com.hailin.blogsystem.utils.ClientIpUtils;
 import com.hailin.blogsystem.utils.Result;
 import com.hailin.blogsystem.utils.UserContext;
+import jakarta.servlet.http.HttpServletRequest;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.*;
-
-import java.time.LocalDateTime;
-import java.util.List;
 
 @RestController
 @RequestMapping("/api")
@@ -37,13 +36,16 @@ public class CommentsController {
     }
 
     @PostMapping("/articles/{articleId}/comments")  //3.发表评论或回复评论，登录用户可访问
-    public Result postComment(@PathVariable Long articleId, @RequestBody CommentDTO commentDTO){
+    public Result postComment(@PathVariable Long articleId, @RequestBody CommentDTO commentDTO,
+                              HttpServletRequest request){
         Long userId = UserContext.get();
         if(userId == null){
             return Result.error(BlogConstants.ErrorCode.LOGIN_FAILED,"请先登录!");
         }
 
-        commentsService.postComment(articleId,commentDTO);
+        String clientIp = ClientIpUtils.getClientIp(request);
+        String cloudflareCountryCode = request.getHeader("CF-IPCountry");
+        commentsService.postComment(articleId,commentDTO,clientIp,cloudflareCountryCode);
 
         return Result.success();
     }

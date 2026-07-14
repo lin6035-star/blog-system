@@ -20,6 +20,7 @@ public class ArticleDetailVO {
     private Integer status;
     private Integer viewCount;
     private LocalDateTime publishedAt;
+    private Long commentCount = 0L;
 
     public static ArticleDetailVO from(Articles article) {
         if (article == null) {

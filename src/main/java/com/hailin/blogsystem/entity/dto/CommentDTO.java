@@ -7,7 +7,5 @@ public class CommentDTO {
 
     private String content;
     private Long parentId;
-    private String ip;
-    private String ipLocation;
 
 }

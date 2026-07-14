@@ -11,7 +11,7 @@ public interface CommentsService extends IService<ArticleComments> {
 
     PageVO<CommentsVO> queryMoreComments(Long rootId, Long page, Long pageSize);
 
-    void postComment(Long articleId, CommentDTO commentDTO);
+    void postComment(Long articleId, CommentDTO commentDTO, String clientIp, String cloudflareCountryCode);
 
     void deleteComment(Long commentId);
 }

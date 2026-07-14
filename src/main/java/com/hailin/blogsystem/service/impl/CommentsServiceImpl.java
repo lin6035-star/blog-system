@@ -16,6 +16,7 @@ import com.hailin.blogsystem.mapper.CommentsMapper;
 import com.hailin.blogsystem.mapper.LikeCommentsMapper;
 import com.hailin.blogsystem.mapper.UsersMapper;
 import com.hailin.blogsystem.service.CommentsService;
+import com.hailin.blogsystem.service.IpLocationService;
 import com.hailin.blogsystem.utils.UserContext;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
@@ -32,12 +33,14 @@ public class CommentsServiceImpl extends ServiceImpl<CommentsMapper, ArticleComm
     private final UsersMapper usersMapper;
     private final LikeCommentsMapper likeCommentsMapper;
     private final ArticlesMapper articlesMapper;
+    private final IpLocationService ipLocationService;
 
     @Override  //1.获取文章评论列表，游客可访问，每条主评论带前几条回复
     public PageVO<CommentsVO> getComments(Long articleId, Long page, Long pageSize, String sort) {
 
         Page<ArticleComments> pageResult = lambdaQuery()
                 .eq(ArticleComments::getArticleId, articleId)
+                .orderByDesc("hot".equals(sort),ArticleComments::getLikeCount)
                 .orderByDesc(ArticleComments::getCreatedAt)
                 .isNull(ArticleComments::getParentId)
                 .page(new Page<>(page, pageSize));
@@ -78,6 +81,7 @@ public class CommentsServiceImpl extends ServiceImpl<CommentsMapper, ArticleComm
             );
 
             List<CommentsVO> replies = replyEntities.stream()
+                    .limit(4)
                     .map(CommentsVO::from)
                     .toList();
 
@@ -168,7 +172,8 @@ public class CommentsServiceImpl extends ServiceImpl<CommentsMapper, ArticleComm
 
 
     @Override  //3.发表评论或回复评论，登录用户可访问
-    public void postComment(Long articleId, CommentDTO commentDTO) {
+    public void postComment(Long articleId, CommentDTO commentDTO, String clientIp,
+                            String cloudflareCountryCode) {
         ArticleComments articleComments = new ArticleComments();
         BeanUtil.copyProperties(commentDTO,articleComments);
 
@@ -195,6 +200,8 @@ public class CommentsServiceImpl extends ServiceImpl<CommentsMapper, ArticleComm
         articleComments.setCreatedAt(LocalDateTime.now());
         articleComments.setUserId(UserContext.get());
         articleComments.setLikeCount(0L);
+        articleComments.setIp(clientIp);
+        articleComments.setIpLocation(ipLocationService.getLocation(clientIp, cloudflareCountryCode));
 
         save(articleComments);
     }

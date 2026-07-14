@@ -1,9 +1,13 @@
 package com.hailin.blogsystem.service.impl;
 
 import cn.hutool.core.bean.BeanUtil;
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
+import com.baomidou.mybatisplus.extension.conditions.query.LambdaQueryChainWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hailin.blogsystem.constants.BlogConstants;
+import com.hailin.blogsystem.entity.ArticleComments;
 import com.hailin.blogsystem.entity.Articles;
 import com.hailin.blogsystem.entity.Category;
 import com.hailin.blogsystem.entity.Users;
@@ -11,6 +15,7 @@ import com.hailin.blogsystem.entity.dto.ArticlesDTO;
 import com.hailin.blogsystem.entity.vo.PageVO;
 import com.hailin.blogsystem.mapper.ArticlesMapper;
 import com.hailin.blogsystem.mapper.CategoryMapper;
+import com.hailin.blogsystem.mapper.CommentsMapper;
 import com.hailin.blogsystem.mapper.UsersMapper;
 import com.hailin.blogsystem.service.ArticlesService;
 import com.hailin.blogsystem.entity.vo.ArticleDetailVO;
@@ -31,6 +36,7 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
 
     private final UsersMapper usersMapper;
     private final CategoryMapper categoryMapper;
+    private final CommentsMapper commentsMapper;
 
     @Override
     public PageVO<ArticleDetailVO> getArticles(Long page, Long pageSize, String keyword, Long categoryId, String sort) {  //1.获取公开文章列表
@@ -49,6 +55,7 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
                 .map(ArticleDetailVO::from)
                 .toList();
         fillArticleMeta(list);
+        fillCommentCounts(list);
 
         return new PageVO<>(
                 list,
@@ -76,6 +83,12 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
 
         ArticleDetailVO vo = ArticleDetailVO.from(article);
         fillArticleMeta(vo);
+        if(vo != null){
+            Long commentsCount = commentsMapper.selectCount(new LambdaQueryWrapper<ArticleComments>()
+                    .eq(ArticleComments::getArticleId, id));
+            vo.setCommentCount(commentsCount);
+        }
+
         return vo;
     }
 
@@ -104,6 +117,32 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
             return;
         }
         fillArticleMeta(List.of(article));
+    }
+
+    private void fillCommentCounts(List<ArticleDetailVO> articles) {
+        if (articles == null || articles.isEmpty()) {
+            return;
+        }
+
+        List<Long> articleIds = articles.stream()
+                .map(ArticleDetailVO::getId)
+                .toList();
+
+        QueryWrapper<ArticleComments> countQuery = new QueryWrapper<>();
+        countQuery.select("article_id", "count(*) as cnt")
+                .in("article_id", articleIds)
+                .groupBy("article_id");
+
+        Map<Long, Long> countMap = commentsMapper.selectMaps(countQuery)
+                .stream()
+                .collect(Collectors.toMap(
+                        m -> ((Number) m.get("article_id")).longValue(),
+                        m -> ((Number) m.get("cnt")).longValue()
+                ));
+
+        for (ArticleDetailVO vo : articles) {
+            vo.setCommentCount(countMap.getOrDefault(vo.getId(), 0L));
+        }
     }
 
     private void fillArticleMeta(List<ArticleDetailVO> articles) {
