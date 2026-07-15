@@ -8,7 +8,7 @@ import org.springframework.web.servlet.config.annotation.InterceptorRegistry;
 import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
 
 /**
- * 注册 JwtInterceptor，放行公开接口，只对 /api/users/me/** 做登录校验。
+ * 公开浏览接口允许游客访问，互动和用户接口需要登录。
  */
 @Configuration
 @RequiredArgsConstructor
@@ -28,7 +28,9 @@ public class WebMvcConfig implements WebMvcConfigurer {
         registry.addInterceptor(jwtInterceptor)
                 .addPathPatterns(
                         "/api/users/me/**",
-                        "/api/comments/**"
+                        "/api/comments/**",
+                        "/api/articles/*/like",
+                        "/api/articles/*/favorite"
                 )
                 .excludePathPatterns("/api/comments/*/replies");
     }

@@ -20,7 +20,11 @@ public class ArticleDetailVO {
     private Integer status;
     private Integer viewCount;
     private LocalDateTime publishedAt;
-    private Long commentCount = 0L;
+    private Integer commentCount = 0;
+    private Integer favoriteCount = 0;
+    private Integer likeCount = 0;
+    private Integer liked = 0;
+    private Integer favorited = 0;
 
     public static ArticleDetailVO from(Articles article) {
         if (article == null) {
@@ -38,6 +42,9 @@ public class ArticleDetailVO {
         vo.setStatus(article.getStatus());
         vo.setViewCount(article.getViewCount());
         vo.setPublishedAt(article.getPublishedAt());
+        vo.setCommentCount(article.getCommentCount());
+        vo.setLikeCount(article.getLikeCount());
+        vo.setFavoriteCount(article.getFavoriteCount());
         return vo;
     }
 }

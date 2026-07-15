@@ -1,5 +1,7 @@
 DROP TABLE IF EXISTS article_tags;
 DROP TABLE IF EXISTS comment_likes;
+DROP TABLE IF EXISTS article_likes;
+DROP TABLE IF EXISTS article_favorites;
 DROP TABLE IF EXISTS article_comments;
 DROP TABLE IF EXISTS articles;
 DROP TABLE IF EXISTS categories;
@@ -15,6 +17,9 @@ CREATE TABLE articles (
     cover_url VARCHAR(500),
     status INT,
     view_count INT,
+    comment_count INT DEFAULT 0,
+    like_count INT DEFAULT 0,
+    favorite_count INT DEFAULT 0,
     published_at TIMESTAMP,
     created_at TIMESTAMP,
     updated_at TIMESTAMP,
@@ -64,4 +69,18 @@ CREATE TABLE comment_likes (
     comment_id BIGINT NOT NULL,
     user_id BIGINT NOT NULL,
     created_at TIMESTAMP
+);
+
+CREATE TABLE article_likes (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    article_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    create_time TIMESTAMP
+);
+
+CREATE TABLE article_favorites (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    article_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    create_time TIMESTAMP
 );

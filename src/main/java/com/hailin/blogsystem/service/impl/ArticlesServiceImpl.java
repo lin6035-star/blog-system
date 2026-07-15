@@ -2,20 +2,20 @@ package com.hailin.blogsystem.service.impl;
 
 import cn.hutool.core.bean.BeanUtil;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
-import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
-import com.baomidou.mybatisplus.extension.conditions.query.LambdaQueryChainWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hailin.blogsystem.constants.BlogConstants;
-import com.hailin.blogsystem.entity.ArticleComments;
+import com.hailin.blogsystem.entity.ArticleFavorites;
+import com.hailin.blogsystem.entity.ArticleLikes;
 import com.hailin.blogsystem.entity.Articles;
 import com.hailin.blogsystem.entity.Category;
 import com.hailin.blogsystem.entity.Users;
 import com.hailin.blogsystem.entity.dto.ArticlesDTO;
 import com.hailin.blogsystem.entity.vo.PageVO;
+import com.hailin.blogsystem.mapper.ArticleFavoritesMapper;
+import com.hailin.blogsystem.mapper.ArticleLikesMapper;
 import com.hailin.blogsystem.mapper.ArticlesMapper;
 import com.hailin.blogsystem.mapper.CategoryMapper;
-import com.hailin.blogsystem.mapper.CommentsMapper;
 import com.hailin.blogsystem.mapper.UsersMapper;
 import com.hailin.blogsystem.service.ArticlesService;
 import com.hailin.blogsystem.entity.vo.ArticleDetailVO;
@@ -27,6 +27,7 @@ import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -36,7 +37,8 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
 
     private final UsersMapper usersMapper;
     private final CategoryMapper categoryMapper;
-    private final CommentsMapper commentsMapper;
+    private final ArticleLikesMapper articleLikesMapper;
+    private final ArticleFavoritesMapper articleFavoritesMapper;
 
     @Override
     public PageVO<ArticleDetailVO> getArticles(Long page, Long pageSize, String keyword, Long categoryId, String sort) {  //1.获取公开文章列表
@@ -55,7 +57,8 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
                 .map(ArticleDetailVO::from)
                 .toList();
         fillArticleMeta(list);
-        fillCommentCounts(list);
+        fillArticleLiked(list);
+        fillArticleFavorited(list);
 
         return new PageVO<>(
                 list,
@@ -83,11 +86,8 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
 
         ArticleDetailVO vo = ArticleDetailVO.from(article);
         fillArticleMeta(vo);
-        if(vo != null){
-            Long commentsCount = commentsMapper.selectCount(new LambdaQueryWrapper<ArticleComments>()
-                    .eq(ArticleComments::getArticleId, id));
-            vo.setCommentCount(commentsCount);
-        }
+        fillArticleLiked(vo);
+        fillArticleFavorited(vo);
 
         return vo;
     }
@@ -119,30 +119,82 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
         fillArticleMeta(List.of(article));
     }
 
-    private void fillCommentCounts(List<ArticleDetailVO> articles) {
+    private void fillArticleLiked(List<ArticleDetailVO> articles) {
         if (articles == null || articles.isEmpty()) {
+            return;
+        }
+
+        Long currentUserId = UserContext.get();
+        if (currentUserId == null) {
             return;
         }
 
         List<Long> articleIds = articles.stream()
                 .map(ArticleDetailVO::getId)
+                .filter(Objects::nonNull)
                 .toList();
 
-        QueryWrapper<ArticleComments> countQuery = new QueryWrapper<>();
-        countQuery.select("article_id", "count(*) as cnt")
-                .in("article_id", articleIds)
-                .groupBy("article_id");
-
-        Map<Long, Long> countMap = commentsMapper.selectMaps(countQuery)
-                .stream()
-                .collect(Collectors.toMap(
-                        m -> ((Number) m.get("article_id")).longValue(),
-                        m -> ((Number) m.get("cnt")).longValue()
-                ));
-
-        for (ArticleDetailVO vo : articles) {
-            vo.setCommentCount(countMap.getOrDefault(vo.getId(), 0L));
+        if (articleIds.isEmpty()) {
+            return;
         }
+
+        Set<Long> likedArticleIds = articleLikesMapper.selectList(
+                        new LambdaQueryWrapper<ArticleLikes>()
+                                .in(ArticleLikes::getArticleId, articleIds)
+                                .eq(ArticleLikes::getUserId, currentUserId))
+                .stream()
+                .map(ArticleLikes::getArticleId)
+                .collect(Collectors.toSet());
+
+        for (ArticleDetailVO article : articles) {
+            article.setLiked(likedArticleIds.contains(article.getId()) ? 1 : 0);
+        }
+    }
+
+    private void fillArticleLiked(ArticleDetailVO article) {
+        if (article == null) {
+            return;
+        }
+        fillArticleLiked(List.of(article));
+    }
+
+    private void fillArticleFavorited(List<ArticleDetailVO> articles) {
+        if (articles == null || articles.isEmpty()) {
+            return;
+        }
+
+        Long currentUserId = UserContext.get();
+        if (currentUserId == null) {
+            return;
+        }
+
+        List<Long> articleIds = articles.stream()
+                .map(ArticleDetailVO::getId)
+                .filter(Objects::nonNull)
+                .toList();
+
+        if (articleIds.isEmpty()) {
+            return;
+        }
+
+        Set<Long> favoritedArticleIds = articleFavoritesMapper.selectList(
+                        new LambdaQueryWrapper<ArticleFavorites>()
+                                .in(ArticleFavorites::getArticleId, articleIds)
+                                .eq(ArticleFavorites::getUserId, currentUserId))
+                .stream()
+                .map(ArticleFavorites::getArticleId)
+                .collect(Collectors.toSet());
+
+        for (ArticleDetailVO article : articles) {
+            article.setFavorited(favoritedArticleIds.contains(article.getId()) ? 1 : 0);
+        }
+    }
+
+    private void fillArticleFavorited(ArticleDetailVO article) {
+        if (article == null) {
+            return;
+        }
+        fillArticleFavorited(List.of(article));
     }
 
     private void fillArticleMeta(List<ArticleDetailVO> articles) {

@@ -27,6 +27,12 @@ public class BlogConstants {
         }
     }
 
+    /* 文章点赞状态 */
+    public static final class ArticleLikes{
+        public static final int LIKED = 1;
+        public static final int UNLIKED = 0;
+    }
+
     /* 错误码 */
     public static final class ErrorCode {
         public static final int SUCCESS = 0;

@@ -1,6 +1,7 @@
 package com.hailin.blogsystem.controller;
 
 import com.hailin.blogsystem.entity.dto.ArticlesDTO;
+import com.hailin.blogsystem.entity.dto.UserProfileDTO;
 import com.hailin.blogsystem.entity.vo.ArticleDetailVO;
 import com.hailin.blogsystem.entity.vo.PageVO;
 import com.hailin.blogsystem.entity.vo.UsersVO;
@@ -22,6 +23,13 @@ public class UsersController {
     public Result<UsersVO> getUsersInfo(){
 
         UsersVO usersVO = usersService.getUsersInfo();
+
+        return Result.success(usersVO);
+    }
+
+    @PutMapping("/profile") // 修改当前用户昵称和个人简介
+    public Result<UsersVO> updateProfile(@RequestBody UserProfileDTO userProfileDTO) {
+        UsersVO usersVO = usersService.updateProfile(userProfileDTO);
 
         return Result.success(usersVO);
     }
@@ -62,17 +70,41 @@ public class UsersController {
         return Result.success();
     }
 
-    @PatchMapping("/articles/{id}/hide")  //隐藏自己的文章
+    @PatchMapping("/articles/{id}/hide")  //1.隐藏自己的文章
     public Result hideArticle(@PathVariable Long id){
         articlesService.hideArticle(id);
 
         return Result.success();
     }
 
-    @PatchMapping("/articles/{id}/publish")  //发布自己的文章
+    @PatchMapping("/articles/{id}/publish")  //2.发布自己的文章
     public Result publishArticle(@PathVariable Long id){
         articlesService.publishArticle(id);
 
         return Result.success();
+    }
+
+    @GetMapping("/liked")  //3.查询自己喜欢的文章
+    public Result<PageVO<ArticleDetailVO>> getMyLiked(@RequestParam(defaultValue = "1") Long page,
+                                                      @RequestParam(defaultValue = "10") Long pageSize){
+        PageVO<ArticleDetailVO> pageVO = usersService.getMyLiked(page,pageSize);
+
+        return Result.success(pageVO);
+    }
+
+    @GetMapping("/favorited")  //4.查询自己收藏的文章
+    public Result<PageVO<ArticleDetailVO>> getMyFavorites(@RequestParam(defaultValue = "1") Long page,
+                                                          @RequestParam(defaultValue = "10") Long pageSize){
+        PageVO<ArticleDetailVO> pageVO = usersService.getMyFavorites(page,pageSize);
+
+        return Result.success(pageVO);
+    }
+
+    @GetMapping("/commented")  //我评价过的文章
+    public Result<PageVO<ArticleDetailVO>> getMyComment(@RequestParam(defaultValue = "1") Long page,
+                                                          @RequestParam(defaultValue = "10") Long pageSize){
+        PageVO<ArticleDetailVO> pageVO = usersService.getComment(page,pageSize);
+
+        return Result.success(pageVO);
     }
 }

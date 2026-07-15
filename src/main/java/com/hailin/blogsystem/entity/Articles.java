@@ -27,4 +27,7 @@ public class Articles {
     private LocalDateTime updatedAt;
     @TableLogic(value = "null", delval = "now()")  // null=未删除，删除时写入当前时间
     private LocalDateTime deletedAt;
+    private Integer likeCount;
+    private Integer favoriteCount;
+    private Integer commentCount;
 }

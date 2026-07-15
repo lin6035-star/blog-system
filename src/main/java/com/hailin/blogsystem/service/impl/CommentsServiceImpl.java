@@ -2,6 +2,7 @@ package com.hailin.blogsystem.service.impl;
 
 import cn.hutool.core.bean.BeanUtil;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hailin.blogsystem.entity.ArticleComments;
@@ -204,6 +205,11 @@ public class CommentsServiceImpl extends ServiceImpl<CommentsMapper, ArticleComm
         articleComments.setIpLocation(ipLocationService.getLocation(clientIp, cloudflareCountryCode));
 
         save(articleComments);
+
+        articlesMapper.update(null,
+                new LambdaUpdateWrapper<Articles>()
+                        .eq(Articles::getId, articleId)
+                        .setSql("comment_count = comment_count + 1"));
     }
 
 
@@ -236,6 +242,12 @@ public class CommentsServiceImpl extends ServiceImpl<CommentsMapper, ArticleComm
                 .set(ArticleComments::getDeletedBy, userId)
                 .in(ArticleComments::getId, commentIds)
                 .update();
+
+        int deletedCount = commentIds.size();
+        articlesMapper.update(null,
+                new LambdaUpdateWrapper<Articles>()
+                        .eq(Articles::getId, article.getId())
+                        .setSql("comment_count = GREATEST(comment_count - " + deletedCount + ", 0)"));
     }
 
     private List<Long> findDescendantCommentIds(Long commentId) {
