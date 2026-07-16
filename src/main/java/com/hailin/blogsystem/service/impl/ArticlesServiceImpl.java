@@ -5,6 +5,7 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hailin.blogsystem.constants.BlogConstants;
+import com.hailin.blogsystem.constants.RedisConstants;
 import com.hailin.blogsystem.entity.ArticleFavorites;
 import com.hailin.blogsystem.entity.ArticleLikes;
 import com.hailin.blogsystem.entity.Articles;
@@ -21,6 +22,7 @@ import com.hailin.blogsystem.service.ArticlesService;
 import com.hailin.blogsystem.entity.vo.ArticleDetailVO;
 import com.hailin.blogsystem.utils.UserContext;
 import lombok.RequiredArgsConstructor;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
@@ -40,7 +42,9 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
     private final ArticleLikesMapper articleLikesMapper;
     private final ArticleFavoritesMapper articleFavoritesMapper;
 
-    @Override
+    private final StringRedisTemplate stringRedisTemplate;
+
+    @Override  //1.获取公开文章列表
     public PageVO<ArticleDetailVO> getArticles(Long page, Long pageSize, String keyword, Long categoryId, String sort) {  //1.获取公开文章列表
 
         Page<Articles> pageResult = lambdaQuery()
@@ -59,6 +63,7 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
         fillArticleMeta(list);
         fillArticleLiked(list);
         fillArticleFavorited(list);
+        fillArticleViewCount(list);
 
         return new PageVO<>(
                 list,
@@ -68,33 +73,34 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
         );
     }
 
-    @Override
+    @Override  //2.获取公开文章详情
     public ArticleDetailVO getPublicArticleById(Long id) {  //2.获取公开文章详情
         Articles article = lambdaQuery()
                 .eq(Articles::getId, id)
                 .eq(Articles::getStatus, BlogConstants.ArticlesStatus.PUBLISHED)
                 .one();
 
+        String key = RedisConstants.ARTICLE_VIEW_KEY_PREFIX + id;
         if (article != null) {
             Long userId = UserContext.get();
-            if (userId != null && !userId.equals(article.getAuthorId())) {
-                int viewCount = article.getViewCount() == null ? 0 : article.getViewCount();
-                article.setViewCount(viewCount + 1);
-                updateById(article);
+            if (userId == null || !userId.equals(article.getAuthorId())) {
+                stringRedisTemplate.opsForValue().increment(key);
             }
         }
 
         ArticleDetailVO vo = ArticleDetailVO.from(article);
+
         fillArticleMeta(vo);
         fillArticleLiked(vo);
         fillArticleFavorited(vo);
+        fillArticleViewCount(List.of(vo));
 
         return vo;
     }
 
 
     @Override
-    public ArticleDetailVO getArticlesById(Long id) {
+    public ArticleDetailVO getArticlesById(Long id) {  //3.获取我自己的文章详情
         Articles articles = getById(id);
         if(articles == null){
             throw new IllegalArgumentException("未找到该博文");
@@ -117,6 +123,46 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
             return;
         }
         fillArticleMeta(List.of(article));
+    }
+
+    private void fillArticleMeta(List<ArticleDetailVO> articles) {
+        if (articles == null || articles.isEmpty()) {
+            return;
+        }
+
+        List<Long> authorIds = articles.stream()
+                .map(ArticleDetailVO::getAuthorId)
+                .filter(Objects::nonNull)
+                .distinct()
+                .toList();
+        List<Long> categoryIds = articles.stream()
+                .map(ArticleDetailVO::getCategoryId)
+                .filter(Objects::nonNull)
+                .distinct()
+                .toList();
+
+        Map<Long, Users> usersById = authorIds.isEmpty()
+                ? Map.of()
+                : usersMapper.selectBatchIds(authorIds)
+                .stream()
+                .collect(Collectors.toMap(Users::getId, Function.identity()));
+        Map<Long, Category> categoriesById = categoryIds.isEmpty()
+                ? Map.of()
+                : categoryMapper.selectBatchIds(categoryIds)
+                .stream()
+                .collect(Collectors.toMap(Category::getId, Function.identity()));
+
+        for (ArticleDetailVO article : articles) {
+            Users author = usersById.get(article.getAuthorId());
+            if (author != null) {
+                article.setAuthorName(author.getNickname());
+            }
+
+            Category category = categoriesById.get(article.getCategoryId());
+            if (category != null) {
+                article.setCategoryName(category.getName());
+            }
+        }
     }
 
     private void fillArticleLiked(List<ArticleDetailVO> articles) {
@@ -197,48 +243,7 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
         fillArticleFavorited(List.of(article));
     }
 
-    private void fillArticleMeta(List<ArticleDetailVO> articles) {
-        if (articles == null || articles.isEmpty()) {
-            return;
-        }
-
-        List<Long> authorIds = articles.stream()
-                .map(ArticleDetailVO::getAuthorId)
-                .filter(Objects::nonNull)
-                .distinct()
-                .toList();
-        List<Long> categoryIds = articles.stream()
-                .map(ArticleDetailVO::getCategoryId)
-                .filter(Objects::nonNull)
-                .distinct()
-                .toList();
-
-        Map<Long, Users> usersById = authorIds.isEmpty()
-                ? Map.of()
-                : usersMapper.selectBatchIds(authorIds)
-                .stream()
-                .collect(Collectors.toMap(Users::getId, Function.identity()));
-        Map<Long, Category> categoriesById = categoryIds.isEmpty()
-                ? Map.of()
-                : categoryMapper.selectBatchIds(categoryIds)
-                .stream()
-                .collect(Collectors.toMap(Category::getId, Function.identity()));
-
-        for (ArticleDetailVO article : articles) {
-            Users author = usersById.get(article.getAuthorId());
-            if (author != null) {
-                article.setAuthorName(author.getNickname());
-            }
-
-            Category category = categoriesById.get(article.getCategoryId());
-            if (category != null) {
-                article.setCategoryName(category.getName());
-            }
-        }
-    }
-
-
-    @Override
+    @Override  //4.创建文章
     public Long writeArticle(ArticlesDTO articlesDTO) {
         Articles articles = new Articles();
         BeanUtil.copyProperties(articlesDTO,articles);
@@ -254,7 +259,7 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
     }
 
 
-    @Override
+    @Override  //5.更新自己的文章
     public void updateArticle(Long id, ArticlesDTO articlesDTO) {
 
         Articles articles = getById(id);
@@ -278,7 +283,7 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
     }
 
 
-    @Override
+    @Override  //6.删除自己的文章
     public void deleteArticle(Long id) {
         Articles articles = getById(id);
         if(articles == null){
@@ -293,7 +298,7 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
     }
 
 
-    @Override
+    @Override  //7.隐藏自己的文章
     public void hideArticle(Long id) {
         Articles articles = getById(id);
         if(articles == null){
@@ -312,7 +317,7 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
     }
 
 
-    @Override
+    @Override  //8.发布自己的文章
     public void publishArticle(Long id) {
         Articles articles = getById(id);
         if(articles == null){
@@ -335,6 +340,57 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
         if (Objects.equals(articles.getStatus(), BlogConstants.ArticlesStatus.PUBLISHED)
                 && articles.getPublishedAt() == null) {
             articles.setPublishedAt(LocalDateTime.now());
+        }
+    }
+
+    //关于redis存储浏览量
+    private void fillArticleViewCount(List<ArticleDetailVO> articles){
+        if(articles == null || articles.isEmpty()){
+            return;
+        }
+
+        String key;
+        for(ArticleDetailVO article : articles){
+            key = RedisConstants.ARTICLE_VIEW_KEY_PREFIX + article.getId();
+            String redisViewCount = stringRedisTemplate.opsForValue().get(key);
+
+            if(redisViewCount == null){
+                continue;
+            }
+
+            int baseViewCount = article.getViewCount() == null ? 0 : article.getViewCount();
+            article.setViewCount((baseViewCount + Integer.parseInt(redisViewCount)));
+        }
+    }
+
+    @Override  //将存储在redis的浏览量加入到数据库，改数据库
+    public void syncViewCountToDb(){
+        Set<String> keys = stringRedisTemplate.keys(RedisConstants.ARTICLE_VIEW_KEY_PREFIX + "*");
+
+        if(keys == null || keys.isEmpty())
+            return;
+
+        String redisViewCount;
+        for(String key : keys){
+            redisViewCount = stringRedisTemplate.opsForValue().get(key);
+
+            if(redisViewCount == null)
+                continue;
+
+            Long articleId = Long.valueOf(key.substring(RedisConstants.ARTICLE_VIEW_KEY_PREFIX.length()));
+            Integer increment = Integer.valueOf(redisViewCount);
+
+            if(increment <= 0){
+                stringRedisTemplate.delete(key);
+                continue;
+            }
+
+            lambdaUpdate()
+                    .eq(Articles::getId,articleId)
+                    .setSql("view_count = view_count + " + increment)
+                    .update();
+
+            stringRedisTemplate.delete(key);
         }
     }
 }

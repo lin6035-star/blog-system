@@ -25,4 +25,6 @@ public interface ArticlesService extends IService<Articles>{
     void hideArticle(Long id);
 
     void publishArticle(Long id);
+
+    void syncViewCountToDb();
 }
