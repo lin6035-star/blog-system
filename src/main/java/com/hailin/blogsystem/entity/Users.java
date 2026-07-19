@@ -24,4 +24,7 @@ public class Users {
     private LocalDateTime updatedAt;
     @TableLogic(value = "null", delval = "now()")  // null=未删除，删除时写入当前时间
     private LocalDateTime deletedAt;
+
+    private Integer followersCount;  //粉丝数
+    private Integer followingCount;  //关注数
 }
