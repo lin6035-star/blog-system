@@ -30,7 +30,8 @@ public class WebMvcConfig implements WebMvcConfigurer {
                         "/api/users/me/**",
                         "/api/comments/**",
                         "/api/articles/*/like",
-                        "/api/articles/*/favorite"
+                        "/api/articles/*/favorite",
+                        "/api/users/*/follow"
                 )
                 .excludePathPatterns("/api/comments/*/replies");
     }
