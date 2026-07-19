@@ -11,6 +11,10 @@ public class PageVO<T> {
     private Long page;
     private Long pageSize;
 
+    public PageVO(){
+
+    }
+
     public PageVO(List<T> list,Long total,Long page,Long pageSize){
         this.list = list;
         this.total = total;

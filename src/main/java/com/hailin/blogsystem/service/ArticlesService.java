@@ -27,4 +27,8 @@ public interface ArticlesService extends IService<Articles>{
     void publishArticle(Long id);
 
     void syncViewCountToDb();
+
+    PageVO<ArticleDetailVO> getHotArticles(Long page, Long pageSize);
+
+    void rebuildArticleHotRank();
 }

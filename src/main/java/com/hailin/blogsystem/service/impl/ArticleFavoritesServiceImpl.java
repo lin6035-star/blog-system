@@ -1,8 +1,8 @@
 package com.hailin.blogsystem.service.impl;
 
-import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.hailin.blogsystem.constants.RedisConstants;
 import com.hailin.blogsystem.entity.ArticleFavorites;
 import com.hailin.blogsystem.entity.Articles;
 import com.hailin.blogsystem.mapper.ArticleFavoritesMapper;
@@ -10,15 +10,18 @@ import com.hailin.blogsystem.mapper.ArticlesMapper;
 import com.hailin.blogsystem.service.ArticleFavoritesService;
 import com.hailin.blogsystem.utils.UserContext;
 import lombok.RequiredArgsConstructor;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
+import java.util.concurrent.TimeUnit;
 
 @Service
 @RequiredArgsConstructor
 public class ArticleFavoritesServiceImpl extends ServiceImpl<ArticleFavoritesMapper, ArticleFavorites> implements ArticleFavoritesService {
 
     private final ArticlesMapper articlesMapper;
+    private final StringRedisTemplate stringRedisTemplate;
 
     @Override  //1.收藏文章
     public void favoriteArticle(Long articleId) {
@@ -41,6 +44,23 @@ public class ArticleFavoritesServiceImpl extends ServiceImpl<ArticleFavoritesMap
                 new LambdaUpdateWrapper<Articles>()
                         .eq(Articles::getId,articleId)
                         .setSql("favorite_count = favorite_count + 1"));
+        //收藏成功后，将数量加入redis
+        String key = RedisConstants.ARTICLE_FAVORITED_USER_KEY_PREFIX + userId;
+        stringRedisTemplate.opsForSet()
+                        .add(key,String.valueOf(articleId));
+
+        //点击收藏增加相应的score分数
+        stringRedisTemplate.opsForZSet().incrementScore(RedisConstants.ARTICLE_HOT_KEY,
+                String.valueOf(articleId),RedisConstants.ARTICLE_FAVORITE_HOT_SCORE);
+
+        //确认收藏时维护 loaded 后的 Set
+        stringRedisTemplate.opsForSet()
+                .add(RedisConstants.ARTICLE_FAVORITED_USER_KEY_PREFIX + userId, String.valueOf(articleId));
+
+        stringRedisTemplate.opsForValue()
+                .set(RedisConstants.ARTICLE_FAVORITED_USER_KEY_PREFIX + userId + ":loaded", "1", 30, TimeUnit.MINUTES);
+
+        stringRedisTemplate.delete(RedisConstants.ARTICLE_DETAIL_KEY_PREFIX + articleId);
     }
 
 
@@ -61,5 +81,24 @@ public class ArticleFavoritesServiceImpl extends ServiceImpl<ArticleFavoritesMap
         articlesMapper.update(null,
                 new LambdaUpdateWrapper<Articles>().eq(Articles::getId,articleId)
                         .setSql("favorite_count = GREATEST(favorite_count - 1, 0)"));
+
+        //收藏失败后，将数量加入redis
+        String key = RedisConstants.ARTICLE_FAVORITED_USER_KEY_PREFIX + userId;
+        stringRedisTemplate.opsForSet()
+                        .remove(key,String.valueOf(articleId));
+
+        //点击取消收藏增加相应的score分数
+        stringRedisTemplate.opsForZSet().incrementScore(RedisConstants.ARTICLE_HOT_KEY,
+                String.valueOf(articleId),RedisConstants.ARTICLE_UNFAVORITE_HOT_SCORE);
+
+
+        //取消收藏时维护 loaded 后的 Set
+        stringRedisTemplate.opsForSet()
+                .remove(RedisConstants.ARTICLE_FAVORITED_USER_KEY_PREFIX + userId, String.valueOf(articleId));
+
+        stringRedisTemplate.opsForValue()
+                .set(RedisConstants.ARTICLE_FAVORITED_USER_KEY_PREFIX + userId + ":loaded", "1", 30, TimeUnit.MINUTES);
+
+        stringRedisTemplate.delete(RedisConstants.ARTICLE_DETAIL_KEY_PREFIX + articleId);
     }
 }

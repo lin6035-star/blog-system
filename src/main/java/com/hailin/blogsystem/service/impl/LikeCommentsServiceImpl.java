@@ -1,6 +1,7 @@
 package com.hailin.blogsystem.service.impl;
 
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.hailin.blogsystem.constants.RedisConstants;
 import com.hailin.blogsystem.entity.ArticleComments;
 import com.hailin.blogsystem.entity.CommentLikes;
 import com.hailin.blogsystem.mapper.CommentsMapper;
@@ -8,16 +9,19 @@ import com.hailin.blogsystem.mapper.LikeCommentsMapper;
 import com.hailin.blogsystem.service.LikeCommentsService;
 import com.hailin.blogsystem.utils.UserContext;
 import lombok.RequiredArgsConstructor;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
+import java.util.concurrent.TimeUnit;
 
 @Service
 @RequiredArgsConstructor
 public class LikeCommentsServiceImpl extends ServiceImpl<LikeCommentsMapper, CommentLikes> implements LikeCommentsService {
 
     private final CommentsMapper commentsMapper;
+    private final StringRedisTemplate stringRedisTemplate;
 
     @Override  //1.点赞评论，登录用户可访问
     @Transactional
@@ -41,6 +45,15 @@ public class LikeCommentsServiceImpl extends ServiceImpl<LikeCommentsMapper, Com
         commentLikes.setCreatedAt(LocalDateTime.now());
 
         save(commentLikes);
+
+        Long userId = UserContext.get();
+        String key = RedisConstants.COMMENT_LIKED_USER_KEY_PREFIX + userId;
+
+        stringRedisTemplate.opsForSet()
+                .add(key,String.valueOf(commentId));
+
+        stringRedisTemplate.opsForValue()
+                .set(key + ":loaded", "1", 30, TimeUnit.MINUTES);
     }
 
 
@@ -59,5 +72,13 @@ public class LikeCommentsServiceImpl extends ServiceImpl<LikeCommentsMapper, Com
             commentsMapper.updateById(comment);
         }
 
+        Long userId = UserContext.get();
+        String key = RedisConstants.COMMENT_LIKED_USER_KEY_PREFIX + userId;
+
+        stringRedisTemplate.opsForSet()
+                .remove(key, String.valueOf(commentId));
+
+        stringRedisTemplate.opsForValue()
+                .set(key + ":loaded", "1", 30, TimeUnit.MINUTES);
     }
 }

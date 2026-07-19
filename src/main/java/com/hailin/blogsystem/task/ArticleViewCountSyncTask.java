@@ -14,4 +14,9 @@ public class ArticleViewCountSyncTask {
     public void syncViewCount(){
         articlesService.syncViewCountToDb();
     }
+
+    @Scheduled(fixedRate = 30 * 60 * 1000)
+    public void rebuildArticleHotRank() {
+        articlesService.rebuildArticleHotRank();
+    }
 }

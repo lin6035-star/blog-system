@@ -5,6 +5,10 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.hailin.blogsystem.constants.RedisConstants;
 import com.hailin.blogsystem.entity.ArticleComments;
 import com.hailin.blogsystem.entity.Articles;
 import com.hailin.blogsystem.entity.CommentLikes;
@@ -20,10 +24,12 @@ import com.hailin.blogsystem.service.CommentsService;
 import com.hailin.blogsystem.service.IpLocationService;
 import com.hailin.blogsystem.utils.UserContext;
 import lombok.RequiredArgsConstructor;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
 import java.util.*;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -35,9 +41,23 @@ public class CommentsServiceImpl extends ServiceImpl<CommentsMapper, ArticleComm
     private final LikeCommentsMapper likeCommentsMapper;
     private final ArticlesMapper articlesMapper;
     private final IpLocationService ipLocationService;
+    private final StringRedisTemplate stringRedisTemplate;
+    private final ObjectMapper objectMapper;
 
     @Override  //1.获取文章评论列表，游客可访问，每条主评论带前几条回复
     public PageVO<CommentsVO> getComments(Long articleId, Long page, Long pageSize, String sort) {
+
+        String cacheKey = buildCommentListCacheKey(articleId,page,pageSize,sort);
+        PageVO<CommentsVO> cachedPage = getCommentListFromCache(cacheKey);
+
+        if(cachedPage != null){
+            fillLiked(cachedPage.getList());
+            for(CommentsVO commentsVO : cachedPage.getList()){
+                fillLiked(commentsVO.getReplies());
+            }
+
+            return cachedPage;
+        }
 
         Page<ArticleComments> pageResult = lambdaQuery()
                 .eq(ArticleComments::getArticleId, articleId)
@@ -54,8 +74,6 @@ public class CommentsServiceImpl extends ServiceImpl<CommentsMapper, ArticleComm
         //从VO里收集所有的userId
         fillUserInfo(list);
 
-        //关于liked字段
-        fillLiked(list);
 
         //关于replies字段
         List<Long> rootIds = list.stream()
@@ -90,6 +108,18 @@ public class CommentsServiceImpl extends ServiceImpl<CommentsMapper, ArticleComm
             mainComment.setReplyCount((long) replyEntities.size());
         }
 
+        PageVO<CommentsVO> pageVO = new PageVO<>(
+                list,
+                pageResult.getTotal(),
+                page,
+                pageSize
+        );
+
+        saveCommentListToCache(cacheKey,pageVO);
+
+        //关于liked字段
+        fillLiked(list);
+
         for(CommentsVO comment : list){
             List<CommentsVO> replies = comment.getReplies();
             if(replies != null){
@@ -99,12 +129,7 @@ public class CommentsServiceImpl extends ServiceImpl<CommentsMapper, ArticleComm
             }
         }
 
-        return new PageVO<>(
-                list,
-                pageResult.getTotal(),
-                page,
-                pageSize
-        );
+        return pageVO;
     }
 
 
@@ -210,6 +235,14 @@ public class CommentsServiceImpl extends ServiceImpl<CommentsMapper, ArticleComm
                 new LambdaUpdateWrapper<Articles>()
                         .eq(Articles::getId, articleId)
                         .setSql("comment_count = comment_count + 1"));
+
+        //评论成功后，文章加入对应的score
+        stringRedisTemplate.opsForZSet().incrementScore(RedisConstants.ARTICLE_HOT_KEY,
+                String.valueOf(articleId),RedisConstants.ARTICLE_COMMENT_HOT_SCORE);
+
+        stringRedisTemplate.delete(RedisConstants.ARTICLE_DETAIL_KEY_PREFIX + articleId);
+
+        deleteCommentListCache(articleId);
     }
 
 
@@ -248,7 +281,30 @@ public class CommentsServiceImpl extends ServiceImpl<CommentsMapper, ArticleComm
                 new LambdaUpdateWrapper<Articles>()
                         .eq(Articles::getId, article.getId())
                         .setSql("comment_count = GREATEST(comment_count - " + deletedCount + ", 0)"));
+
+        stringRedisTemplate.opsForZSet().incrementScore(RedisConstants.ARTICLE_HOT_KEY,
+                String.valueOf(article.getId()),deletedCount * RedisConstants.ARTICLE_DELETE_COMMENT_HOT_SCORE);
+
+        stringRedisTemplate.delete(RedisConstants.ARTICLE_DETAIL_KEY_PREFIX + article.getId());
+
+        deleteCommentListCache(article.getId());
     }
+
+
+    private void deleteCommentListCache(Long articleId) {
+        try {
+            Set<String> keys = stringRedisTemplate.keys(
+                    RedisConstants.COMMENT_LIST_KEY_PREFIX + articleId + ":*"
+            );
+
+            if (keys != null && !keys.isEmpty()) {
+                stringRedisTemplate.delete(keys);
+            }
+        } catch (Exception e) {
+            // Redis 删除失败不影响评论发布/删除
+        }
+    }
+
 
     private List<Long> findDescendantCommentIds(Long commentId) {
         List<Long> descendants = new ArrayList<>();
@@ -272,6 +328,64 @@ public class CommentsServiceImpl extends ServiceImpl<CommentsMapper, ArticleComm
         }
 
         return descendants;
+    }
+
+
+    private String buildCommentListCacheKey(Long articleId,Long page,Long pageSize,String sort){
+        String normalizedSort = "hot".equals(sort) ? "hot" : "time";
+
+        return RedisConstants.COMMENT_LIST_KEY_PREFIX + articleId
+                + ":page:" + page
+                + ":pageSize:" + pageSize
+                + ":sort:" + normalizedSort;
+    }
+
+    //从缓存读评论列表
+    private PageVO<CommentsVO> getCommentListFromCache(String key){
+        String json = null;
+
+        try{
+            json = stringRedisTemplate.opsForValue().get(key);
+        }
+        catch (Exception e){
+            return null;
+        }
+
+        if (json == null || json.isBlank()) {
+            return null;
+        }
+
+        try{
+            return objectMapper.readValue(json, new TypeReference<PageVO<CommentsVO>>() {});
+        }
+        catch(JsonProcessingException e){
+            try{
+                stringRedisTemplate.delete(key);
+            } catch (Exception ex) {
+
+            }
+            return null;
+        }
+
+
+    }
+
+    //保存评论列表缓存
+    private void saveCommentListToCache(String key, PageVO<CommentsVO> pageVO){
+        if (pageVO == null) {
+            return;
+        }
+
+        try {
+            stringRedisTemplate.opsForValue().set(
+                    key,
+                    objectMapper.writeValueAsString(pageVO),
+                    RedisConstants.COMMENT_LIST_TTL_MINUTES,
+                    TimeUnit.MINUTES
+            );
+        } catch (Exception e) {
+            // 缓存失败不影响评论列表返回
+        }
     }
 
 
@@ -348,20 +462,54 @@ public class CommentsServiceImpl extends ServiceImpl<CommentsMapper, ArticleComm
         if(list == null || list.isEmpty() || currentUserId == null){
             return;
         }
-        List<Long> commentIds = list.stream().map(CommentsVO::getId)
+        List<Long> commentIds = list.stream()
+                .map(CommentsVO::getId)
                 .toList();
 
         if(commentIds.isEmpty()){
             return;
         }
-        LambdaQueryWrapper<CommentLikes> lambdaQueryWrapper  =new LambdaQueryWrapper<>();
-        lambdaQueryWrapper.eq(CommentLikes::getUserId,currentUserId)
-                .in(CommentLikes::getCommentId,commentIds);
 
-        List<CommentLikes> commentLikes = likeCommentsMapper.selectList(lambdaQueryWrapper);
+        //改为Redis Set优先，再来判断是否要查询数据库
+        String key = RedisConstants.COMMENT_LIKED_USER_KEY_PREFIX + currentUserId;
+        String loadedKey = key + ":loaded";
 
-        Set<Long> likedCommentIds = commentLikes.stream()
-                .map(CommentLikes::getCommentId)
+        Set<String> likedIdStrings = null;
+
+        try {
+            if (Boolean.TRUE.equals(stringRedisTemplate.hasKey(loadedKey))) {
+                likedIdStrings = stringRedisTemplate.opsForSet().members(key);
+            }
+        } catch (Exception e) {
+            // Redis读取失败，下面兜底查数据库
+        }
+
+        if (likedIdStrings == null) {
+            List<CommentLikes> commentLikes = likeCommentsMapper.selectList(
+                    new LambdaQueryWrapper<CommentLikes>()
+                            .eq(CommentLikes::getUserId, currentUserId)
+            );
+
+            likedIdStrings = commentLikes.stream()
+                    .map(like -> String.valueOf(like.getCommentId()))
+                    .collect(Collectors.toSet());
+
+            try {
+                if (!likedIdStrings.isEmpty()) {
+                    stringRedisTemplate.opsForSet()
+                            .add(key, likedIdStrings.toArray(new String[0]));
+                }
+
+                stringRedisTemplate.opsForValue()
+                        .set(loadedKey, "1", 30, TimeUnit.MINUTES);
+            } catch (Exception e) {
+                // Redis回填失败不影响 liked 状态计算
+            }
+        }
+        Set<Long> likedCommentIds = likedIdStrings == null
+                ? Set.of()
+                : likedIdStrings.stream()
+                .map(Long::valueOf)
                 .collect(Collectors.toSet());
 
         for(CommentsVO comment : list){
