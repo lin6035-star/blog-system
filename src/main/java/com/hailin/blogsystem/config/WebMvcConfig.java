@@ -22,11 +22,23 @@ public class WebMvcConfig implements WebMvcConfigurer {
         registry.addInterceptor(optionalJwtInterceptor)
                 .addPathPatterns(
                         "/api/articles/**",
-                        "/api/comments/*/replies"
+                        "/api/comments/*/replies",
+                        "/api/users/*",
+                        "/api/users/*/articles",
+                        "/api/users/*/liked",
+                        "/api/users/*/favorited",
+                        "/api/users/*/commented",
+                        "/api/users/*/followers",
+                        "/api/users/*/following"
+                )
+                .excludePathPatterns(
+                        "/api/users/me",
+                        "/api/users/me/**"
                 );
 
         registry.addInterceptor(jwtInterceptor)
                 .addPathPatterns(
+                        "/api/users/me",
                         "/api/users/me/**",
                         "/api/comments/**",
                         "/api/articles/*/like",

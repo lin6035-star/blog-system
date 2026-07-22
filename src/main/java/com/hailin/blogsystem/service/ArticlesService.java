@@ -31,4 +31,12 @@ public interface ArticlesService extends IService<Articles>{
     PageVO<ArticleDetailVO> getHotArticles(Long page, Long pageSize);
 
     void rebuildArticleHotRank();
+
+    PageVO<ArticleDetailVO> getPublicUserArticles(Long id,Long page,Long pageSize);
+
+    PageVO<ArticleDetailVO> getPublicUserLiked(Long id, Long page, Long pageSize);
+
+    PageVO<ArticleDetailVO> getPublicUserFavorited(Long id, Long page, Long pageSize);
+
+    PageVO<ArticleDetailVO> getPublicCommented(Long id, Long page, Long pageSize);
 }

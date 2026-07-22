@@ -19,6 +19,8 @@ public class Users {
     private String nickname;  //昵称
     private String avatarUrl;  //头像地址
     private String bio;  //个人简介
+    private String loginType = "password";  //登录方式: password / github
+    private Long githubId;  //GitHub 用户ID
     private Integer status = 1; //状态：0禁用，1正常
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;

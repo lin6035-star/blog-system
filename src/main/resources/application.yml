@@ -38,6 +38,17 @@ mybatis-plus:
 jwt:
   secret: blog-system-dev-secret-change-later
 
+# GitHub OAuth
+github:
+  oauth:
+    client-id: Ov23liAK8jSJ1Omz1MTI
+    client-secret: 7fed3fa95a98677ddac04f1573a671071a044902
+    redirect-uri: http://localhost:8080/api/auth/github/callback
+
+# 前端地址
+app:
+  frontend-url: http://localhost:5173
+
 # 阿里云OSS
 aliyun:
   oss:

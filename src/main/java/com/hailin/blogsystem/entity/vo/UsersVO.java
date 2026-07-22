@@ -12,6 +12,8 @@ public class UsersVO {  //UserVO 是用户资料
     private String nickname;
     private String avatarUrl;
     private String bio;
+    private Long followersCount;
+    private Long followingCount;
     private LocalDateTime createdAt;
 
     public static UsersVO from(Users user){
@@ -21,6 +23,8 @@ public class UsersVO {  //UserVO 是用户资料
         usersVO.setNickname(user.getNickname());
         usersVO.setAvatarUrl(user.getAvatarUrl());
         usersVO.setBio(user.getBio());
+        usersVO.setFollowersCount(user.getFollowersCount() == null ? 0L : user.getFollowersCount().longValue());
+        usersVO.setFollowingCount(user.getFollowingCount() == null ? 0L : user.getFollowingCount().longValue());
         usersVO.setCreatedAt(user.getCreatedAt());
 
         return usersVO;

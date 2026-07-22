@@ -9,18 +9,10 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.hailin.blogsystem.constants.BlogConstants;
 import com.hailin.blogsystem.constants.RedisConstants;
-import com.hailin.blogsystem.entity.ArticleFavorites;
-import com.hailin.blogsystem.entity.ArticleLikes;
-import com.hailin.blogsystem.entity.Articles;
-import com.hailin.blogsystem.entity.Category;
-import com.hailin.blogsystem.entity.Users;
+import com.hailin.blogsystem.entity.*;
 import com.hailin.blogsystem.entity.dto.ArticlesDTO;
 import com.hailin.blogsystem.entity.vo.PageVO;
-import com.hailin.blogsystem.mapper.ArticleFavoritesMapper;
-import com.hailin.blogsystem.mapper.ArticleLikesMapper;
-import com.hailin.blogsystem.mapper.ArticlesMapper;
-import com.hailin.blogsystem.mapper.CategoryMapper;
-import com.hailin.blogsystem.mapper.UsersMapper;
+import com.hailin.blogsystem.mapper.*;
 import com.hailin.blogsystem.service.ArticlesService;
 import com.hailin.blogsystem.entity.vo.ArticleDetailVO;
 import com.hailin.blogsystem.utils.UserContext;
@@ -45,6 +37,7 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
     private final CategoryMapper categoryMapper;
     private final ArticleLikesMapper articleLikesMapper;
     private final ArticleFavoritesMapper articleFavoritesMapper;
+    private final CommentsMapper commentsMapper;
 
     private final ObjectMapper objectMapper;
 
@@ -207,8 +200,8 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
     }
 
 
-    @Override
-    public ArticleDetailVO getArticlesById(Long id) {  //3.获取我自己的文章详情
+    @Override  //3.获取我自己的文章详情
+    public ArticleDetailVO getArticlesById(Long id) {
         Articles articles = getById(id);
         if(articles == null){
             throw new IllegalArgumentException("未找到该博文");
@@ -592,6 +585,166 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
         return new PageVO<>(
                 list,
                 total == null ? 0 : total,
+                page,
+                pageSize
+        );
+    }
+
+
+    @Override  //10.默认加载：他发布的文章
+    public PageVO<ArticleDetailVO> getPublicUserArticles(Long id,Long page,Long pageSize) {
+        Page<Articles> pageResult = lambdaQuery()
+                .eq(Articles::getAuthorId,id)
+                .eq(Articles::getStatus,BlogConstants.ArticlesStatus.PUBLISHED)
+                .page(new Page<>(page,pageSize));
+
+        List<ArticleDetailVO> list = pageResult.getRecords()
+                .stream()
+                .map(ArticleDetailVO::from)
+                .toList();
+
+        fillArticleMeta(list);
+        fillArticleLiked(list);
+        fillArticleFavorited(list);
+        fillArticleViewCount(list);
+
+        return new PageVO<>(
+                list,
+                pageResult.getTotal(),
+                page,
+                pageSize
+        );
+    }
+
+    @Override  //11.查看他喜欢的文章
+    public PageVO<ArticleDetailVO> getPublicUserLiked(Long id, Long page, Long pageSize) {
+
+        Page<ArticleLikes> articleLikesPage = articleLikesMapper.selectPage(new Page<>(page, pageSize),
+                new LambdaQueryWrapper<ArticleLikes>()
+                        .eq(ArticleLikes::getUserId, id)
+                        .orderByDesc(ArticleLikes::getCreateTime));
+        //拿到这一页的文章id
+        List<Long> articleIds = articleLikesPage.getRecords().stream()
+                .map(ArticleLikes::getArticleId)
+                .toList();
+        if (articleIds.isEmpty()) {
+            return new PageVO<>(List.of(), 0L, page, pageSize);
+        }
+        //再查文章
+        List<Articles> articles = lambdaQuery().in(Articles::getId, articleIds)
+                .eq(Articles::getStatus, BlogConstants.ArticlesStatus.PUBLISHED)
+                .list();
+        //in 查出来的顺序不一定等于 articleIds 的顺序，所以要转 Map，再按 articleIds 顺序组装
+        Map<Long,Articles> articleMap = articles.stream()
+                .collect(Collectors.toMap(Articles::getId, Function.identity()));
+
+        List<ArticleDetailVO> list = articleIds.stream()
+                .map(articleMap::get)
+                .map(ArticleDetailVO::from)
+                .filter(Objects::nonNull)
+                .toList();
+        fillArticleMeta(list);
+        fillArticleLiked(list);
+        fillArticleFavorited(list);
+
+        return new PageVO<>(
+                list,
+                articleLikesPage.getTotal(),
+                page,
+                pageSize
+        );
+    }
+
+    @Override  //12.查看他收藏的文章
+    public PageVO<ArticleDetailVO> getPublicUserFavorited(Long id, Long page, Long pageSize) {
+
+        Page<ArticleFavorites> articleFavoritessPage = articleFavoritesMapper.selectPage(new Page<>(page, pageSize),
+                new LambdaQueryWrapper<ArticleFavorites>()
+                        .eq(ArticleFavorites::getUserId, id)
+                        .orderByDesc(ArticleFavorites::getCreateTime));
+        //获取该页文章的id
+        List<Long> articleIds = articleFavoritessPage.getRecords().stream()
+                .map(ArticleFavorites::getArticleId)
+                .toList();
+
+        if (articleIds.isEmpty()) {
+            return new PageVO<>(List.of(), 0L, page, pageSize);
+        }
+        //再查文章
+        List<Articles> articles = lambdaQuery().in(Articles::getId, articleIds)
+                .eq(Articles::getStatus, BlogConstants.ArticlesStatus.PUBLISHED)
+                .list();
+
+        Map<Long, Articles> articleMap = articles.stream()
+                .collect(Collectors.toMap(Articles::getId, Function.identity()));
+
+        List<ArticleDetailVO> list = articleIds.stream()
+                .map(articleMap::get)
+                .filter(Objects::nonNull)
+                .map(ArticleDetailVO::from)
+                .toList();
+
+        fillArticleMeta(list);
+        fillArticleLiked(list);
+        fillArticleFavorited(list);
+
+        return new PageVO<>(
+                list,
+                articleFavoritessPage.getTotal(),
+                page,
+                pageSize
+        );
+
+    }
+
+    @Override  //13.查看他评论过的文章
+    public PageVO<ArticleDetailVO> getPublicCommented(Long id, Long page, Long pageSize) {
+        List<ArticleComments> comments = commentsMapper.selectList(
+                new LambdaQueryWrapper<ArticleComments>()
+                        .eq(ArticleComments::getUserId,id)
+                        .orderByDesc(ArticleComments::getCreatedAt)
+        );
+
+        List<Long> articleIds = comments.stream()
+                .map(ArticleComments::getArticleId)
+                .filter(Objects::nonNull)
+                .distinct()
+                .toList();
+
+        if (articleIds.isEmpty()) {
+            return new PageVO<>(List.of(), 0L, page, pageSize);
+        }
+
+        int from = (int) ((page - 1) * pageSize);
+        int to = Math.min(from + pageSize.intValue(), articleIds.size());
+
+        if (from >= articleIds.size()) {
+            return new PageVO<>(List.of(), (long) articleIds.size(), page, pageSize);
+        }
+
+        List<Long> pageArticleIds = articleIds.subList(from, to);
+
+        List<Articles> articles = lambdaQuery()
+                .in(Articles::getId, pageArticleIds)
+                .eq(Articles::getStatus, BlogConstants.ArticlesStatus.PUBLISHED)
+                .list();
+
+        Map<Long, Articles> articleMap = articles.stream()
+                .collect(Collectors.toMap(Articles::getId, Function.identity()));
+
+        List<ArticleDetailVO> list = pageArticleIds.stream()
+                .map(articleMap::get)
+                .filter(Objects::nonNull)
+                .map(ArticleDetailVO::from)
+                .toList();
+
+        fillArticleMeta(list);
+        fillArticleLiked(list);
+        fillArticleFavorited(list);
+
+        return new PageVO<>(
+                list,
+                (long) articleIds.size(),
                 page,
                 pageSize
         );

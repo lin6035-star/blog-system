@@ -8,6 +8,8 @@ import com.hailin.blogsystem.entity.*;
 import com.hailin.blogsystem.entity.dto.UserProfileDTO;
 import com.hailin.blogsystem.entity.vo.ArticleDetailVO;
 import com.hailin.blogsystem.entity.vo.PageVO;
+import com.hailin.blogsystem.entity.vo.UserInfoVO;
+import com.hailin.blogsystem.entity.vo.UserRelationVO;
 import com.hailin.blogsystem.entity.vo.UsersVO;
 import com.hailin.blogsystem.mapper.*;
 import com.hailin.blogsystem.service.ArticlesService;
@@ -34,6 +36,8 @@ public class UsersServiceImpl extends ServiceImpl<UsersMapper, Users>
     private final ArticleFavoritesMapper articleFavoritesMapper;
     private final CategoryMapper categoryMapper;
     private final UsersMapper usersMapper;
+    private final FollowMapper followMapper;
+    private final ArticlesMapper articlesMapper;
 
     @Override  //1.获取当前用户
     public UsersVO getUsersInfo() {
@@ -48,7 +52,7 @@ public class UsersServiceImpl extends ServiceImpl<UsersMapper, Users>
             throw new IllegalArgumentException("该用户不存在，出现错误");
         }
 
-        return UsersVO.from(users);
+        return buildCurrentUserVO(users);
     }
 
     @Override // 修改当前用户昵称和个人简介
@@ -85,7 +89,21 @@ public class UsersServiceImpl extends ServiceImpl<UsersMapper, Users>
         users.setNickname(nickname);
         users.setBio(bio);
         users.setUpdatedAt(updatedAt);
-        return UsersVO.from(users);
+        return buildCurrentUserVO(users);
+    }
+
+    private UsersVO buildCurrentUserVO(Users users) {
+        UsersVO usersVO = UsersVO.from(users);
+        Long followersCount = followMapper.selectCount(new LambdaQueryWrapper<UserFollows>()
+                .eq(UserFollows::getFollowingId, users.getId())
+                .isNull(UserFollows::getDeletedAt));
+        Long followingCount = followMapper.selectCount(new LambdaQueryWrapper<UserFollows>()
+                .eq(UserFollows::getFollowerId, users.getId())
+                .isNull(UserFollows::getDeletedAt));
+
+        usersVO.setFollowersCount(followersCount);
+        usersVO.setFollowingCount(followingCount);
+        return usersVO;
     }
 
     private final ArticlesService articlesService;
@@ -287,6 +305,140 @@ public class UsersServiceImpl extends ServiceImpl<UsersMapper, Users>
         );
     }
 
+
+    @Override  //6.他人点进用户中心获取用户资料
+    public UserInfoVO getPublicUserInfo(Long id) {
+        Users user = getById(id);
+        Long userId = UserContext.get();
+
+        if(user == null){
+            throw  new IllegalArgumentException("该用户不存在");
+        }
+
+        UserInfoVO userInfoVO = UserInfoVO.from(user);
+        userInfoVO.setSelf(userId != null && userId.equals(id));
+
+        if(userId != null && !userId.equals(id)){
+            UserFollows followOne = followMapper.selectOne(new LambdaQueryWrapper<UserFollows>()
+                    .eq(UserFollows::getFollowerId, userId)
+                    .eq(UserFollows::getFollowingId,id)
+                    .isNull(UserFollows::getDeletedAt));
+            if(followOne != null){
+                userInfoVO.setFollowed(true);
+            }
+        }
+        Long followersCount = followMapper.selectCount(new LambdaQueryWrapper<UserFollows>()
+                .eq(UserFollows::getFollowingId, id)
+                .isNull(UserFollows::getDeletedAt)
+        );
+        Long followingCount = followMapper.selectCount(new LambdaQueryWrapper<UserFollows>()
+                .eq(UserFollows::getFollowerId, id)
+                .isNull(UserFollows::getDeletedAt));
+
+        userInfoVO.setFollowersCount(followersCount);
+        userInfoVO.setFollowingCount(followingCount);
+
+        Long articlesCount = articlesMapper.selectCount(new LambdaQueryWrapper<Articles>()
+                .eq(Articles::getAuthorId, id)
+                .eq(Articles::getStatus, BlogConstants.ArticlesStatus.PUBLISHED));
+        userInfoVO.setArticlesCount(articlesCount);
+
+        return userInfoVO;
+    }
+
+    @Override
+    public PageVO<UserRelationVO> getPublicUserFollowing(Long id, Long page, Long pageSize) {
+        ensurePublicUserExists(id);
+
+        Page<UserFollows> followPage = followMapper.selectPage(new Page<>(page, pageSize),
+                new LambdaQueryWrapper<UserFollows>()
+                        .eq(UserFollows::getFollowerId, id)
+                        .isNull(UserFollows::getDeletedAt)
+                        .orderByDesc(UserFollows::getCreatedAt)
+                        .orderByDesc(UserFollows::getId));
+
+        List<Long> userIds = followPage.getRecords().stream()
+                .map(UserFollows::getFollowingId)
+                .toList();
+
+        return buildRelationPage(userIds, followPage.getTotal(), page, pageSize);
+    }
+
+    @Override
+    public PageVO<UserRelationVO> getPublicUserFollowers(Long id, Long page, Long pageSize) {
+        ensurePublicUserExists(id);
+
+        Page<UserFollows> followPage = followMapper.selectPage(new Page<>(page, pageSize),
+                new LambdaQueryWrapper<UserFollows>()
+                        .eq(UserFollows::getFollowingId, id)
+                        .isNull(UserFollows::getDeletedAt)
+                        .orderByDesc(UserFollows::getCreatedAt)
+                        .orderByDesc(UserFollows::getId));
+
+        List<Long> userIds = followPage.getRecords().stream()
+                .map(UserFollows::getFollowerId)
+                .toList();
+
+        return buildRelationPage(userIds, followPage.getTotal(), page, pageSize);
+    }
+
+    private void ensurePublicUserExists(Long id) {
+        Users user = getById(id);
+        if (user == null) {
+            throw new IllegalArgumentException("该用户不存在");
+        }
+    }
+
+    private PageVO<UserRelationVO> buildRelationPage(List<Long> userIds, Long total, Long page, Long pageSize) {
+        if (userIds.isEmpty()) {
+            return new PageVO<>(List.of(), total, page, pageSize);
+        }
+
+        Map<Long, Users> usersById = usersMapper.selectBatchIds(userIds)
+                .stream()
+                .collect(Collectors.toMap(Users::getId, Function.identity()));
+
+        List<UserRelationVO> list = userIds.stream()
+                .map(usersById::get)
+                .filter(Objects::nonNull)
+                .map(UserRelationVO::from)
+                .toList();
+
+        fillRelationState(list);
+
+        return new PageVO<>(list, total, page, pageSize);
+    }
+
+    private void fillRelationState(List<UserRelationVO> users) {
+        if (users == null || users.isEmpty()) {
+            return;
+        }
+
+        Long currentUserId = UserContext.get();
+        if (currentUserId == null) {
+            return;
+        }
+
+        List<Long> userIds = users.stream()
+                .map(UserRelationVO::getId)
+                .filter(Objects::nonNull)
+                .toList();
+
+        Set<Long> followedUserIds = followMapper.selectList(
+                        new LambdaQueryWrapper<UserFollows>()
+                                .eq(UserFollows::getFollowerId, currentUserId)
+                                .in(UserFollows::getFollowingId, userIds)
+                                .isNull(UserFollows::getDeletedAt))
+                .stream()
+                .map(UserFollows::getFollowingId)
+                .collect(Collectors.toSet());
+
+        for (UserRelationVO user : users) {
+            boolean self = currentUserId.equals(user.getId());
+            user.setSelf(self);
+            user.setFollowed(!self && followedUserIds.contains(user.getId()));
+        }
+    }
 
 
     private void fillArticleMeta(List<ArticleDetailVO> articles) {

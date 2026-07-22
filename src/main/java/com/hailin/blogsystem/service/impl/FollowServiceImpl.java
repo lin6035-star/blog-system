@@ -67,10 +67,15 @@ implements FollowService {
             return;
         }
 
-        history.setUpdatedAt(LocalDateTime.now());
-        history.setDeletedAt(null);
+        if(history.getDeletedAt() == null){
+            throw new IllegalArgumentException("已经关注该up");
+        }
 
-        updateById(history);
+        update(new LambdaUpdateWrapper<UserFollows>()
+                .eq(UserFollows::getFollowerId, userId)
+                .eq(UserFollows::getFollowingId, followingId)
+                .set(UserFollows::getUpdatedAt, LocalDateTime.now())
+                .set(UserFollows::getDeletedAt, null));
 
         usersMapper.update(null,
                 new LambdaUpdateWrapper<Users>()

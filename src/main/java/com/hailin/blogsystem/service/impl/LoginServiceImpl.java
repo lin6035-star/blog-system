@@ -37,6 +37,7 @@ public class LoginServiceImpl extends ServiceImpl<LoginMapper, Users>
 
         Users users = lambdaQuery()
                 .eq(Users::getUsername, registerDTO.getUsername())
+                .eq(Users::getLoginType, "password")
                 .one();
         if(users != null){
             throw new BusinessException(BlogConstants.ErrorCode.BAD_REQUEST, "用户名已存在");
@@ -46,6 +47,7 @@ public class LoginServiceImpl extends ServiceImpl<LoginMapper, Users>
         user.setUsername(registerDTO.getUsername());
         user.setNickname(registerDTO.getNickname());
         user.setPasswordHash(passwordEncoder.encode(registerDTO.getPassword()));
+        user.setLoginType("password");
         user.setCreatedAt(LocalDateTime.now());
         user.setUpdatedAt(LocalDateTime.now());
 
@@ -60,6 +62,7 @@ public class LoginServiceImpl extends ServiceImpl<LoginMapper, Users>
 
         Users users = lambdaQuery()
                 .eq(Users::getUsername, loginDTO.getUsername())
+                .eq(Users::getLoginType, "password")
                 .one();
 
         if(users == null || !passwordEncoder.matches(loginDTO.getPassword(),users.getPasswordHash())){
