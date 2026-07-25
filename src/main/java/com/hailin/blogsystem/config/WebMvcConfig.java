@@ -29,7 +29,9 @@ public class WebMvcConfig implements WebMvcConfigurer {
                         "/api/users/*/favorited",
                         "/api/users/*/commented",
                         "/api/users/*/followers",
-                        "/api/users/*/following"
+                        "/api/users/*/following",
+                        "/api/ai/chat",
+                        "/api/ai/chat/stream"
                 )
                 .excludePathPatterns(
                         "/api/users/me",
@@ -43,8 +45,11 @@ public class WebMvcConfig implements WebMvcConfigurer {
                         "/api/comments/**",
                         "/api/articles/*/like",
                         "/api/articles/*/favorite",
-                        "/api/users/*/follow"
+                        "/api/users/*/follow",
+                        "/api/ai/**"
                 )
-                .excludePathPatterns("/api/comments/*/replies");
+                .excludePathPatterns("/api/comments/*/replies",
+                                     "/api/ai/chat",
+                                     "/api/ai/chat/stream");
     }
 }
