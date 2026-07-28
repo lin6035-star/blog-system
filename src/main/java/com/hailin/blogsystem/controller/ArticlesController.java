@@ -42,4 +42,11 @@ public class ArticlesController {
         PageVO<ArticleDetailVO> data = articlesService.getHotArticles(page, pageSize);
         return Result.success(data);
     }
+
+    @PostMapping("/articles/{id}/share")  //收藏文章
+    public Result shareArticle(@PathVariable Long id){
+        articlesService.shareArticle(id);
+
+        return Result.success();
+    }
 }

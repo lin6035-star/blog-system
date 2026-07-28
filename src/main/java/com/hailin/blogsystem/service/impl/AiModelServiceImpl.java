@@ -1,6 +1,8 @@
 package com.hailin.blogsystem.service.impl;
 
+import com.hailin.blogsystem.ai.tool.*;
 import com.hailin.blogsystem.config.BlogAiProperties;
+import com.hailin.blogsystem.entity.AiPrompt;
 import com.hailin.blogsystem.service.AiModelService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
@@ -12,28 +14,35 @@ import reactor.core.publisher.Flux;
 public class AiModelServiceImpl implements AiModelService {
 
     private final ChatClient chatClient;
+    private final AiArticleTools aiArticleTools;
+    private final AiNavigationToolsFactory aiNavigationToolsFactory;
+    private final AiEditorToolFactory aiEditorToolFactory;
+    private final AiArticleActionToolsFactory aiArticleActionToolsFactory;
+    private final AiUserProfileTools aiUserProfileTools;
 
-    public AiModelServiceImpl(ChatClient.Builder chatClientBuilder, BlogAiProperties blogAiProperties) {
+
+    public AiModelServiceImpl(ChatClient.Builder chatClientBuilder, BlogAiProperties blogAiProperties, AiArticleTools aiArticleTools, AiNavigationToolsFactory aiNavigationToolsFactory, AiEditorToolFactory aiEditorToolFactory, AiArticleActionToolsFactory aiArticleActionToolsFactory, AiUserProfileTools aiUserProfileTools) {
+        this.aiArticleTools = aiArticleTools;
+        this.aiEditorToolFactory = aiEditorToolFactory;
+        this.aiArticleActionToolsFactory = aiArticleActionToolsFactory;
+        this.aiUserProfileTools = aiUserProfileTools;
         this.chatClient = chatClientBuilder
                 .defaultSystem(blogAiProperties.getSystemPrompt())
                 .build();
+        this.aiNavigationToolsFactory = aiNavigationToolsFactory;
     }
 
-    @Override  //阻塞式，等ai全部回答完在全部输出
-    public String chat(String message, String promptContext) {
-        String context = promptContext == null || promptContext.isBlank()
-                ? "无页面上下文"
-                : promptContext;
-
+    @Override
+    public String chat(AiPrompt prompt,String requestId) {
         try {
-            String content = chatClient.prompt()
-                    .user("""
-                        用户当前页面上下文：
-                        %s
+            AiNavigationTools aiNavigationTools = aiNavigationToolsFactory.create(requestId);
+            AiEditorTools aiEditorTools = aiEditorToolFactory.create(requestId);
+            AiArticleActionTools aiArticleActionTools = aiArticleActionToolsFactory.create(requestId);
 
-                        用户问题：
-                        %s
-                        """.formatted(context, message))
+
+            String content = chatClient.prompt()
+                    .user(prompt.getFinalPromptContext())
+                    .tools(aiArticleTools,aiNavigationTools,aiEditorTools,aiArticleActionTools,aiUserProfileTools)
                     .call()
                     .content();
 
@@ -44,25 +53,21 @@ public class AiModelServiceImpl implements AiModelService {
             return content;
 
         } catch (Exception e) {
-            log.error("AI 模型调用失败",e);
+            log.error("AI 模型调用失败", e);
             return fallbackMessage(e);
         }
     }
 
-    @Override  //流式输出
-    public Flux<String> streamChat(String message, String promptContext) {
-        String context = promptContext == null || promptContext.isBlank()
-                ? "无页面上下文"
-                : promptContext;
+    @Override
+    public Flux<String> streamChat(AiPrompt prompt,String requestId) {
+
+        AiNavigationTools aiNavigationTools = aiNavigationToolsFactory.create(requestId);
+        AiEditorTools aiEditorTools = aiEditorToolFactory.create(requestId);
+        AiArticleActionTools aiArticleActionTools = aiArticleActionToolsFactory.create(requestId);
 
         return chatClient.prompt()
-                .user("""
-                        用户当前页面上下文：
-                        %s
-
-                        用户问题：
-                        %s
-                        """.formatted(context, message))
+                .user(prompt.getFinalPromptContext())
+                .tools(aiArticleTools,aiNavigationTools,aiEditorTools,aiArticleActionTools,aiUserProfileTools)
                 .stream()
                 .content()
                 .onErrorResume(e -> {

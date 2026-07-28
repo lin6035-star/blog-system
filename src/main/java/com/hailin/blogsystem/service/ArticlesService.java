@@ -39,4 +39,6 @@ public interface ArticlesService extends IService<Articles>{
     PageVO<ArticleDetailVO> getPublicUserFavorited(Long id, Long page, Long pageSize);
 
     PageVO<ArticleDetailVO> getPublicCommented(Long id, Long page, Long pageSize);
+
+    void shareArticle(Long id);
 }

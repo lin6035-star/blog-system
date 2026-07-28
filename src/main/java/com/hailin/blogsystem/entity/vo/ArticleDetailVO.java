@@ -25,6 +25,7 @@ public class ArticleDetailVO {
     private Integer likeCount = 0;
     private Integer liked = 0;
     private Integer favorited = 0;
+    private Integer shareCount = 0;
 
     public static ArticleDetailVO from(Articles article) {
         if (article == null) {
@@ -45,6 +46,7 @@ public class ArticleDetailVO {
         vo.setCommentCount(article.getCommentCount());
         vo.setLikeCount(article.getLikeCount());
         vo.setFavoriteCount(article.getFavoriteCount());
+        vo.setShareCount(article.getShareCount());
         return vo;
     }
 }

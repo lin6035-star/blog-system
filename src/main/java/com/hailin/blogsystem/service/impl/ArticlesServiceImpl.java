@@ -750,6 +750,16 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
         );
     }
 
+    @Override  //14.收藏文章
+    public void shareArticle(Long id) {
+        lambdaUpdate()
+                .eq(Articles::getId,id)
+                .setSql("share_count = share_count + 1")
+                .update();
+
+        deleteArticleDetailCache(id);
+    }
+
 
     private void syncPublishedAt(Articles articles) {
         if (Objects.equals(articles.getStatus(), BlogConstants.ArticlesStatus.PUBLISHED)
