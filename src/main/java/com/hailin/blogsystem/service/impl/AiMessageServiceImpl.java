@@ -4,25 +4,22 @@ import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hailin.blogsystem.ai.tool.AiToolActionRegistry;
+import com.hailin.blogsystem.ai.tool.AiUserProfileTools;
+import com.hailin.blogsystem.constants.BlogConstants;
 import com.hailin.blogsystem.entity.*;
 import com.hailin.blogsystem.entity.dto.AiChatDTO;
 import com.hailin.blogsystem.entity.dto.AiCreateSessionDTO;
+import com.hailin.blogsystem.entity.dto.AiIntent;
 import com.hailin.blogsystem.entity.dto.PageContextDTO;
-import com.hailin.blogsystem.entity.vo.AiChatEventVO;
-import com.hailin.blogsystem.entity.vo.AiChatVO;
-import com.hailin.blogsystem.entity.vo.AiMessageVO;
-import com.hailin.blogsystem.entity.vo.AiSessionVO;
+import com.hailin.blogsystem.entity.vo.*;
 import com.hailin.blogsystem.mapper.AiMessageMapper;
 import com.hailin.blogsystem.mapper.AiSessionMapper;
-import com.hailin.blogsystem.service.AiMessageService;
-import com.hailin.blogsystem.service.AiPromptService;
-import com.hailin.blogsystem.service.AiSessionService;
+import com.hailin.blogsystem.service.*;
 import com.hailin.blogsystem.utils.UserContext;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import com.hailin.blogsystem.service.AiModelService;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.publisher.SignalType;
@@ -46,6 +43,10 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
     private final AiModelService aiModelService;
     private final AiPromptService aiPromptService;
     private final AiToolActionRegistry aiToolActionRegistry;
+    private final AiUserProfileTools aiUserProfileTools;
+    private final AiIntentClassifier aiIntentClassifier;
+    private final AiEditorDraftGenerator aiEditorDraftGenerator;
+    private final ArticlesService articlesService;
 
     private final AiSessionService aiSessionService;
     private final ObjectMapper objectMapper;
@@ -324,8 +325,26 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             getOwnedSession(sessionId, userId);
         }
 
+        AiIntent intent = aiIntentClassifier.classify(message,pageContext);
+        AiArticleActionCommand articleActionFromIntent = buildArticleActionFromIntent(intent, pageContext);
+        String extraPromptContext = buildExtraPromptContextFromIntent(intent, pageContext);
+        if (extraPromptContext == null || extraPromptContext.isBlank()) {
+            extraPromptContext = buildArticleDetailContextFromIntent(intent, pageContext);
+        }
+        if (extraPromptContext == null || extraPromptContext.isBlank()) {
+            extraPromptContext = buildArticleSearchContextFromIntent(intent);
+        }
+        
+        
+        AiNavigateCommand navigateFromIntent = buildNavigateFromIntent(intent,pageContext);
+        AiEditorCommand editorActionFromIntent = buildEditorActionFromIntent(intent,message);
+
         // 拼完整 prompt（含历史记忆 + 页面上下文 + 当前问题）
         AiPrompt prompt = aiPromptService.buildPrompt(message, pageContext, sessionId);
+        appendExtraPromptContext(prompt,extraPromptContext);  //将第一次模型回复的拼进prompt
+
+        String actionResultPromptContext = buildActionResultPromptContext(navigateFromIntent);
+        appendExtraPromptContext(prompt,actionResultPromptContext);
 
         AiMessages userMessage = new AiMessages();
         userMessage.setSessionId(sessionId);
@@ -363,16 +382,28 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             eventData.put("session", AiSessionVO.from(updatedSession));
             eventData.put("assistantMessage", AiMessageVO.from(assistantMessage));
 
-            AiNavigateCommand navigate = getNavigateOrInfer(requestId, message);
+            AiNavigateCommand navigate = navigateFromIntent;
+
+            if (navigate == null) {
+                navigate = getNavigateOrInfer(requestId, message);
+            }
             if (navigate != null) {
                 eventData.put("navigate", navigate);
             }
-            AiEditorCommand editorAction = getEditorActionOrInfer(requestId, message);
+
+            AiEditorCommand editorAction = editorActionFromIntent;
+
+            if (editorAction == null) {
+                editorAction = getEditorActionOrInfer(requestId, message);
+            }
             if(editorAction != null){
                 eventData.put("editorAction", editorAction);
             }
 
-            AiArticleActionCommand articleAction = getArticleActionOrInfer(requestId, message, pageContext);
+            AiArticleActionCommand articleAction = articleActionFromIntent;
+            if(articleAction == null){
+                articleAction = getArticleActionOrInfer(requestId, message, pageContext);
+            }
             if (articleAction != null) {
                 eventData.put("articleAction", articleAction);
             }
@@ -445,8 +476,22 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         userMessage.setContent(message);
         userMessage.setCreatedAt(LocalDateTime.now());
 
+        AiIntent intent = aiIntentClassifier.classify(message, pageContext);
+        AiArticleActionCommand articleActionFromIntent = buildArticleActionFromIntent(intent, pageContext);
+        String extraPromptContext = buildExtraPromptContextFromIntent(intent, pageContext);
+        if (extraPromptContext == null || extraPromptContext.isBlank()) {
+            extraPromptContext = buildArticleDetailContextFromIntent(intent, pageContext);
+        }
+
+        AiNavigateCommand navigateFromIntent = buildNavigateFromIntent(intent,pageContext);
+        AiEditorCommand editorActionFromIntent = buildEditorActionFromIntent(intent,message);
+
         // 拼 prompt（游客无 sessionId，跳过历史记忆）
         AiPrompt prompt = aiPromptService.buildPrompt(message, pageContext, null);
+        appendExtraPromptContext(prompt, extraPromptContext);
+
+        String actionResultPromptContext = buildActionResultPromptContext(navigateFromIntent);
+        appendExtraPromptContext(prompt,actionResultPromptContext);
 
         AiChatEventVO paramEvent = AiChatEventVO.builder()
                 .eventType(AiChatEventType.PARAM.getValue())
@@ -466,7 +511,6 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
 
         Mono<AiChatEventVO> stopEvent = Mono.fromSupplier(() -> {
             String reply = fullReply.toString();
-            AiNavigateCommand navigate = getNavigateOrInfer(requestId, message);
 
             AiMessageVO assistantMessage = new AiMessageVO();
             assistantMessage.setId("guest-ai-" + System.currentTimeMillis());
@@ -478,16 +522,28 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             Map<String, Object> eventData = new HashMap<>();
             eventData.put("session", guestSession);
             eventData.put("assistantMessage", assistantMessage);
+
+            AiNavigateCommand navigate = navigateFromIntent;
+
+            if (navigate == null) {
+                navigate = getNavigateOrInfer(requestId, message);
+            }
             if (navigate != null) {
                 eventData.put("navigate", navigate);
             }
 
-            AiEditorCommand editorAction = getEditorActionOrInfer(requestId, message);
+            AiEditorCommand editorAction = editorActionFromIntent;
+            if (editorAction == null) {
+                editorAction = getEditorActionOrInfer(requestId, message);
+            }
             if(editorAction != null){
                 eventData.put("editorAction", editorAction);
             }
 
-            AiArticleActionCommand articleAction = getArticleActionOrInfer(requestId, message, pageContext);
+            AiArticleActionCommand articleAction = articleActionFromIntent;
+            if(articleAction == null){
+                articleAction = getArticleActionOrInfer(requestId, message, pageContext);
+            }
             if (articleAction != null) {
                 eventData.put("articleAction", articleAction);
             }
@@ -679,5 +735,287 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         command.setType(type);
         command.setArticleId(pageContext.getArticleId());
         return command;
+    }
+
+
+    //第一个：根据意图生成文章动作。
+    private AiArticleActionCommand buildArticleActionFromIntent(AiIntent intent,PageContextDTO pageContext){
+        if(intent == null || !"ARTICLE_ACTION".equals(intent.getIntent())){
+            return null;
+        }
+
+        String articleId = intent.getArticleId();
+        if ((articleId == null || articleId.isBlank())
+                && pageContext != null
+                && pageContext.getArticleId() != null
+                && !pageContext.getArticleId().isBlank()) {
+            articleId = pageContext.getArticleId();
+        }
+
+        if (articleId == null || articleId.isBlank()) {
+            return null;
+        }
+
+        if (intent.getActionType() == null || intent.getActionType().isBlank()) {
+            return null;
+        }
+
+        AiArticleActionCommand command = new AiArticleActionCommand();
+        command.setType(intent.getActionType());
+        command.setArticleId(articleId);
+        command.setContent(intent.getContent());
+
+        return command;
+
+    }
+    //第二个：根据意图准备额外上下文
+    private String buildExtraPromptContextFromIntent(AiIntent intent,PageContextDTO pageContext){
+        if (intent == null || !"USER_PROFILE_INSIGHT".equals(intent.getIntent())) {
+            return null;
+        }
+        String userId = intent.getUserId();
+
+        if((userId == null || userId.isBlank())
+                && pageContext != null
+                && pageContext.getUserId() != null
+                && !pageContext.getUserId().isBlank())
+        {
+            userId = pageContext.getUserId();
+        }
+
+        if (userId == null || userId.isBlank()) {
+            return "用户想了解当前主页信息，但缺少 userId，无法查询用户画像。";
+        }
+
+        return aiUserProfileTools.getUserProfileInsight(Long.valueOf(userId));
+    }
+    //第三个：拼进 prompt
+    private void appendExtraPromptContext(AiPrompt prompt, String extraPromptContext) {
+        if (prompt == null || extraPromptContext == null || extraPromptContext.isBlank()) {
+            return;
+        }
+
+        prompt.setFinalPromptContext(
+                prompt.getFinalPromptContext()
+                        + "\n\n## 意图识别补充上下文\n"
+                        + extraPromptContext
+        );
+    }
+
+    //关于路由跳转的结构
+    private AiNavigateCommand buildNavigateFromIntent(AiIntent intent,PageContextDTO pageContext) {
+        if (intent == null || !"NAVIGATE".equals(intent.getIntent())) {
+            return null;
+        }
+
+        String target = intent.getTarget();
+        String param = intent.getParam();
+
+        if("userProfile".equals(target)){
+            param = resolveAuthorIdByArticleId(intent, pageContext);
+        }
+
+
+        if (target == null || target.isBlank()) {
+            return null;
+        }
+        if (param != null && param.isBlank()) {
+            param = null;
+        }
+
+        return new AiNavigateCommand(target, param);
+    }
+    private String resolveAuthorIdByArticleId(AiIntent intent,PageContextDTO pageContext){
+        String articleId = null;
+
+        if (pageContext != null && pageContext.getArticleId() != null) {
+            articleId = pageContext.getArticleId();
+        }
+
+        if ((articleId == null || articleId.isBlank()) && intent.getArticleId() != null) {
+            articleId = intent.getArticleId();
+        }
+
+        if (articleId == null || articleId.isBlank()) {
+            return null;
+        }
+
+        Articles article = articlesService.getById(Long.valueOf(articleId));
+
+        if (article == null || article.getAuthorId() == null) {
+            return null;
+        }
+
+        return article.getAuthorId().toString();
+    }
+
+    //关于文章的保存和发布的结构
+    private AiEditorCommand buildEditorActionFromIntent(AiIntent intent,String message) {
+        if (intent == null || !"EDITOR_ACTION".equals(intent.getIntent())) {
+            return null;
+        }
+
+        String actionType = intent.getActionType();
+        if (actionType == null || actionType.isBlank()) {
+            return null;
+        }
+
+        if ("saveDraft".equals(actionType) || "publish".equals(actionType)) {
+            AiEditorCommand command = new AiEditorCommand();
+            command.setType(actionType);
+            return command;
+        }
+
+        if ("fillArticle".equals(actionType)) {
+            return aiEditorDraftGenerator.generateDraft(message, intent);
+        }
+
+        return null;
+    }
+
+    //关于文章详情页的文章总结
+    private String buildArticleDetailContextFromIntent(AiIntent intent,PageContextDTO pageContext){
+        if(intent == null || !"ARTICLE_DETAIL_QA".equals(intent.getIntent())){
+            return null;
+        }
+
+        String articleId = intent.getArticleId();
+
+        if(articleId == null || articleId.isBlank()
+        && pageContext != null
+        && pageContext.getArticleId() != null
+        && !pageContext.getArticleId().isBlank()){
+            articleId = pageContext.getArticleId();
+        }
+
+        if (articleId == null || articleId.isBlank()) {
+            return "用户想询问当前文章内容，但缺少 articleId，无法读取文章详情。";
+        }
+
+        Long id;
+        try{
+            id = Long.valueOf(articleId);
+        }
+        catch (Exception e){
+            return "当前文章ID格式错误，无法读取文章详情。";
+        }
+
+        Articles article = articlesService.lambdaQuery()
+                .select(
+                        Articles::getId,
+                        Articles::getTitle,
+                        Articles::getSummary,
+                        Articles::getContent
+                )
+                .eq(Articles::getId,id)
+                .eq(Articles::getStatus, BlogConstants.ArticlesStatus.PUBLISHED)
+                .one();
+
+        if (article == null) {
+            return "当前文章不存在或未发布。";
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("当前文章内容：\n");
+        sb.append("标题：").append(article.getTitle()).append("\n");
+
+        if (article.getSummary() != null && !article.getSummary().isBlank()) {
+            sb.append("摘要：").append(article.getSummary()).append("\n");
+        }
+
+        sb.append("正文：\n")
+                .append(limitText(article.getContent(), 9000))
+                .append("\n");
+
+        sb.append("\n请基于以上文章内容回答用户问题，不要编造文章中没有的信息。");
+
+        return sb.toString();
+    }
+    private String limitText(String text, int maxLength) {
+        if (text == null) {
+            return "";
+        }
+        if (text.length() <= maxLength) {
+            return text;
+        }
+        return text.substring(0, maxLength) + "\n\n[文章内容过长，后半部分已省略]";
+    }
+    
+    //关于搜索站内文章列表
+    private String buildArticleSearchContextFromIntent(AiIntent intent){
+        if(intent == null || !"ARTICLE_SEARCH".equals(intent.getIntent())){
+            return null;
+        }
+
+        String keyword = intent.getKeyWord();
+        if (keyword == null || keyword.isBlank()) {
+            return "用户想搜索站内文章，但缺少搜索关键词。";
+        }
+
+        PageVO<ArticleDetailVO> pageResult = articlesService.getArticles(1L, 3L, intent.getKeyWord(), null, "lasted");
+        List<ArticleDetailVO> list = pageResult.getList();
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("站内文章搜索结果：\n");
+        sb.append("搜索关键词：").append(keyword).append("\n");
+        sb.append("结果总数：").append(pageResult.getTotal()).append("\n\n");
+
+        if (list == null || list.isEmpty()) {
+            sb.append("没有找到匹配的公开文章。\n");
+            sb.append("请告诉用户暂时没有找到相关文章，不要编造不存在的文章。");
+            return sb.toString();
+        }
+
+        sb.append("最多展示前 3 篇：\n");
+
+        for (int i = 0; i < list.size(); i++) {
+            ArticleDetailVO article = list.get(i);
+
+            sb.append(i + 1).append(". ");
+            sb.append("文章ID：").append(article.getId()).append("\n");
+            sb.append("标题：").append(article.getTitle()).append("\n");
+
+            if (article.getSummary() != null && !article.getSummary().isBlank()) {
+                sb.append("摘要：").append(article.getSummary()).append("\n");
+            }
+
+            sb.append("浏览数：").append(article.getViewCount()).append("\n");
+            sb.append("点赞数：").append(article.getLikeCount()).append("\n");
+            sb.append("收藏数：").append(article.getFavoriteCount()).append("\n");
+            sb.append("评论数：").append(article.getCommentCount()).append("\n");
+            sb.append("\n");
+        }
+
+        sb.append("请基于以上搜索结果回答用户。");
+        sb.append("如果用户想打开某篇文章，可以提示他说“打开文章ID”。");
+        sb.append("不要编造搜索结果之外的文章。");
+
+        return sb.toString();
+    }
+
+    private String buildActionResultPromptContext(AiNavigateCommand navigate) {
+        if (navigate == null) {
+            return null;
+        }
+
+        if ("userProfile".equals(navigate.getTarget())) {
+            if (navigate.getParam() != null && !navigate.getParam().isBlank()) {
+                return """
+                    系统动作结果：
+                    后端已经根据当前文章ID查询到作者ID。
+                    本轮回答结束后，前端会自动跳转到该作者主页。
+                    你只需要简短回复用户，例如：好的，正在为你打开作者主页。
+                    不要说无法获取作者ID。
+                    """;
+            }
+
+            return """
+                系统动作结果：
+                后端没有解析到作者ID，因此无法跳转到作者主页。
+                请如实告诉用户当前无法跳转。
+                """;
+        }
+
+        return null;
     }
 }

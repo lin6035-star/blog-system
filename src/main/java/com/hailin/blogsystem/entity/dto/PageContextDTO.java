@@ -7,6 +7,7 @@ public class PageContextDTO {
     private String pageType;
     private String path;
     private String articleId;
+    private String authorId;
     private String articleTitle;
     private String userId;
 }

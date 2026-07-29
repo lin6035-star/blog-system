@@ -3,7 +3,9 @@ package com.hailin.blogsystem.service.impl;
 import com.hailin.blogsystem.ai.tool.*;
 import com.hailin.blogsystem.config.BlogAiProperties;
 import com.hailin.blogsystem.entity.AiPrompt;
+import com.hailin.blogsystem.service.AiIntentClassifier;
 import com.hailin.blogsystem.service.AiModelService;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.stereotype.Service;
@@ -19,13 +21,15 @@ public class AiModelServiceImpl implements AiModelService {
     private final AiEditorToolFactory aiEditorToolFactory;
     private final AiArticleActionToolsFactory aiArticleActionToolsFactory;
     private final AiUserProfileTools aiUserProfileTools;
+    private final AiIntentClassifier aiIntentClassifier;
 
 
-    public AiModelServiceImpl(ChatClient.Builder chatClientBuilder, BlogAiProperties blogAiProperties, AiArticleTools aiArticleTools, AiNavigationToolsFactory aiNavigationToolsFactory, AiEditorToolFactory aiEditorToolFactory, AiArticleActionToolsFactory aiArticleActionToolsFactory, AiUserProfileTools aiUserProfileTools) {
+    public AiModelServiceImpl(ChatClient.Builder chatClientBuilder, BlogAiProperties blogAiProperties, AiArticleTools aiArticleTools, AiNavigationToolsFactory aiNavigationToolsFactory, AiEditorToolFactory aiEditorToolFactory, AiArticleActionToolsFactory aiArticleActionToolsFactory, AiUserProfileTools aiUserProfileTools, AiIntentClassifier aiIntentClassifier) {
         this.aiArticleTools = aiArticleTools;
         this.aiEditorToolFactory = aiEditorToolFactory;
         this.aiArticleActionToolsFactory = aiArticleActionToolsFactory;
         this.aiUserProfileTools = aiUserProfileTools;
+        this.aiIntentClassifier = aiIntentClassifier;
         this.chatClient = chatClientBuilder
                 .defaultSystem(blogAiProperties.getSystemPrompt())
                 .build();

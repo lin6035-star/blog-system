@@ -750,7 +750,7 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
         );
     }
 
-    @Override  //14.收藏文章
+    @Override  //14.转发文章
     public void shareArticle(Long id) {
         lambdaUpdate()
                 .eq(Articles::getId,id)

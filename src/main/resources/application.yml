@@ -30,7 +30,8 @@ spring:
       read-timeout: 60s
       chat:
         options:
-          model: qwen3.7-plus
+          model: deepseek-v4-pro
+          reasoning-effort: low
 
 # mybatis-plus配置
 mybatis-plus:

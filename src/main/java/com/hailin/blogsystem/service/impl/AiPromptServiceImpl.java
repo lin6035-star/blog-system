@@ -57,7 +57,7 @@ public class AiPromptServiceImpl implements AiPromptService {
                     && pageContext.getArticleId() != null
                     && !pageContext.getArticleId().isBlank()) {
 
-                Long articleId;
+                /*Long articleId;
                 try {
                     articleId = Long.valueOf(pageContext.getArticleId());
                 } catch (NumberFormatException e) {
@@ -83,7 +83,7 @@ public class AiPromptServiceImpl implements AiPromptService {
                         sb.append("摘要：").append(article.getSummary()).append("\n");
                     }
                     sb.append("正文：\n").append(limitText(article.getContent(), 8000)).append("\n");
-                }
+                }*/
             }
         }
 
