@@ -1,8 +1,11 @@
 package com.hailin.blogsystem.service.impl;
 
+import com.hailin.blogsystem.ai.rag.ArticleRagPromptBuilder;
+import com.hailin.blogsystem.ai.rag.ArticleRagRetrieveService;
 import com.hailin.blogsystem.ai.tool.*;
 import com.hailin.blogsystem.config.BlogAiProperties;
 import com.hailin.blogsystem.entity.AiPrompt;
+import com.hailin.blogsystem.entity.dto.ArticleRagContext;
 import com.hailin.blogsystem.service.AiIntentClassifier;
 import com.hailin.blogsystem.service.AiModelService;
 import lombok.RequiredArgsConstructor;
@@ -10,6 +13,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
+
+import java.util.List;
 
 @Slf4j
 @Service
@@ -36,31 +41,32 @@ public class AiModelServiceImpl implements AiModelService {
         this.aiNavigationToolsFactory = aiNavigationToolsFactory;
     }
 
-    @Override
-    public String chat(AiPrompt prompt,String requestId) {
-        try {
-            AiNavigationTools aiNavigationTools = aiNavigationToolsFactory.create(requestId);
-            AiEditorTools aiEditorTools = aiEditorToolFactory.create(requestId);
-            AiArticleActionTools aiArticleActionTools = aiArticleActionToolsFactory.create(requestId);
-
-
-            String content = chatClient.prompt()
-                    .user(prompt.getFinalPromptContext())
-                    .tools(aiArticleTools,aiNavigationTools,aiEditorTools,aiArticleActionTools,aiUserProfileTools)
-                    .call()
-                    .content();
-
-            if (content == null || content.isBlank()) {
-                return "抱歉，AI 暂时没有返回有效内容，请稍后再试。";
-            }
-
-            return content;
-
-        } catch (Exception e) {
-            log.error("AI 模型调用失败", e);
-            return fallbackMessage(e);
-        }
-    }
+    // 【已废弃】非流式接口，前端已全面切到流式，暂时注释，后续删除
+    // @Override
+    // public String chat(AiPrompt prompt,String requestId) {
+    //     try {
+    //         AiNavigationTools aiNavigationTools = aiNavigationToolsFactory.create(requestId);
+    //         AiEditorTools aiEditorTools = aiEditorToolFactory.create(requestId);
+    //         AiArticleActionTools aiArticleActionTools = aiArticleActionToolsFactory.create(requestId);
+    //
+    //
+    //         String content = chatClient.prompt()
+    //                 .user(prompt.getFinalPromptContext())
+    //                 .tools(aiArticleTools,aiNavigationTools,aiEditorTools,aiArticleActionTools,aiUserProfileTools)
+    //                 .call()
+    //                 .content();
+    //
+    //         if (content == null || content.isBlank()) {
+    //             return "抱歉，AI 暂时没有返回有效内容，请稍后再试。";
+    //         }
+    //
+    //         return content;
+    //
+    //     } catch (Exception e) {
+    //         log.error("AI 模型调用失败", e);
+    //         return fallbackMessage(e);
+    //     }
+    // }
 
     @Override
     public Flux<String> streamChat(AiPrompt prompt,String requestId) {
@@ -98,4 +104,12 @@ public class AiModelServiceImpl implements AiModelService {
 
         return "抱歉，AI 服务暂时不可用，请稍后再试。";
     }
+
+    /*
+    * RAG 检索
+        -> 拼成知识库上下文
+        -> 追加到 finalPromptContext
+        -> 交给 ChatClient
+    * */
+
 }

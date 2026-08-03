@@ -12,6 +12,8 @@ public class RedisConstants
     public static final String TAG_LIST_KEY = "tag:list";
     public static final String COMMENT_LIKED_USER_KEY_PREFIX = "comment:liked:user:";
     public static final String COMMENT_LIST_KEY_PREFIX = "comment:list:article:";
+    //RAG 索引同步失败标记：rag:index:fail:{action}:{articleId}，action = index / delete / rebuild，articleId 为空用 all
+    public static final String RAG_INDEX_FAILURE_KEY_PREFIX = "rag:index:fail:";
 
 
     public static final double ARTICLE_VIEW_HOT_SCORE = 1.0;
@@ -31,6 +33,9 @@ public class RedisConstants
     //防止缓存穿透
     public static final String CACHE_NULL_VALUE = "__NULL__";
     public static final long CACHE_NULL_TTL_MINUTES = 3;
+
+    //RAG 索引失败标记 TTL（天）
+    public static final long RAG_INDEX_FAILURE_TTL_DAYS = 7;
 
     private RedisConstants(){
 

@@ -7,6 +7,8 @@ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.hailin.blogsystem.ai.rag.ArticleRagIndexService;
+import com.hailin.blogsystem.ai.rag.ArticleRagSyncService;
 import com.hailin.blogsystem.constants.BlogConstants;
 import com.hailin.blogsystem.constants.RedisConstants;
 import com.hailin.blogsystem.entity.*;
@@ -17,6 +19,7 @@ import com.hailin.blogsystem.service.ArticlesService;
 import com.hailin.blogsystem.entity.vo.ArticleDetailVO;
 import com.hailin.blogsystem.utils.UserContext;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
@@ -31,6 +34,7 @@ import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
+@Slf4j
 public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> implements ArticlesService {
 
     private final UsersMapper usersMapper;
@@ -38,6 +42,7 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
     private final ArticleLikesMapper articleLikesMapper;
     private final ArticleFavoritesMapper articleFavoritesMapper;
     private final CommentsMapper commentsMapper;
+    private final ArticleRagSyncService articleRagSyncService;
 
     private final ObjectMapper objectMapper;
 
@@ -420,6 +425,7 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
         save(articles);
         if(Objects.equals(articles.getStatus(), BlogConstants.ArticlesStatus.PUBLISHED)){
             deleteArticleListCache();
+            safelyIndexArticleRag(articles.getId());  //发布文章是自动同步RAG索引
         }
         return articles.getId();
     }
@@ -449,6 +455,21 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
 
         deleteArticleDetailCache(id);
         deleteArticleListCache();
+
+        syncArticleRagIndex(articles);  //更新文章之后要判断文章的状态，是否隐藏
+    }
+    private void syncArticleRagIndex(Articles article){
+        if (article == null || article.getId() == null) {
+            return;
+        }
+
+        //发布状态 -》 写入/刷新RAG
+        if(Objects.equals(article.getStatus(),BlogConstants.ArticlesStatus.PUBLISHED)){
+            safelyIndexArticleRag(article.getId());
+        }
+        else{  //隐藏 -》 从RAG删除
+            safelyDeleteArticleRagIndex(article.getId());
+        }
     }
 
 
@@ -467,6 +488,7 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
 
         deleteArticleDetailCache(id);
         deleteArticleListCache();
+        safelyDeleteArticleRagIndex(id);  //删除时自动同步 RAG 索引。
     }
 
 
@@ -489,6 +511,8 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
 
         deleteArticleDetailCache(id);
         deleteArticleListCache();
+
+        safelyDeleteArticleRagIndex(id);  //隐藏时自动同步 RAG 索引。
     }
 
 
@@ -512,6 +536,8 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
 
         deleteArticleDetailCache(id);
         deleteArticleListCache();
+
+        safelyIndexArticleRag(id);  //发布文章时自动同步 RAG 索引。
     }
 
 
@@ -946,7 +972,6 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
             // Redis删除失败不影响文章变更本身
         }
     }
-
     private void deleteArticleListCache() {
         try{
             Set<String> keys = stringRedisTemplate.keys(RedisConstants.ARTICLE_LIST_KEY_PREFIX + "*");
@@ -955,6 +980,23 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
             }
         }catch(Exception e){
             // Redis删除失败不影响文章变更本身
+        }
+    }
+
+    //但如果 ES 没开、Embedding API 超时、额度没了，现在可能会导致“文章发布失败”
+    //这不合理，最多影响AI检索，不影响用户正常发布文章
+    private void safelyIndexArticleRag(Long articleId){
+        try{
+            articleRagSyncService.indexArticle(articleId);
+        } catch (Exception e) {
+            log.warn("文章 RAG 索引同步失败，articleId={}",articleId,e);
+        }
+    }
+    private void safelyDeleteArticleRagIndex(Long articleId){
+        try{
+            articleRagSyncService.deleteArticleIndex(articleId);
+        } catch (Exception e) {
+            log.warn("文章 RAG 索引删除失败，articleId={}",articleId,e);
         }
     }
 }

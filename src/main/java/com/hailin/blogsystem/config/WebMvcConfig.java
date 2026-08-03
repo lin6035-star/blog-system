@@ -30,7 +30,7 @@ public class WebMvcConfig implements WebMvcConfigurer {
                         "/api/users/*/commented",
                         "/api/users/*/followers",
                         "/api/users/*/following",
-                        "/api/ai/chat",
+                        // "/api/ai/chat",  // 【已废弃】非流式接口
                         "/api/ai/chat/stream"
                 )
                 .excludePathPatterns(
@@ -49,7 +49,7 @@ public class WebMvcConfig implements WebMvcConfigurer {
                         "/api/ai/**"
                 )
                 .excludePathPatterns("/api/comments/*/replies",
-                                     "/api/ai/chat",
+                                     // "/api/ai/chat",  // 【已废弃】非流式接口
                                      "/api/ai/chat/stream");
     }
 }

@@ -22,6 +22,10 @@ spring:
     multipart:
       max-file-size: 10MB
       max-request-size: 10MB
+
+  elasticsearch:
+    uris: http://localhost:19200
+
   ai:
     openai:
       api-key: ${ALIYUN_API_KEY}
@@ -30,8 +34,17 @@ spring:
       read-timeout: 60s
       chat:
         options:
-          model: deepseek-v4-pro
-          reasoning-effort: low
+          model: ${AI_CHAT_MODEL:qwen3.7-plus}
+      embedding:
+        options:
+          model: text-embedding-v3
+          dimensions: 1024
+
+    vectorstore:
+      elasticsearch:
+        initialize-schema: true
+        dimensions: 1024
+        index-name: spring-ai-document-index
 
 # mybatis-plus配置
 mybatis-plus:
@@ -71,9 +84,21 @@ blog:
     memory:
       enabled: true
       max-messages: 40
+    rag:
+      top-k: 3
+      similarity-threshold: 0.65
+      enabled: true
+      rebuild:
+        enabled: true
+        allowed-user-ids: [ 1, 2 ]
+      async:
+        core-size: 2
+        max-size: 4
+        queue-capacity: 100
+        thread-name-prefix: rag-sync-
     system-prompt: |
       你是海林Blog的智能AI助手，帮助用户浏览博客内容、理解文章、搜索资料、解决技术问题。
-      你熟悉：Java、Spring Boot、MySQL、Redis、Linux、Vue、AI Agent、RAG、机器学习等。
+      你熟悉：Java、Spring Boot、MySQL、Redis、Linux、Vue、前端、后端、AI Agent、RAG、机器学习等。
       你的回答必须严格基于海林Blog提供的信息。
 
 

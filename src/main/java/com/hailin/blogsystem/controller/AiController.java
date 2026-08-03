@@ -48,11 +48,12 @@ public class AiController {
         return Result.success(messages);
     }
 
-    @PostMapping("/chat")  //5.发送聊天消息
-    public Result<AiChatVO> chat(@RequestBody AiChatDTO aiChatDTO){
-        AiChatVO result = aiMessageService.chat(aiChatDTO);
-        return Result.success(result);
-    }
+    // 【已废弃】非流式接口，前端已全面切到流式，暂时注释，后续删除
+    // @PostMapping("/chat")  //5.发送聊天消息
+    // public Result<AiChatVO> chat(@RequestBody AiChatDTO aiChatDTO){
+    //     AiChatVO result = aiMessageService.chat(aiChatDTO);
+    //     return Result.success(result);
+    // }
 
     @PostMapping(value = "/chat/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public Flux<AiChatEventVO> streamChat(@RequestBody AiChatDTO aiChatDTO) {

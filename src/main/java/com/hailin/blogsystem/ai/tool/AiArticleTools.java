@@ -22,11 +22,13 @@ public class AiArticleTools {
 
     private final ArticlesService articlesService;
 
-    @Tool(description = "搜索海林Blog中已经发布的公开文章。当用户询问站内是否有某个技术主题、推荐相关文章、查找博客文章时使用。")
+    @Tool(description = "搜索已经发布的公开文章，仅当系统没有提供站内文章知识库检索结果，且用户明确要求按关键词搜索文章列表时使用")
     public List<AiArticleSearchResult> searchPublishedArticles(
             @ToolParam(description = "搜索关键词，例如 Redis,Spring Boot,缓存穿透,微服务")
             String keyWord
     ){
+        log.info("AI工具调用：searchPublishedArticles, keyWord={}", keyWord);
+
         return articlesService.lambdaQuery()
                 .select(Articles::getId,Articles::getTitle,Articles::getSummary,Articles::getCreatedAt,Articles::getViewCount,Articles::getCoverUrl)
                 .eq(Articles::getStatus, BlogConstants.ArticlesStatus.PUBLISHED)
@@ -51,7 +53,7 @@ public class AiArticleTools {
     }
 
 
-    @Tool(description = "根据文章ID获取海林Blog中已发布公开文章的详细内容。当用户想了解某篇搜索结果文章的详细内容、总结某篇文章、继续追问某篇文章时使用。")
+    @Tool(description = "根据文章ID获取中已发布公开文章的详细内容。当用户想了解某篇搜索结果文章的详细内容、总结某篇文章、继续追问某篇文章时使用。")
     public AiArticleDetailResult getPublishedArticleDetail(
             @ToolParam(description = "文章ID，例如 12")
             Long articleId

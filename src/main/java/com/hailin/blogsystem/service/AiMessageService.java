@@ -13,7 +13,7 @@ import java.util.List;
 public interface AiMessageService extends IService<AiMessages> {
     List<AiMessageVO> getMessages(String id);
 
-    AiChatVO chat(AiChatDTO aiChatDTO);
+    /*AiChatVO chat(AiChatDTO aiChatDTO);*/
 
     Flux<AiChatEventVO> streamChat(AiChatDTO aiChatDTO);
 }
