@@ -60,4 +60,10 @@ public class AiController {
         return aiMessageService.streamChat(aiChatDTO);
     }
 
+    @DeleteMapping("/conversations/{sessionId}/messages/{messageId}")
+    public Result<Void> deleteMessage(@PathVariable Long sessionId, @PathVariable Long messageId) {
+        aiMessageService.deleteMessage(sessionId, messageId);
+        return Result.success();
+    }
+
 }

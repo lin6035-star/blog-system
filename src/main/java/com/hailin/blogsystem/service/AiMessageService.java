@@ -16,4 +16,6 @@ public interface AiMessageService extends IService<AiMessages> {
     /*AiChatVO chat(AiChatDTO aiChatDTO);*/
 
     Flux<AiChatEventVO> streamChat(AiChatDTO aiChatDTO);
+
+    void deleteMessage(Long sessionId, Long messageId);
 }

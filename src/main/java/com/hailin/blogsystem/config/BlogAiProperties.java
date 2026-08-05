@@ -16,6 +16,15 @@ public class BlogAiProperties {
     public static class Memory{
         private boolean enabled = true;
         private int maxMessages = 40;
+        private Extraction extraction = new Extraction();
+    }
+
+    @Data
+    public static class Extraction {
+        private int coreSize = 1;
+        private int maxSize = 2;
+        private int queueCapacity = 30;
+        private String threadNamePrefix = "memory-extract-";
     }
 
     @Data

@@ -45,9 +45,9 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
     private final AiIntentClassifier aiIntentClassifier;
     private final AiEditorDraftGenerator aiEditorDraftGenerator;
     private final ArticlesService articlesService;
-    private final ArticleRagRetrieveService articleRagRetrieveService;
     private final ArticleRagPromptBuilder articleRagPromptBuilder;
     private final ArticleRagSearchService articleRagSearchService;
+    private final AiMemoryCandidateExtractorService aiMemoryCandidateExtractorService;
 
     private final AiSessionService aiSessionService;
     private final ObjectMapper objectMapper;
@@ -87,106 +87,6 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         return aiMessageVOList;
     }
 
-    // ==================== 以下为非流式接口，前端已全面切到流式，暂时注释，后续删除 ====================
-
-    // @Override  //2.发送聊天消息
-    // @Transactional
-    // public AiChatVO chat(AiChatDTO aiChatDTO) {
-    //     Long userId = UserContext.get();  //1. 从 UserContext 拿 userId（null = 游客）
-    //
-    //     if (aiChatDTO == null) { //校验message为非空
-    //         throw new IllegalArgumentException("请求参数不能为空");
-    //     }
-    //     String message = aiChatDTO.getMessage() == null ? "" : aiChatDTO.getMessage().trim();
-    //     if (message.isEmpty()) {
-    //         throw new IllegalArgumentException("消息内容不能为空");
-    //     }
-    //
-    //     //准备两个context
-    //     //rawPageContextJson 还是存数据库，表示用户当时在哪个页面问的。
-    //     String rawPageContextJson = toJson(aiChatDTO.getPageContext());
-    //
-    //     // ===== 游客模式：调 AI，不存库 =====
-    //     if (userId == null) {  //如果 userId == null → chatAsGuest()（只拼 VO，不存库）
-    //         return chatAsGuest(message, rawPageContextJson, aiChatDTO.getPageContext());
-    //     }
-    //
-    //     // ===== 用户模式：调 AI，要存库 =====
-    //     AiSessionVO sessionVO;
-    //     Long sessionId;
-    //
-    //     //没传 sessionId → 新建会话（标题取 message 前 20 字）
-    //     if(aiChatDTO.getSessionId() == null || aiChatDTO.getSessionId().trim().isEmpty()){
-    //         AiCreateSessionDTO aiCreateSessionDTO = new AiCreateSessionDTO();
-    //         aiCreateSessionDTO.setTitle(buildSessionTitle(message));
-    //
-    //         sessionVO = aiSessionService.createSession(aiCreateSessionDTO);
-    //         sessionId = Long.valueOf(sessionVO.getId());
-    //     }
-    //     else{
-    //         sessionId = Long.valueOf(aiChatDTO.getSessionId());
-    //         AiSessions session = getOwnedSession(sessionId, userId);
-    //     }
-    //
-    //     // 拼完整 prompt（含历史记忆 + 页面上下文 + 当前问题）
-    //     AiPrompt prompt = aiPromptService.buildPrompt(message, aiChatDTO.getPageContext(), sessionId);
-    //
-    //
-    //
-    //     LocalDateTime now = LocalDateTime.now();
-    //
-    //     //存用户消息到 ai_messages
-    //     AiMessages userMessage = new AiMessages();
-    //     userMessage.setSessionId(sessionId);
-    //     userMessage.setRole(ROLE_USER);
-    //     userMessage.setContent(message);
-    //     userMessage.setPageContext(rawPageContextJson);
-    //     userMessage.setCreatedAt(now);
-    //     save(userMessage);
-    //
-    //
-    //     //调 aiModelService.chat()  ← ⭐核心，阻塞等 AI 回复
-    //     String requestId = UUID.randomUUID().toString();
-    //     String reply;
-    //     AiNavigateCommand navigate;
-    //     AiEditorCommand editorCommand;
-    //     try {
-    //         reply = aiModelService.chat(prompt, requestId);
-    //         navigate = getNavigateOrInfer(requestId, message);
-    //         editorCommand = getEditorActionOrInfer(requestId, message);
-    //     } finally {
-    //         aiToolActionRegistry.clear(requestId);
-    //     }
-    //
-    //     //存ai回复到ai_message
-    //     AiMessages assistantMessage = new AiMessages();
-    //     assistantMessage.setSessionId(sessionId);
-    //     assistantMessage.setRole(ROLE_ASSISTANT);
-    //     assistantMessage.setContent(reply);
-    //     assistantMessage.setPageContext(rawPageContextJson);
-    //     assistantMessage.setCreatedAt(LocalDateTime.now());
-    //     save(assistantMessage);
-    //
-    //     //更新ai_sessions.updated_at
-    //     aiSessionService.lambdaUpdate()
-    //             .eq(AiSessions::getId, sessionId)
-    //             .eq(AiSessions::getUserId, userId)
-    //             .set(AiSessions::getUpdatedAt, LocalDateTime.now())
-    //             .update();
-    //
-    //     AiSessions updatedSession = getOwnedSession(sessionId, userId);
-    //
-    //     //拼 AiChatVO 返回
-    //     AiChatVO aiChatVO = new AiChatVO();
-    //     aiChatVO.setSession(AiSessionVO.from(updatedSession));
-    //     aiChatVO.setUserMessage(AiMessageVO.from(userMessage));
-    //     aiChatVO.setAssistantMessage(AiMessageVO.from(assistantMessage));
-    //     aiChatVO.setNavigate(navigate);
-    //     aiChatVO.setEditorAction(editorCommand);
-    //     return aiChatVO;
-    //
-    // }
-    //获取当前用户的会话
     private AiSessions getOwnedSession(Long sessionId, Long userId) {
         AiSessions session = aiSessionService.lambdaQuery()
                 .eq(AiSessions::getId, sessionId)
@@ -232,61 +132,6 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
     不 createSession()
     不 update ai_sessions
     */
-    // private AiChatVO chatAsGuest(String message, String rawPageContextJson, PageContextDTO pageContext) {
-    //     LocalDateTime now = LocalDateTime.now();
-    //
-    //     // 1. 组装临时 userMessage（纯 VO，不 new AiMessages，不 save）
-    //     AiMessageVO userMsg = new AiMessageVO();
-    //     userMsg.setId("guest-user-" + System.currentTimeMillis());
-    //     userMsg.setSessionId("guest-session");
-    //     userMsg.setRole("user");
-    //     userMsg.setContent(message);
-    //     userMsg.setPageContext(rawPageContextJson);
-    //     userMsg.setCreatedAt(now);
-    //
-    //     // 2. 拼 prompt（游客无 sessionId，跳过历史记忆）
-    //     AiPrompt prompt = aiPromptService.buildPrompt(message, pageContext, null);
-    //
-    //     // 3. 调 AI
-    //     String requestId = UUID.randomUUID().toString();
-    //     String reply;
-    //     AiNavigateCommand navigate;
-    //     AiEditorCommand aiEditorCommand;
-    //     try {
-    //         reply = aiModelService.chat(prompt, requestId);
-    //         navigate = getNavigateOrInfer(requestId, message);
-    //         aiEditorCommand = getEditorActionOrInfer(requestId, message);
-    //     } finally {
-    //         aiToolActionRegistry.clear(requestId);
-    //     }
-    //
-    //     // 4. 组装临时 assistantMessage
-    //     AiMessageVO assistantMsg = new AiMessageVO();
-    //     assistantMsg.setId("guest-ai-" + System.currentTimeMillis());
-    //     assistantMsg.setSessionId("guest-session");
-    //     assistantMsg.setRole("assistant");
-    //     assistantMsg.setContent(reply);
-    //     assistantMsg.setPageContext(rawPageContextJson);
-    //     assistantMsg.setCreatedAt(LocalDateTime.now());
-    //
-    //     // 4. 组装临时 session
-    //     AiSessionVO sessionVO = new AiSessionVO();
-    //     sessionVO.setId("guest-session");
-    //     sessionVO.setTitle(buildSessionTitle(message));
-    //     sessionVO.setCreatedAt(now);
-    //     sessionVO.setUpdatedAt(now);
-    //
-    //     // 5. 打包返回
-    //     AiChatVO result = new AiChatVO();
-    //     result.setSession(sessionVO);
-    //     result.setUserMessage(userMsg);
-    //     result.setAssistantMessage(assistantMsg);
-    //     result.setNavigate(navigate);
-    //     result.setEditorAction(aiEditorCommand);
-    //     return result;
-    // }
-
-    // ==================== 以上为非流式接口 ====================
 
 
     @Override  //流式输出
@@ -337,9 +182,6 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         if (extraPromptContext == null || extraPromptContext.isBlank()) {
             extraPromptContext = buildArticleDetailContextFromIntent(intent, pageContext);
         }
-        /*if (extraPromptContext == null || extraPromptContext.isBlank()) {
-            extraPromptContext = buildArticleSearchContextFromIntent(intent);
-        }*/
         
         
         AiNavigateCommand navigateFromIntent = buildNavigateFromIntent(intent,pageContext);
@@ -395,6 +237,15 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
 
         Mono<AiChatEventVO> stopEvent = Mono.fromSupplier(() -> {
             AiMessages assistantMessage = saveStreamAssistantMessage(sessionId,userId,rawPageContextJson, fullReply.toString());
+
+            // 异步提取候选记忆（规则预筛命中才写入，不会阻塞 SSE）
+            aiMemoryCandidateExtractorService.extractAfterChat(
+                    userId,
+                    sessionId,
+                    userMessage.getId(),
+                    message,
+                    fullReply.toString()
+            );
 
             AiSessions updatedSession = getOwnedSession(sessionId, userId);
 
@@ -1058,105 +909,6 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         );
     }
 
-    /*private boolean isArticleSearch(AiIntent intent) {
-        return intent != null && "ARTICLE_SEARCH".equals(intent.getIntent());
-    }*/
-    
-    //关于搜索站内文章列表
-    /*private String buildArticleSearchContextFromIntent(AiIntent intent){
-        if(intent == null || !"ARTICLE_SEARCH".equals(intent.getIntent())){
-            return null;
-        }
-
-        String keyword = intent.getKeyWord();
-        if (keyword == null || keyword.isBlank()) {
-            return "用户想搜索站内文章，但缺少搜索关键词。";
-        }
-
-        PageVO<ArticleDetailVO> pageResult = articlesService.getArticles(1L, 3L, intent.getKeyWord(), null, "lasted");
-        List<ArticleDetailVO> list = pageResult.getList();
-
-        StringBuilder sb = new StringBuilder();
-        sb.append("站内文章搜索结果：\n");
-        sb.append("搜索关键词：").append(keyword).append("\n");
-        sb.append("结果总数：").append(pageResult.getTotal()).append("\n\n");
-
-        if (list == null || list.isEmpty()) {
-            sb.append("没有找到匹配的公开文章。\n");
-            sb.append("请告诉用户暂时没有找到相关文章，不要编造不存在的文章。");
-            return sb.toString();
-        }
-
-        sb.append("最多展示前 3 篇：\n");
-
-        for (int i = 0; i < list.size(); i++) {
-            ArticleDetailVO article = list.get(i);
-
-            sb.append(i + 1).append(". ");
-            sb.append("文章ID：").append(article.getId()).append("\n");
-            sb.append("标题：").append(article.getTitle()).append("\n");
-
-            if (article.getSummary() != null && !article.getSummary().isBlank()) {
-                sb.append("摘要：").append(article.getSummary()).append("\n");
-            }
-
-            sb.append("浏览数：").append(article.getViewCount()).append("\n");
-            sb.append("点赞数：").append(article.getLikeCount()).append("\n");
-            sb.append("收藏数：").append(article.getFavoriteCount()).append("\n");
-            sb.append("评论数：").append(article.getCommentCount()).append("\n");
-            sb.append("\n");
-        }
-
-        sb.append("请基于以上搜索结果回答用户。");
-        sb.append("如果用户想打开某篇文章，请直接调用 goToArticle 导航工具，传入对应文章ID，不要只让用户自己输入文章ID。");
-        sb.append("不要编造搜索结果之外的文章。");
-
-        return sb.toString();
-    }
-    private List<ArticleRagContext> buildArticleSearchFallbackContextsFromIntent(AiIntent intent){
-        if(!isArticleSearch(intent)){
-            return List.of();
-        }
-
-        String keyWord = intent.getKeyWord();
-        if (keyWord == null || keyWord.isBlank()) {
-            return List.of();
-        }
-        PageVO<ArticleDetailVO> pageResult = articlesService.getArticles(1L, 3L, keyWord, null, "lasted");
-        List<ArticleDetailVO> list = pageResult.getList();
-
-        if (list == null || list.isEmpty()) {
-            log.info("ARTICLE_SEARCH MySQL 兜底无结果，keyword={}", keyWord);
-            return List.of();
-        }
-
-        log.info("ARTICLE_SEARCH 使用 MySQL 兜底生成引用，keyword={}, count={}", keyWord, list.size());
-
-        return list.stream()
-                .filter(article -> article.getId() != null)
-                .map(article -> new ArticleRagContext(
-                        article.getId(),
-                        article.getTitle(),
-                        0,
-                        buildArticleSearchFallbackSnippet(article)
-                ))
-                .toList();
-    }*/
-    /*private String buildArticleSearchFallbackSnippet(ArticleDetailVO article) {
-        if (article == null) {
-            return "";
-        }
-
-        if (article.getSummary() != null && !article.getSummary().isBlank()) {
-            return article.getSummary();
-        }
-
-        if (article.getContent() != null && !article.getContent().isBlank()) {
-            return limitText(article.getContent(), 50);
-        }
-
-        return article.getTitle() == null ? "" : article.getTitle();
-    }*/
 
     private String buildActionResultPromptContext(AiNavigateCommand navigate) {
         if (navigate == null) {
@@ -1184,16 +936,6 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         return null;
     }
 
-    //有关RAG检索时的文章来源
-    /*private List<ArticleRagContext> retrieveArticleRagContexts(String message){
-        try{
-            return articleRagRetrieveService.retrieve(message);
-        }
-        catch (Exception e){
-            log.warn("RAG 检索失败，降级为普通 AI 对话", e);
-            return List.of();
-        }
-    }*/
     private void appendRagContextToPrompt(AiPrompt prompt,List<ArticleRagContext> contexts){
         if (prompt == null || contexts == null || contexts.isEmpty()) {
             return;
@@ -1223,5 +965,31 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         }
 
         return List.copyOf(referenceMap.values());
+    }
+
+    @Override
+    public void deleteMessage(Long sessionId, Long messageId) {
+        Long userId = UserContext.get();
+        if (userId == null) {
+            throw new IllegalArgumentException("请先登录");
+        }
+
+        AiSessions session = aiSessionMapper.selectById(sessionId);
+        if (session == null) {
+            throw new IllegalArgumentException("会话不存在");
+        }
+        if (!session.getUserId().equals(userId)) {
+            throw new IllegalArgumentException("无权操作该会话");
+        }
+
+        AiMessages message = getById(messageId);
+        if (message == null) {
+            throw new IllegalArgumentException("消息不存在");
+        }
+        if (!message.getSessionId().equals(sessionId)) {
+            throw new IllegalArgumentException("消息不属于该会话");
+        }
+
+        removeById(messageId);
     }
 }

@@ -34,7 +34,15 @@ public class ArticleRagSearchService {
     private final ArticleRagKeywordRetriever articleRagKeywordRetriever;
 
     public ArticleRagSearchResult search(String question, AiIntent intent){
-        // 1. 并行：向量 + keyword
+        if (!shouldSearchArticleRag(intent)) {
+            log.info(
+                    "RAG 跳过文章检索，intent={}",
+                    intent == null ? null : intent.getIntent()
+            );
+            return new ArticleRagSearchResult(ArticleRagSearchStrategy.EMPTY, List.of());
+        }
+
+        // 1. ARTICLE_SEARCH：向量 + keyword
         List<ArticleRagContext> vectorContexts = articleRagRetrieveService.retrieve(question);
 
         List<ArticleRagContext> contexts;
@@ -83,6 +91,10 @@ public class ArticleRagSearchService {
 
     private boolean isArticleSearch(AiIntent intent) {
         return intent != null && "ARTICLE_SEARCH".equals(intent.getIntent());
+    }
+
+    private boolean shouldSearchArticleRag(AiIntent intent) {
+        return isArticleSearch(intent);
     }
 
     private String getArticleSearchKeyword(String question, AiIntent intent) {
