@@ -2,7 +2,6 @@ package com.hailin.blogsystem.ai.rag;
 
 import co.elastic.clients.elasticsearch.ElasticsearchClient;
 import co.elastic.clients.elasticsearch._types.FieldValue;
-import co.elastic.clients.elasticsearch._types.query_dsl.Operator;
 import co.elastic.clients.elasticsearch.core.SearchResponse;
 import co.elastic.clients.json.JsonData;
 import com.hailin.blogsystem.entity.dto.ArticleRagContext;
@@ -51,7 +50,6 @@ public class ArticleRagKeywordRetriever {
                                                     .match(mm -> mm
                                                             .field("content")
                                                             .query(question.trim())
-                                                            .operator(Operator.And)
                                                     )
                                             )
                                             .filter(f -> f

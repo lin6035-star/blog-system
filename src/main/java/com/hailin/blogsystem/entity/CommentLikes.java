@@ -10,7 +10,7 @@ import java.time.LocalDateTime;
 @Data
 @TableName("comment_likes")
 public class CommentLikes {
-    @TableId(type = IdType.AUTO)
+    @TableId(type = IdType.ASSIGN_ID)
     private Long id;
     private Long commentId;  //'评论ID'
     private Long userId;  //'点赞用户ID'

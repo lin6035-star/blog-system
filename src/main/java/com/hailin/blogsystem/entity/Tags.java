@@ -11,7 +11,7 @@ import java.time.LocalDateTime;
 @TableName("tags")
 public class Tags {
 
-    @TableId( type = IdType.AUTO)
+    @TableId(type = IdType.ASSIGN_ID)
     private Long id;
     private String name;  //标签名称
     private Long createdBy;

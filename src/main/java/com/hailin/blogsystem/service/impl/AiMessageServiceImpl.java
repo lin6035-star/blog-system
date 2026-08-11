@@ -1,5 +1,6 @@
 package com.hailin.blogsystem.service.impl;
 
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -9,12 +10,15 @@ import com.hailin.blogsystem.ai.rag.ArticleRagRetrieveService;
 import com.hailin.blogsystem.ai.rag.ArticleRagSearchService;
 import com.hailin.blogsystem.ai.tool.AiToolActionRegistry;
 import com.hailin.blogsystem.ai.tool.AiUserProfileTools;
+import com.hailin.blogsystem.ai.workflow.AiWorkflowStepEmitter;
 import com.hailin.blogsystem.constants.BlogConstants;
 import com.hailin.blogsystem.entity.*;
 import com.hailin.blogsystem.entity.dto.*;
 import com.hailin.blogsystem.entity.vo.*;
 import com.hailin.blogsystem.mapper.AiMessageMapper;
 import com.hailin.blogsystem.mapper.AiSessionMapper;
+import com.hailin.blogsystem.mapper.AiWorkflowRunMapper;
+import com.hailin.blogsystem.mapper.AiWorkflowStepLogMapper;
 import com.hailin.blogsystem.service.*;
 import com.hailin.blogsystem.utils.UserContext;
 import lombok.RequiredArgsConstructor;
@@ -24,6 +28,7 @@ import org.springframework.transaction.annotation.Transactional;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.publisher.SignalType;
+import reactor.core.scheduler.Schedulers;
 
 import java.time.LocalDateTime;
 import java.util.*;
@@ -48,6 +53,9 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
     private final ArticleRagPromptBuilder articleRagPromptBuilder;
     private final ArticleRagSearchService articleRagSearchService;
     private final AiMemoryCandidateExtractorService aiMemoryCandidateExtractorService;
+    private final AiWorkflowRunService aiWorkflowRunService;
+    private final AiWorkflowRunMapper aiWorkflowRunMapper;
+    private final AiWorkflowStepLogMapper aiWorkflowStepLogMapper;
 
     private final AiSessionService aiSessionService;
     private final ObjectMapper objectMapper;
@@ -176,14 +184,41 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             getOwnedSession(sessionId, userId);
         }
 
-        AiIntent intent = aiIntentClassifier.classify(message,pageContext);
+        AiSessions session = getOwnedSession(sessionId,userId);
+
+        if(session.getActiveWorkflowRunId() != null){
+            return streamContinueActiveWorkflow(
+                    message,
+                    pageContext,
+                    rawPageContextJson,
+                    userId,
+                    session
+            );
+        }
+
+        // 先用 LLM 分类意图，再决定是否起 Workflow——不在入口猜自然语言（分类后还有确定性兜底）
+        AiIntent intent = classifyWithFallback(message, pageContext);
+
+        // 创建文章意图（CREATE_ARTICLE_WORKFLOW 或兼容的 EDITOR_ACTION+fillArticle）→ 起 Workflow
+        if (isCreateArticleWorkflowIntent(intent)) {
+            return streamCreateArticleWorkflowFromIntent(
+                    message,
+                    intent,
+                    pageContext,
+                    rawPageContextJson,
+                    userId,
+                    sessionId
+            );
+        }
+
+
         AiArticleActionCommand articleActionFromIntent = buildArticleActionFromIntent(intent, pageContext);
         String extraPromptContext = buildExtraPromptContextFromIntent(intent, pageContext);
         if (extraPromptContext == null || extraPromptContext.isBlank()) {
             extraPromptContext = buildArticleDetailContextFromIntent(intent, pageContext);
         }
-        
-        
+
+
         AiNavigateCommand navigateFromIntent = buildNavigateFromIntent(intent,pageContext);
         AiEditorCommand editorActionFromIntent = buildEditorActionFromIntent(intent,message);
 
@@ -216,7 +251,6 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         userMessage.setCreatedAt(LocalDateTime.now());
         save(userMessage);
 
-        AiSessions session = getOwnedSession(sessionId, userId);
         StringBuilder fullReply = new StringBuilder();
 
         AiChatEventVO paramEvent = AiChatEventVO.builder()
@@ -272,6 +306,10 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             if (editorAction == null) {
                 editorAction = getEditorActionOrInfer(requestId, message);
             }
+            // fillArticle 只能从 Workflow 的 editorAction 出来，普通聊天不允许直接填充文章
+            if (editorAction != null && "fillArticle".equals(editorAction.getType())) {
+                editorAction = null;
+            }
             if(editorAction != null){
                 eventData.put("editorAction", editorAction);
             }
@@ -312,15 +350,433 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         })
                 ;
     }
+
+    /** 文章创作意图但没有明确主题 → 追问主题，不起 Workflow */
+    private Flux<AiChatEventVO> streamAskArticleTopic(
+            String message,
+            String rawPageContextJson,
+            Long userId,
+            Long sessionId
+    ) {
+        AiMessages userMessage = new AiMessages();
+        userMessage.setSessionId(sessionId);
+        userMessage.setRole(ROLE_USER);
+        userMessage.setContent(message);
+        userMessage.setPageContext(rawPageContextJson);
+        userMessage.setCreatedAt(LocalDateTime.now());
+        save(userMessage);
+
+        String reply = "可以，想写什么主题？\n比如 Redis 缓存、Kafka 消息队列、RAG 检索增强这些";
+
+        AiMessages assistantMessage = saveStreamAssistantMessage(
+                sessionId,
+                userId,
+                rawPageContextJson,
+                reply
+        );
+
+        AiSessions updatedSession = getOwnedSession(sessionId, userId);
+
+        AiChatEventVO paramEvent = AiChatEventVO.builder()
+                .eventType(AiChatEventType.PARAM.getValue())
+                .eventData(Map.of(
+                        "session", AiSessionVO.from(updatedSession),
+                        "userMessage", AiMessageVO.from(userMessage)
+                ))
+                .build();
+
+        Map<String, Object> eventData = new HashMap<>();
+        eventData.put("session", AiSessionVO.from(updatedSession));
+        eventData.put("assistantMessage", AiMessageVO.from(assistantMessage));
+        eventData.put("references", List.of());
+
+        AiChatEventVO stopEvent = AiChatEventVO.builder()
+                .eventType(AiChatEventType.STOP.getValue())
+                .eventData(eventData)
+                .build();
+
+        return Flux.just(paramEvent, stopEvent);
+    }
+
+    /** 从意图分类结果创建文章 Workflow，绑定到当前 session */
+    /** 统一入口判断：新意图 CREATE_ARTICLE_WORKFLOW，或历史兼容 EDITOR_ACTION + fillArticle */
+    private boolean isCreateArticleWorkflowIntent(AiIntent intent) {
+        if (intent == null) {
+            return false;
+        }
+        if ("CREATE_ARTICLE_WORKFLOW".equals(intent.getIntent())) {
+            return true;
+        }
+        return "EDITOR_ACTION".equals(intent.getIntent())
+                && "fillArticle".equals(intent.getActionType());
+    }
+
+    /** 意图分类 + 确定性兜底：LLM 分类不稳定，明显的写文章请求即使分错也强制走 Workflow（内部还有需求分析/澄清） */
+    private AiIntent classifyWithFallback(String message, PageContextDTO pageContext) {
+        AiIntent intent = aiIntentClassifier.classify(message, pageContext);
+        if (!isCreateArticleWorkflowIntent(intent) && looksLikeCreateArticleRequest(message)) {
+            log.info("意图分类兜底命中：\"{}\" 强制走 CREATE_ARTICLE_WORKFLOW", message);
+            intent = buildCreateArticleWorkflowIntent(message);
+        }
+        return intent;
+    }
+
+    private boolean looksLikeCreateArticleRequest(String message) {
+        if (message == null || message.isBlank()) {
+            return false;
+        }
+        String text = message.trim();
+        return text.matches(".*(帮我|给我|请|生成|写|创作).*(一篇|篇).*(文章|博客|博文|草稿|大纲).*")
+                || text.matches(".*(写一篇|生成一篇|创作一篇).*(文章|博客|博文).*");
+    }
+
+    private AiIntent buildCreateArticleWorkflowIntent(String message) {
+        AiIntent intent = new AiIntent();
+        intent.setIntent("CREATE_ARTICLE_WORKFLOW");
+        intent.setTopic(message);
+        return intent;
+    }
+
+    private Flux<AiChatEventVO> streamCreateArticleWorkflowFromIntent(
+            String message,
+            AiIntent intent,
+            PageContextDTO pageContext,
+            String rawPageContextJson,
+            Long userId,
+            Long sessionId
+    ) {
+        AiMessages userMessage = new AiMessages();
+        userMessage.setSessionId(sessionId);
+        userMessage.setRole(ROLE_USER);
+        userMessage.setContent(message);
+        userMessage.setPageContext(rawPageContextJson);
+        userMessage.setCreatedAt(LocalDateTime.now());
+        save(userMessage);
+
+        // 用 intent.topic 拼 requirement，优先级高于原始 message
+        String requirement = intent.getTopic() != null && !intent.getTopic().isBlank()
+                ? intent.getTopic()
+                : message;
+        if (intent.getRequirements() != null && !intent.getRequirements().isBlank()) {
+            requirement += "，要求：" + intent.getRequirements();
+        }
+
+        AiWorkflowCreateArticleDTO workflowDTO = new AiWorkflowCreateArticleDTO();
+        workflowDTO.setConversationId(sessionId);
+        workflowDTO.setRequirement(requirement);
+        workflowDTO.setPageContext(pageContext);
+
+        AiChatEventVO paramEvent = AiChatEventVO.builder()
+                .eventType(AiChatEventType.PARAM.getValue())
+                .eventData(Map.of(
+                        "session", AiSessionVO.from(getOwnedSession(sessionId, userId)),
+                        "userMessage", AiMessageVO.from(userMessage)
+                ))
+                .build();
+
+        Flux<AiChatEventVO> workflowEvents = Flux.create(sink ->
+                Schedulers.boundedElastic().schedule(() -> {
+                    UserContext.set(userId);
+                    try {
+                        AiWorkflowStepEmitter emitter = new AiWorkflowStepEmitter() {
+                            @Override
+                            public void emit(String step, String status, String stepMessage) {
+                                // 初次创建时 step 事件可以先不推给前端
+                            }
+
+                            @Override
+                            public void emitContent(String step, String field, String delta) {
+                                if ("outline".equals(field)) {
+                                    sink.next(AiChatEventVO.builder()
+                                            .eventType(AiChatEventType.DATA.getValue())
+                                            .eventData(delta)
+                                            .build());
+                                }
+                            }
+                        };
+
+                        // ServiceImpl 的 create 内部会绑定 session 的 activeWorkflowRunId
+                        AiWorkflowRunVO workflow = aiWorkflowRunService.createArticleWorkflow(workflowDTO, emitter);
+
+                        AiMessages assistantMessage = saveStreamAssistantMessage(
+                                sessionId,
+                                userId,
+                                rawPageContextJson,
+                                buildWorkflowAssistantContent(workflow),
+                                Long.valueOf(workflow.getId())
+                        );
+
+                        AiSessions updatedSession = getOwnedSession(sessionId, userId);
+
+                        Map<String, Object> eventData = new HashMap<>();
+                        eventData.put("session", AiSessionVO.from(updatedSession));
+                        eventData.put("assistantMessage", AiMessageVO.from(assistantMessage));
+                        eventData.put("references", List.of());
+                        eventData.put("workflow", workflow);
+
+                        sink.next(AiChatEventVO.builder()
+                                .eventType(AiChatEventType.STOP.getValue())
+                                .eventData(eventData)
+                                .build());
+
+                        sink.complete();
+                    } catch (Throwable e) {
+                        sink.error(e);
+                    } finally {
+                        UserContext.clear();
+                    }
+                })
+        );
+
+        return Flux.concat(Flux.just(paramEvent), workflowEvents);
+    }
+
+    private String buildWorkflowAssistantContent(AiWorkflowRunVO workflow) {
+        Object contextValue = workflow == null ? null : workflow.getContext();
+        if (!(contextValue instanceof Map<?, ?> context)) {
+            return "已创建文章创作 Workflow，请先确认生成方案。";
+        }
+
+        Object outline = context.get("outline");
+        if (outline == null || String.valueOf(outline).isBlank()) {
+            return "已创建文章创作 Workflow，请先确认生成方案。";
+        }
+
+        return "已创建文章创作 Workflow，请先确认下面的大纲。\n\n" + outline;
+    }
+
+    /** 会话有 active workflow 时，优先把用户输入交给 Workflow 处理 */
+    private Flux<AiChatEventVO> streamContinueActiveWorkflow(
+            String message,
+            PageContextDTO pageContext,
+            String rawPageContextJson,
+            Long userId,
+            AiSessions session
+    ) {
+        Long sessionId = session.getId();
+        Long workflowRunId = session.getActiveWorkflowRunId();
+
+        AiMessages userMessage = new AiMessages();
+        userMessage.setSessionId(sessionId);
+        userMessage.setRole(ROLE_USER);
+        userMessage.setContent(message);
+        userMessage.setPageContext(rawPageContextJson);
+        userMessage.setCreatedAt(LocalDateTime.now());
+        save(userMessage);
+
+        // 查 workflow
+        AiWorkflowRunVO workflow;
+        try {
+            workflow = aiWorkflowRunService.getWorkflowRun(workflowRunId);
+        } catch (Exception e) {
+            // Workflow 不存在或无权访问 → 清空绑定，回普通聊天
+            clearSessionActiveWorkflow(session);
+            return fallbackToNormalChatAfterWorkflowGone(
+                    message, pageContext, rawPageContextJson, userId, sessionId, userMessage);
+        }
+
+        if (workflow == null) {
+            clearSessionActiveWorkflow(session);
+            return fallbackToNormalChatAfterWorkflowGone(
+                    message, pageContext, rawPageContextJson, userId, sessionId, userMessage);
+        }
+
+        AiWorkflowStatus status;
+        try {
+            status = AiWorkflowStatus.valueOf(workflow.getStatus());
+        } catch (Exception e) {
+            clearSessionActiveWorkflow(session);
+            return fallbackToNormalChatAfterWorkflowGone(
+                    message, pageContext, rawPageContextJson, userId, sessionId, userMessage);
+        }
+
+        // 已结束的状态 → 清空绑定，回普通聊天
+        if (status == AiWorkflowStatus.COMPLETED
+                || status == AiWorkflowStatus.CANCELLED
+                || status == AiWorkflowStatus.FAILED) {
+            clearSessionActiveWorkflow(session);
+            return fallbackToNormalChatAfterWorkflowGone(
+                    message, pageContext, rawPageContextJson, userId, sessionId, userMessage);
+        }
+
+        // WAITING_REQUIREMENT_CONFIRM：用户输入当作补充需求，走 reject 流程
+        if (status == AiWorkflowStatus.WAITING_REQUIREMENT_CONFIRM) {
+            try {
+                workflow = aiWorkflowRunService.reject(workflowRunId, message);
+            } catch (Exception e) {
+                log.warn("Workflow 补充需求失败: workflowRunId={}, error={}", workflowRunId, e.getMessage());
+                // 失败不阻塞，返回当前 workflow 状态让用户看到错误
+            }
+            return buildWorkflowStopFlux(sessionId, userId, rawPageContextJson, userMessage, workflow);
+        }
+
+        // WAITING_OUTLINE_CONFIRM / WAITING_DRAFT_CONFIRM / WAITING_FILL_CONFIRM
+        // 这些状态下的确认操作应走前端 approve/reject 按钮，普通输入提示用户
+        if (status == AiWorkflowStatus.WAITING_OUTLINE_CONFIRM
+                || status == AiWorkflowStatus.WAITING_DRAFT_CONFIRM
+                || status == AiWorkflowStatus.WAITING_FILL_CONFIRM) {
+            AiMessages assistantMessage = saveStreamAssistantMessage(
+                    sessionId, userId, rawPageContextJson,
+                    "当前 Workflow 正在等待确认，请使用底部的按钮操作。"
+                            + "\n- 同意：继续下一步"
+                            + "\n- 不同意：输入修改意见后发送",
+                    workflowRunId
+            );
+            return buildSimpleStopFlux(sessionId, userId, userMessage, assistantMessage, workflow);
+        }
+
+        // WAITING_USER_SAVE：提示用户在编辑器保存/发布
+        if (status == AiWorkflowStatus.WAITING_USER_SAVE) {
+            AiMessages assistantMessage = saveStreamAssistantMessage(
+                    sessionId, userId, rawPageContextJson,
+                    "文章已填充到编辑器，请在编辑器中保存草稿或发布文章，然后点击底部的「已保存 / 发布」按钮完成 Workflow。",
+                    workflowRunId
+            );
+            return buildSimpleStopFlux(sessionId, userId, userMessage, assistantMessage, workflow);
+        }
+
+        // RUNNING / PAUSED 等：静默返回当前 workflow 状态
+        return buildWorkflowStopFlux(sessionId, userId, rawPageContextJson, userMessage, workflow);
+    }
+
+    /** Workflow 已结束或不存在时，清空绑定并回退到普通聊天 */
+    private Flux<AiChatEventVO> fallbackToNormalChatAfterWorkflowGone(
+            String message,
+            PageContextDTO pageContext,
+            String rawPageContextJson,
+            Long userId,
+            Long sessionId,
+            AiMessages userMessage
+    ) {
+        AiIntent intent = classifyWithFallback(message, pageContext);
+
+        // 重新检查是否需要起新 Workflow（topic 已由兜底填充，非空才起）
+        if (isCreateArticleWorkflowIntent(intent)
+                && intent.getTopic() != null && !intent.getTopic().isBlank()) {
+            // 删除已保存的 userMessage（新 Workflow 方法会重新保存）
+            removeById(userMessage.getId());
+            return streamCreateArticleWorkflowFromIntent(
+                    message, intent, pageContext, rawPageContextJson, userId, sessionId);
+        }
+
+        // 否则走普通 SSE 聊天（复用流式逻辑，但 userMessage 已经保存了）
+        AiPrompt prompt = aiPromptService.buildPrompt(message, pageContext, sessionId);
+        StringBuilder fullReply = new StringBuilder();
+
+        AiSessions updatedSession = getOwnedSession(sessionId, userId);
+
+        AiChatEventVO paramEvent = AiChatEventVO.builder()
+                .eventType(AiChatEventType.PARAM.getValue())
+                .eventData(Map.of(
+                        "session", AiSessionVO.from(updatedSession),
+                        "userMessage", AiMessageVO.from(userMessage)
+                ))
+                .build();
+
+        String requestId = UUID.randomUUID().toString();
+        Flux<AiChatEventVO> dataEvents = aiModelService.streamChat(prompt, requestId)
+                .doOnNext(fullReply::append)
+                .map(chunk -> AiChatEventVO.builder()
+                        .eventType(AiChatEventType.DATA.getValue())
+                        .eventData(chunk)
+                        .build());
+
+        Mono<AiChatEventVO> stopEvent = Mono.fromSupplier(() -> {
+            AiMessages assistantMessage = saveStreamAssistantMessage(
+                    sessionId, userId, rawPageContextJson, fullReply.toString());
+
+            AiSessions updated = getOwnedSession(sessionId, userId);
+
+            Map<String, Object> eventData = new HashMap<>();
+            eventData.put("session", AiSessionVO.from(updated));
+            eventData.put("assistantMessage", AiMessageVO.from(assistantMessage));
+            eventData.put("references", List.of());
+
+            return AiChatEventVO.builder()
+                    .eventType(AiChatEventType.STOP.getValue())
+                    .eventData(eventData)
+                    .build();
+        });
+
+        return Flux.concat(
+                Flux.just(paramEvent),
+                dataEvents,
+                stopEvent
+        ).doFinally(signalType -> aiToolActionRegistry.clear(requestId));
+    }
+
+    /** 构建带 workflow 的 STOP Flux（无流式内容） */
+    private Flux<AiChatEventVO> buildWorkflowStopFlux(
+            Long sessionId, Long userId, String rawPageContextJson,
+            AiMessages userMessage, AiWorkflowRunVO workflow
+    ) {
+        AiMessages assistantMessage = saveStreamAssistantMessage(
+                sessionId, userId, rawPageContextJson,
+                buildWorkflowAssistantContent(workflow),
+                workflow == null ? null : Long.valueOf(workflow.getId()));
+
+        return buildSimpleStopFlux(sessionId, userId, userMessage, assistantMessage, workflow);
+    }
+
+    /** 构建简单 STOP Flux（带 assistantMessage 和可选的 workflow） */
+    private Flux<AiChatEventVO> buildSimpleStopFlux(
+            Long sessionId, Long userId,
+            AiMessages userMessage, AiMessages assistantMessage,
+            AiWorkflowRunVO workflow
+    ) {
+        AiSessions updatedSession = getOwnedSession(sessionId, userId);
+
+        AiChatEventVO paramEvent = AiChatEventVO.builder()
+                .eventType(AiChatEventType.PARAM.getValue())
+                .eventData(Map.of(
+                        "session", AiSessionVO.from(updatedSession),
+                        "userMessage", AiMessageVO.from(userMessage)
+                ))
+                .build();
+
+        Map<String, Object> eventData = new HashMap<>();
+        eventData.put("session", AiSessionVO.from(updatedSession));
+        eventData.put("assistantMessage", AiMessageVO.from(assistantMessage));
+        eventData.put("references", List.of());
+        if (workflow != null) {
+            eventData.put("workflow", workflow);
+        }
+
+        AiChatEventVO stopEvent = AiChatEventVO.builder()
+                .eventType(AiChatEventType.STOP.getValue())
+                .eventData(eventData)
+                .build();
+
+        return Flux.just(paramEvent, stopEvent);
+    }
+
+    /** 清空 session 的 activeWorkflowRunId */
+    private void clearSessionActiveWorkflow(AiSessions session) {
+        if (session.getActiveWorkflowRunId() == null) {
+            return;
+        }
+        session.setActiveWorkflowRunId(null);
+    }
+
     //保存停止生成的内容
     private AiMessages saveStreamAssistantMessage(
             Long sessionId,
             Long userId,
             String rawPageContextJson,
             String content
+    ) {
+        return saveStreamAssistantMessage(sessionId, userId, rawPageContextJson, content, null);
+    }
+    private AiMessages saveStreamAssistantMessage(
+            Long sessionId,
+            Long userId,
+            String rawPageContextJson,
+            String content,
+            Long workflowRunId
     ){
         AiMessages assistantMessage = new AiMessages();
         assistantMessage.setSessionId(sessionId);
+        assistantMessage.setWorkflowRunId(String.valueOf(workflowRunId));
         assistantMessage.setRole(ROLE_ASSISTANT);
         assistantMessage.setContent(content);
         assistantMessage.setPageContext(rawPageContextJson);
@@ -355,7 +811,42 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         userMessage.setContent(message);
         userMessage.setCreatedAt(LocalDateTime.now());
 
-        AiIntent intent = aiIntentClassifier.classify(message, pageContext);
+        // 先用 LLM 分类意图（游客同样先分类再决定，带确定性兜底）
+        AiIntent intent = classifyWithFallback(message, pageContext);
+
+        // 创建文章意图 → 有主题提示登录，没主题追问
+        if (isCreateArticleWorkflowIntent(intent)) {
+            AiMessageVO assistantMessage = new AiMessageVO();
+            assistantMessage.setId("guest-ai-" + System.currentTimeMillis());
+            assistantMessage.setSessionId("guest");
+            assistantMessage.setRole("assistant");
+            if (intent.getTopic() != null && !intent.getTopic().isBlank()) {
+                assistantMessage.setContent("文章创作 Workflow 需要登录后使用，请先登录后再试。");
+            } else {
+                assistantMessage.setContent("可以，想写什么主题？\n比如 Redis 缓存、Kafka 消息队列、RAG 检索增强这些");
+            }
+            assistantMessage.setCreatedAt(LocalDateTime.now());
+
+            Map<String, Object> eventData = new HashMap<>();
+            eventData.put("session", guestSession);
+            eventData.put("assistantMessage", assistantMessage);
+            eventData.put("references", List.of());
+
+            return Flux.just(
+                    AiChatEventVO.builder()
+                            .eventType(AiChatEventType.PARAM.getValue())
+                            .eventData(Map.of(
+                                    "session", guestSession,
+                                    "userMessage", userMessage
+                            ))
+                            .build(),
+                    AiChatEventVO.builder()
+                            .eventType(AiChatEventType.STOP.getValue())
+                            .eventData(eventData)
+                            .build()
+            );
+        }
+
         AiArticleActionCommand articleActionFromIntent = buildArticleActionFromIntent(intent, pageContext);
         String extraPromptContext = buildExtraPromptContextFromIntent(intent, pageContext);
         if (extraPromptContext == null || extraPromptContext.isBlank()) {
@@ -433,6 +924,10 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             AiEditorCommand editorAction = editorActionFromIntent;
             if (editorAction == null) {
                 editorAction = getEditorActionOrInfer(requestId, message);
+            }
+            // fillArticle 只能从 Workflow 的 editorAction 出来，普通聊天不允许直接填充文章
+            if (editorAction != null && "fillArticle".equals(editorAction.getType())) {
+                editorAction = null;
             }
             if(editorAction != null){
                 eventData.put("editorAction", editorAction);
@@ -968,6 +1463,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
     }
 
     @Override
+    @Transactional
     public void deleteMessage(Long sessionId, Long messageId) {
         Long userId = UserContext.get();
         if (userId == null) {
@@ -990,6 +1486,47 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             throw new IllegalArgumentException("消息不属于该会话");
         }
 
+        // 实体里 workflowRunId 是 String（雪花 ID 前端精度约定），库里是 BIGINT
+        Long workflowRunId = message.getWorkflowRunId() == null
+                ? null
+                : Long.valueOf(message.getWorkflowRunId());
+
         removeById(messageId);
+
+        if (workflowRunId != null) {
+            cleanupWorkflowIfNoMessageReferences(session, workflowRunId);
+        }
+    }
+
+    /** 删除消息后联动清理：若 Workflow 已无消息引用且已结束，连带删除 step log 和 run */
+    private void cleanupWorkflowIfNoMessageReferences(AiSessions session, Long workflowRunId) {
+        Long refCount = lambdaQuery()
+                .eq(AiMessages::getWorkflowRunId, workflowRunId)
+                .count();
+
+        if (refCount != null && refCount > 0) {
+            return;
+        }
+
+        AiWorkflowRun run = aiWorkflowRunMapper.selectById(workflowRunId);
+        if (run == null) {
+            return;
+        }
+
+        // 严格模式：只允许删除已结束 Workflow 的消息，进行中必须走取消流程
+        if (!isFinishedWorkflowStatus(run.getStatus())) {
+            throw new IllegalArgumentException("Workflow 正在进行中，请先取消后再删除消息");
+        }
+
+        aiWorkflowStepLogMapper.delete(new LambdaQueryWrapper<AiWorkflowStepLog>()
+                .eq(AiWorkflowStepLog::getWorkflowRunId, workflowRunId));
+
+        aiWorkflowRunMapper.deleteById(workflowRunId);
+    }
+
+    private boolean isFinishedWorkflowStatus(String status) {
+        return AiWorkflowStatus.COMPLETED.name().equals(status)
+                || AiWorkflowStatus.CANCELLED.name().equals(status)
+                || AiWorkflowStatus.FAILED.name().equals(status);
     }
 }

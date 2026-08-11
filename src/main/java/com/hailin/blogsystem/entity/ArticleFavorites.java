@@ -11,7 +11,7 @@ import java.time.LocalDateTime;
 @TableName("article_favorites")
 public class ArticleFavorites {
 
-    @TableId( type = IdType.AUTO)
+    @TableId(type = IdType.ASSIGN_ID)
     private Long id;
     private Long articleId;
     private Long userId;

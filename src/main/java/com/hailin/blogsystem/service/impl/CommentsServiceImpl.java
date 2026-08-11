@@ -115,8 +115,6 @@ public class CommentsServiceImpl extends ServiceImpl<CommentsMapper, ArticleComm
                 pageSize
         );
 
-        saveCommentListToCache(cacheKey,pageVO);
-
         //关于liked字段
         fillLiked(list);
 
@@ -128,6 +126,9 @@ public class CommentsServiceImpl extends ServiceImpl<CommentsMapper, ArticleComm
                 fillLiked(replies);
             }
         }
+
+        //所有字段填充完成后才保存缓存，否则缓存里回复的 nickname/avatarUrl 为空
+        saveCommentListToCache(cacheKey,pageVO);
 
         return pageVO;
     }

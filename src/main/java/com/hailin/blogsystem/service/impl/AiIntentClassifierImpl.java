@@ -54,6 +54,7 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 - ARTICLE_ACTION
                                 - NAVIGATE
                                 - EDITOR_ACTION
+                                - CREATE_ARTICLE_WORKFLOW
                                 - ARTICLE_DETAIL_QA
                                 - ARTICLE_SEARCH
                 
@@ -68,23 +69,8 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 ARTICLE_DETAIL_QA 不需要 actionType。
                                 如果缺少 articleId，输出 GENERAL_CHAT。
                                  
-                                actionType 可选：
-                                - likeArticle
-                                - unlikeArticle
-                                - favoriteArticle
-                                - unfavoriteArticle
-                                - followAuthor
-                                - unfollowAuthor
-                                - copyArticleLink
-                                - scrollToComments
-                                - saveDraft
-                                - publish
-                                - fillArticle
-                                - scrollToTop
-                
-                                输出格式：
-                                {"intent":"GENERAL_CHAT","actionType":null,"articleId":null,"userId":null,"content":null}
-                
+                                actionType 可选：likeArticle, unlikeArticle, favoriteArticle, unfavoriteArticle, followAuthor, unfollowAuthor, copyArticleLink, scrollToComments, saveDraft, publish, fillArticle, scrollToTop。
+
                                 当用户要求跳转页面、打开页面、进入页面、回到某页时，输出 NAVIGATE。
                                 当 pageType 是 article-detail，且用户要求查看该作者或者进入该作者的主页时，输出 NAVIGATE。
                                 
@@ -109,10 +95,10 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 
                                 如果用户说“打开第 X 篇文章”，但没有明确文章ID，不要猜ID，输出 GENERAL_CHAT。
                                 
-                                当用户要求帮他写一篇文章、生成博文、起草博客、写一篇关于某主题的内容时，输出 EDITOR_ACTION，actionType=fillArticle。
-               
+                                当用户要求帮他写一篇关于特定主题的文章、博客、博文、草稿、大纲时，输出 CREATE_ARTICLE_WORKFLOW。
+                                这类请求不要求用户必须在编辑器页面。
                                 如果用户指定了主题，填写 topic。
-                                如果用户指定了分类，填写 categoryName,默认为随笔分类.
+                                如果用户指定了分类，填写 categoryName，默认为随笔分类。
                                 如果用户有额外要求，填写 requirements。
                                 不要在意图识别阶段生成完整正文。
                                 
@@ -126,9 +112,7 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 只有 pageType 是 editor-new 或 editor-edit 时，才输出 EDITOR_ACTION。
                                 如果用户不在编辑器页面却要求保存或发布，仍然输出 EDITOR_ACTION，让后端/前端提示用户先进入编辑器。
                                 
-                                必须输出合法 JSON。
-                                不要输出 markdown。
-                                不要输出代码块。
+                                只输出纯 JSON，禁止 markdown、代码块或任何额外文本。
                """;
     }
 
