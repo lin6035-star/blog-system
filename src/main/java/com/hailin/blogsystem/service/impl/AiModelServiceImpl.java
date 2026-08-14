@@ -1,5 +1,7 @@
 package com.hailin.blogsystem.service.impl;
 
+import com.hailin.blogsystem.ai.LlmErrorClassifier;
+import com.hailin.blogsystem.ai.TokenUsageAccumulator;
 import com.hailin.blogsystem.ai.rag.ArticleRagPromptBuilder;
 import com.hailin.blogsystem.ai.rag.ArticleRagRetrieveService;
 import com.hailin.blogsystem.ai.tool.*;
@@ -11,9 +13,11 @@ import com.hailin.blogsystem.service.AiModelService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
 
+import java.time.Duration;
 import java.util.List;
 
 @Slf4j
@@ -69,17 +73,29 @@ public class AiModelServiceImpl implements AiModelService {
     // }
 
     @Override
-    public Flux<String> streamChat(AiPrompt prompt,String requestId) {
+    public Flux<String> streamChat(AiPrompt prompt,String requestId,TokenUsageAccumulator usageAccumulator) {
 
         AiNavigationTools aiNavigationTools = aiNavigationToolsFactory.create(requestId);
         AiEditorTools aiEditorTools = aiEditorToolFactory.create(requestId);
         AiArticleActionTools aiArticleActionTools = aiArticleActionToolsFactory.create(requestId);
 
+        TokenUsageAccumulator usage = usageAccumulator == null ? new TokenUsageAccumulator() : usageAccumulator;
+
         return chatClient.prompt()
                 .user(prompt.getFinalPromptContext())
                 .tools(aiArticleTools,aiNavigationTools,aiEditorTools,aiArticleActionTools,aiUserProfileTools)
+                .options(OpenAiChatOptions.builder()
+                        .streamUsage(true)
+                        .build())
                 .stream()
-                .content()
+                .chatResponse()
+                .timeout(Duration.ofSeconds(60))
+                .map(response -> {
+                    //工具调用是多轮请求，每轮一个 usage，跨轮累计
+                    usage.add(response.getMetadata().getUsage());
+                    return response.getResult() == null ? "" : response.getResult().getOutput().getText();
+                })
+                .filter(text -> text != null && !text.isEmpty())
                 .onErrorResume(e -> {
                     log.error("AI 流式调用失败", e);
                     return Flux.just(fallbackMessage(e));
@@ -98,7 +114,8 @@ public class AiModelServiceImpl implements AiModelService {
             return "AI 服务额度不足，请稍后再试。";
         }
 
-        if (msg.contains("timeout") || msg.contains("timed out")) {
+        if (msg.contains("timeout") || msg.contains("timed out")
+                || LlmErrorClassifier.containsTimeoutException(e)) {
             return "AI 响应超时，请稍后重试。";
         }
 

@@ -55,6 +55,7 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 - NAVIGATE
                                 - EDITOR_ACTION
                                 - CREATE_ARTICLE_WORKFLOW
+                                - OPTIMIZE_ARTICLE_WORKFLOW
                                 - ARTICLE_DETAIL_QA
                                 - ARTICLE_SEARCH
                 
@@ -98,10 +99,16 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 当用户要求帮他写一篇关于特定主题的文章、博客、博文、草稿、大纲时，输出 CREATE_ARTICLE_WORKFLOW。
                                 这类请求不要求用户必须在编辑器页面。
                                 如果用户指定了主题，填写 topic。
+                                topic 只能从用户原话中提取；用户没有明确给出主题时，topic 必须为 null，禁止猜测、联想或编造主题。
                                 如果用户指定了分类，填写 categoryName，默认为随笔分类。
                                 如果用户有额外要求，填写 requirements。
                                 不要在意图识别阶段生成完整正文。
-                                
+
+                                当 pageType 是 article-detail，且用户要求优化、改进、润色、重写当前文章时，输出 OPTIMIZE_ARTICLE_WORKFLOW，并填写 articleId（从页面上下文中获取）。
+                                这类请求不需要用户在编辑器页面。
+                                如果缺少 articleId，输出 GENERAL_CHAT。
+                                不要在意图识别阶段生成优化方案。
+
                                 输出格式：
                                 {"intent":"GENERAL_CHAT","actionType":null,"articleId":null,"userId":null,"content":null,"target":null,"param":null,"topic":null,"categoryName":null,"requirements":null}
                

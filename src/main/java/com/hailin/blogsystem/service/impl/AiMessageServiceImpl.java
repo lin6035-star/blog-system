@@ -5,6 +5,8 @@ import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.errorprone.annotations.Var;
+import com.hailin.blogsystem.ai.TokenUsageAccumulator;
+import com.hailin.blogsystem.ai.workflow.CreateArticleWorkflowHandler;
 import com.hailin.blogsystem.ai.rag.ArticleRagPromptBuilder;
 import com.hailin.blogsystem.ai.rag.ArticleRagRetrieveService;
 import com.hailin.blogsystem.ai.rag.ArticleRagSearchService;
@@ -56,6 +58,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
     private final AiWorkflowRunService aiWorkflowRunService;
     private final AiWorkflowRunMapper aiWorkflowRunMapper;
     private final AiWorkflowStepLogMapper aiWorkflowStepLogMapper;
+    private final CreateArticleWorkflowHandler createArticleWorkflowHandler;
 
     private final AiSessionService aiSessionService;
     private final ObjectMapper objectMapper;
@@ -199,6 +202,19 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         // 先用 LLM 分类意图，再决定是否起 Workflow——不在入口猜自然语言（分类后还有确定性兜底）
         AiIntent intent = classifyWithFallback(message, pageContext);
 
+        // 优化文章意图（OPTIMIZE_ARTICLE_WORKFLOW，需页面带 articleId）→ 起优化 Workflow
+        if (isOptimizeArticleWorkflowIntent(intent, pageContext)
+                || looksLikeOptimizeArticleRequest(message, pageContext)) {
+            return streamArticleOptimizeWorkflowFromIntent(
+                    message,
+                    intent,
+                    pageContext,
+                    rawPageContextJson,
+                    userId,
+                    sessionId
+            );
+        }
+
         // 创建文章意图（CREATE_ARTICLE_WORKFLOW 或兼容的 EDITOR_ACTION+fillArticle）→ 起 Workflow
         if (isCreateArticleWorkflowIntent(intent)) {
             return streamCreateArticleWorkflowFromIntent(
@@ -262,7 +278,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 .build();
 
         String requestId = UUID.randomUUID().toString();
-        Flux<AiChatEventVO> dataEvents = aiModelService.streamChat(prompt,requestId)
+        TokenUsageAccumulator usage = new TokenUsageAccumulator();
+        Flux<AiChatEventVO> dataEvents = aiModelService.streamChat(prompt,requestId,usage)
                 .doOnNext(fullReply::append)
                 .map(chunk -> AiChatEventVO.builder()
                         .eventType(AiChatEventType.DATA.getValue())
@@ -271,6 +288,11 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
 
         Mono<AiChatEventVO> stopEvent = Mono.fromSupplier(() -> {
             AiMessages assistantMessage = saveStreamAssistantMessage(sessionId,userId,rawPageContextJson, fullReply.toString());
+            //token 用量落库（含工具调用多轮累计）
+            if (usage.getTotalTokens() > 0) {
+                assistantMessage.setTokenCount((long) usage.getTotalTokens());
+                updateById(assistantMessage);
+            }
 
             // 异步提取候选记忆（规则预筛命中才写入，不会阻塞 SSE）
             aiMemoryCandidateExtractorService.extractAfterChat(
@@ -411,6 +433,168 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 && "fillArticle".equals(intent.getActionType());
     }
 
+    /** 优化文章意图：OPTIMIZE_ARTICLE_WORKFLOW，且页面上下文带有 articleId 才可进入 */
+    private boolean isOptimizeArticleWorkflowIntent(AiIntent intent, PageContextDTO pageContext) {
+        if (intent == null || !"OPTIMIZE_ARTICLE_WORKFLOW".equals(intent.getIntent())) {
+            return false;
+        }
+        return pageContext != null
+                && pageContext.getArticleId() != null
+                && !pageContext.getArticleId().isBlank();
+    }
+
+    /** 从意图分类结果创建文章优化 Workflow */
+    private Flux<AiChatEventVO> streamArticleOptimizeWorkflowFromIntent(
+            String message,
+            AiIntent intent,
+            PageContextDTO pageContext,
+            String rawPageContextJson,
+            Long userId,
+            Long sessionId
+    ) {
+        AiMessages userMessage = new AiMessages();
+        userMessage.setSessionId(sessionId);
+        userMessage.setRole(ROLE_USER);
+        userMessage.setContent(message);
+        userMessage.setPageContext(rawPageContextJson);
+        userMessage.setCreatedAt(LocalDateTime.now());
+        save(userMessage);
+
+        AiWorkflowOptimizeArticleDTO workflowDTO = new AiWorkflowOptimizeArticleDTO();
+        workflowDTO.setConversationId(sessionId);
+        workflowDTO.setArticleId(Long.valueOf(pageContext.getArticleId()));
+        workflowDTO.setInstruction(message);
+        workflowDTO.setPageContext(pageContext);
+
+        AiChatEventVO paramEvent = AiChatEventVO.builder()
+                .eventType(AiChatEventType.PARAM.getValue())
+                .eventData(Map.of(
+                        "session", AiSessionVO.from(getOwnedSession(sessionId, userId)),
+                        "userMessage", AiMessageVO.from(userMessage)
+                ))
+                .build();
+
+        Flux<AiChatEventVO> workflowEvents = Flux.create(sink ->
+                Schedulers.boundedElastic().schedule(() -> {
+                    UserContext.set(userId);
+                    try {
+                        AiWorkflowStepEmitter emitter = new AiWorkflowStepEmitter() {
+                            @Override
+                            public void emit(String step, String status, String stepMessage) {
+                                // 初次创建时 step 事件可以先不推给前端
+                            }
+
+                            @Override
+                            public void emitContent(String step, String field, String delta) {
+                                if ("optimizationPlan".equals(field) || "optimizedContent".equals(field)) {
+                                    sink.next(AiChatEventVO.builder()
+                                            .eventType(AiChatEventType.DATA.getValue())
+                                            .eventData(delta)
+                                            .build());
+                                }
+                            }
+                        };
+
+                        AiWorkflowRunVO workflow = aiWorkflowRunService.createArticleOptimizeWorkflow(workflowDTO, emitter);
+
+                        AiMessages assistantMessage = saveStreamAssistantMessage(
+                                sessionId,
+                                userId,
+                                rawPageContextJson,
+                                buildOptimizeWorkflowAssistantContent(workflow),
+                                Long.valueOf(workflow.getId())
+                        );
+
+                        AiSessions updatedSession = getOwnedSession(sessionId, userId);
+
+                        Map<String, Object> eventData = new HashMap<>();
+                        eventData.put("session", AiSessionVO.from(updatedSession));
+                        eventData.put("assistantMessage", AiMessageVO.from(assistantMessage));
+                        eventData.put("references", List.of());
+                        eventData.put("workflow", workflow);
+
+                        sink.next(AiChatEventVO.builder()
+                                .eventType(AiChatEventType.STOP.getValue())
+                                .eventData(eventData)
+                                .build());
+
+                        sink.complete();
+                    } catch (Throwable e) {
+                        String friendlyMessage = buildOptimizeWorkflowRejectedMessage(e);
+                        if (friendlyMessage != null) {
+                            AiMessages assistantMessage = saveStreamAssistantMessage(
+                                    sessionId,
+                                    userId,
+                                    rawPageContextJson,
+                                    friendlyMessage,
+                                    null
+                            );
+
+                            AiSessions updatedSession = getOwnedSession(sessionId, userId);
+
+                            Map<String, Object> eventData = new HashMap<>();
+                            eventData.put("session", AiSessionVO.from(updatedSession));
+                            eventData.put("assistantMessage", AiMessageVO.from(assistantMessage));
+                            eventData.put("references", List.of());
+
+                            sink.next(AiChatEventVO.builder()
+                                    .eventType(AiChatEventType.STOP.getValue())
+                                    .eventData(eventData)
+                                    .build());
+
+                            sink.complete();
+                            return;
+                        }
+
+                        sink.error(e);
+                    } finally {
+                        UserContext.clear();
+                    }
+                })
+        );
+
+        return Flux.concat(Flux.just(paramEvent), workflowEvents);
+    }
+
+    private String buildOptimizeWorkflowAssistantContent(AiWorkflowRunVO workflow) {
+        Object contextValue = workflow == null ? null : workflow.getContext();
+        if (!(contextValue instanceof Map<?, ?> context)) {
+            return "已创建文章优化 Workflow，请先确认优化方案。";
+        }
+
+        Object stepResultsValue = context.get("stepResults");
+        if (!(stepResultsValue instanceof Map<?, ?> stepResults)) {
+            return "已创建文章优化 Workflow，请先确认优化方案。";
+        }
+
+        Object plan = stepResults.get("optimizationPlan");
+        if (plan == null || String.valueOf(plan).isBlank()) {
+            return "已创建文章优化 Workflow，请先确认优化方案。";
+        }
+
+        return "已创建文章优化 Workflow，请先确认下面的优化方案。\n\n" + plan;
+    }
+
+    /** 优化 Workflow 的可预期业务拒绝 → 返回友好的 AI 回复文案；非预期异常返回 null 交给 sink.error */
+    private String buildOptimizeWorkflowRejectedMessage(Throwable e) {
+        if (!(e instanceof IllegalArgumentException)) {
+            return null;
+        }
+
+        String message = e.getMessage();
+        if ("只能优化自己的文章".equals(message)) {
+            return "这篇文章不是你发布的，我不能直接帮你优化或填充编辑器。你可以让我从读者视角给出修改建议，但不能进入编辑保存流程。";
+        }
+
+        if ("文章不存在或已删除".equals(message)) {
+            return "这篇文章不存在或已被删除，暂时不能发起优化。";
+        }
+
+        return message == null || message.isBlank()
+                ? "当前文章暂时不能发起优化。"
+                : message;
+    }
+
     /** 意图分类 + 确定性兜底：LLM 分类不稳定，明显的写文章请求即使分错也强制走 Workflow（内部还有需求分析/澄清） */
     private AiIntent classifyWithFallback(String message, PageContextDTO pageContext) {
         AiIntent intent = aiIntentClassifier.classify(message, pageContext);
@@ -425,6 +609,11 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         if (message == null || message.isBlank()) {
             return false;
         }
+
+        if (containsAny(message, "优化", "改进", "润色", "重写", "完善", "提升", "修改")) {
+            return false;
+        }
+
         String text = message.trim();
         return text.matches(".*(帮我|给我|请|生成|写|创作).*(一篇|篇).*(文章|博客|博文|草稿|大纲).*")
                 || text.matches(".*(写一篇|生成一篇|创作一篇).*(文章|博客|博文).*");
@@ -453,13 +642,9 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         userMessage.setCreatedAt(LocalDateTime.now());
         save(userMessage);
 
-        // 用 intent.topic 拼 requirement，优先级高于原始 message
-        String requirement = intent.getTopic() != null && !intent.getTopic().isBlank()
-                ? intent.getTopic()
-                : message;
-        if (intent.getRequirements() != null && !intent.getRequirements().isBlank()) {
-            requirement += "，要求：" + intent.getRequirements();
-        }
+        // requirement 只用原始 message：intent.topic / requirements 是 LLM 结构化输出，会幻觉。
+        // 主题是否明确交给 CreateArticleWorkflowHandler.isRequirementUnclear 确定性规则判断（LLM 判断意图，规则判断参数）
+        String requirement = message;
 
         AiWorkflowCreateArticleDTO workflowDTO = new AiWorkflowCreateArticleDTO();
         workflowDTO.setConversationId(sessionId);
@@ -610,9 +795,10 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             return buildWorkflowStopFlux(sessionId, userId, rawPageContextJson, userMessage, workflow);
         }
 
-        // WAITING_OUTLINE_CONFIRM / WAITING_DRAFT_CONFIRM / WAITING_FILL_CONFIRM
+        // WAITING_PLAN_CONFIRM / WAITING_OUTLINE_CONFIRM / WAITING_DRAFT_CONFIRM / WAITING_FILL_CONFIRM
         // 这些状态下的确认操作应走前端 approve/reject 按钮，普通输入提示用户
-        if (status == AiWorkflowStatus.WAITING_OUTLINE_CONFIRM
+        if (status == AiWorkflowStatus.WAITING_PLAN_CONFIRM
+                || status == AiWorkflowStatus.WAITING_OUTLINE_CONFIRM
                 || status == AiWorkflowStatus.WAITING_DRAFT_CONFIRM
                 || status == AiWorkflowStatus.WAITING_FILL_CONFIRM) {
             AiMessages assistantMessage = saveStreamAssistantMessage(
@@ -650,9 +836,9 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
     ) {
         AiIntent intent = classifyWithFallback(message, pageContext);
 
-        // 重新检查是否需要起新 Workflow（topic 已由兜底填充，非空才起）
+        // 重新检查是否需要起新 Workflow：主题必须能从原文证明（确定性规则，不信任 classifier 的 topic）
         if (isCreateArticleWorkflowIntent(intent)
-                && intent.getTopic() != null && !intent.getTopic().isBlank()) {
+                && !createArticleWorkflowHandler.isRequirementUnclear(message)) {
             // 删除已保存的 userMessage（新 Workflow 方法会重新保存）
             removeById(userMessage.getId());
             return streamCreateArticleWorkflowFromIntent(
@@ -674,7 +860,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 .build();
 
         String requestId = UUID.randomUUID().toString();
-        Flux<AiChatEventVO> dataEvents = aiModelService.streamChat(prompt, requestId)
+        TokenUsageAccumulator usage = new TokenUsageAccumulator();
+        Flux<AiChatEventVO> dataEvents = aiModelService.streamChat(prompt, requestId, usage)
                 .doOnNext(fullReply::append)
                 .map(chunk -> AiChatEventVO.builder()
                         .eventType(AiChatEventType.DATA.getValue())
@@ -684,6 +871,11 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         Mono<AiChatEventVO> stopEvent = Mono.fromSupplier(() -> {
             AiMessages assistantMessage = saveStreamAssistantMessage(
                     sessionId, userId, rawPageContextJson, fullReply.toString());
+            //token 用量落库（含工具调用多轮累计）
+            if (usage.getTotalTokens() > 0) {
+                assistantMessage.setTokenCount((long) usage.getTotalTokens());
+                updateById(assistantMessage);
+            }
 
             AiSessions updated = getOwnedSession(sessionId, userId);
 
@@ -776,7 +968,9 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
     ){
         AiMessages assistantMessage = new AiMessages();
         assistantMessage.setSessionId(sessionId);
-        assistantMessage.setWorkflowRunId(String.valueOf(workflowRunId));
+        if (workflowRunId != null) {
+            assistantMessage.setWorkflowRunId(String.valueOf(workflowRunId));
+        }
         assistantMessage.setRole(ROLE_ASSISTANT);
         assistantMessage.setContent(content);
         assistantMessage.setPageContext(rawPageContextJson);
@@ -820,7 +1014,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             assistantMessage.setId("guest-ai-" + System.currentTimeMillis());
             assistantMessage.setSessionId("guest");
             assistantMessage.setRole("assistant");
-            if (intent.getTopic() != null && !intent.getTopic().isBlank()) {
+            // 主题必须能从原文证明（确定性规则，不信任 classifier 的 topic）
+            if (!createArticleWorkflowHandler.isRequirementUnclear(message)) {
                 assistantMessage.setContent("文章创作 Workflow 需要登录后使用，请先登录后再试。");
             } else {
                 assistantMessage.setContent("可以，想写什么主题？\n比如 Redis 缓存、Kafka 消息队列、RAG 检索增强这些");
@@ -886,7 +1081,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 .build();
 
         String requestId = UUID.randomUUID().toString();
-        Flux<AiChatEventVO> dataEvents = aiModelService.streamChat(prompt,requestId)
+        Flux<AiChatEventVO> dataEvents = aiModelService.streamChat(prompt,requestId,new TokenUsageAccumulator())
                 .doOnNext(fullReply::append)
                 .map(chunk -> AiChatEventVO.builder()
                         .eventType(AiChatEventType.DATA.getValue())
@@ -1528,5 +1723,21 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         return AiWorkflowStatus.COMPLETED.name().equals(status)
                 || AiWorkflowStatus.CANCELLED.name().equals(status)
                 || AiWorkflowStatus.FAILED.name().equals(status);
+    }
+
+    //加一个确定性优化兜底
+    private boolean looksLikeOptimizeArticleRequest(String message, PageContextDTO pageContext) {
+        if (message == null || message.isBlank()) {
+            return false;
+        }
+        if (pageContext == null
+                || pageContext.getArticleId() == null
+                || pageContext.getArticleId().isBlank()) {
+            return false;
+        }
+
+        String text = message.trim();
+        return text.matches(".*(优化|改进|润色|重写|完善|提升|修改).*(这篇|当前|这篇文章|文章).*")
+                || text.matches(".*(帮我|请|可以).*(优化|改进|润色|重写|完善|提升|修改).*");
     }
 }

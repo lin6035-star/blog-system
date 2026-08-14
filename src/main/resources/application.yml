@@ -34,7 +34,7 @@ spring:
       read-timeout: 60s
       chat:
         options:
-          model: ${AI_CHAT_MODEL:deepseek-v4-pro}
+          model: ${AI_CHAT_MODEL:qwen-plus-2025-07-28}
       embedding:
         options:
           model: text-embedding-v3
