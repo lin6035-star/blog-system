@@ -13,7 +13,11 @@ public enum AiWorkflowStep {
     ANALYZE_ARTICLE(9),  // analyze_article 分析文章现状与问题
     GENERATE_OPTIMIZATION_PLAN(10),  // generate_optimization_plan 生成优化方案
     REWRITE_ARTICLE(11),  // rewrite_article 按优化方案重写文章
-    CONTENT_CHECK(12);  // content_check 检查重写后的内容质量
+    CONTENT_CHECK(12),  // content_check 检查重写后的内容质量
+
+    ANALYZE_GOAL(13),  // analyze_goal 分析学习目标，信息不足则追问
+    GENERATE_PLAN(14), // generate_plan 生成结构化学习计划
+    SAVE_PLAN(15);     // save_plan 幂等保存学习计划（upsert）
 
     private final int order;
 

@@ -1,6 +1,7 @@
 package com.hailin.blogsystem.controller;
 
 import com.hailin.blogsystem.entity.dto.AiWorkflowCreateArticleDTO;
+import com.hailin.blogsystem.entity.dto.AiWorkflowLearningPlanDTO;
 import com.hailin.blogsystem.entity.dto.AiWorkflowOptimizeArticleDTO;
 import com.hailin.blogsystem.entity.dto.AiWorkflowRejectDTO;
 import com.hailin.blogsystem.entity.vo.AiChatEventVO;
@@ -32,6 +33,11 @@ public class AiWorkflowController {
     @PostMapping("/article/optimize")  //创建文章优化工作流
     public Result<AiWorkflowRunVO> createArticleOptimizeWorkflow(@RequestBody AiWorkflowOptimizeArticleDTO dto) {
         return Result.success(aiWorkflowRunService.createArticleOptimizeWorkflow(dto));
+    }
+
+    @PostMapping("/learning-plan/create")  //创建学习规划工作流
+    public Result<AiWorkflowRunVO> createLearningPlanWorkflow(@RequestBody AiWorkflowLearningPlanDTO dto) {
+        return Result.success(aiWorkflowRunService.createLearningPlanWorkflow(dto));
     }
 
     @GetMapping("/{id}")

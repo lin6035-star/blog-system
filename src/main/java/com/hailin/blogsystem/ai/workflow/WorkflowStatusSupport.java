@@ -46,6 +46,7 @@ public class WorkflowStatusSupport {
             case "WAITING_REQUIREMENT_CONFIRM": return "等待补充需求";
             case "WAITING_OUTLINE_CONFIRM": return "等待确认大纲";
             case "WAITING_PLAN_CONFIRM": return "等待确认优化方案";
+            case "WAITING_LEARNING_PLAN_CONFIRM": return "学习计划已生成，等待用户确认或修改";
             case "WAITING_DRAFT_CONFIRM": return "等待确认草稿";
             case "WAITING_FILL_CONFIRM": return "等待确认填充";
             case "WAITING_USER_SAVE": return "等待用户保存/发布";
@@ -72,6 +73,9 @@ public class WorkflowStatusSupport {
             case "GENERATE_OPTIMIZATION_PLAN": return "生成优化方案";
             case "REWRITE_ARTICLE": return "重写文章";
             case "CONTENT_CHECK": return "内容检查";
+            case "ANALYZE_GOAL": return "分析学习目标";
+            case "GENERATE_PLAN": return "生成结构化学习计划";
+            case "SAVE_PLAN": return "保存学习计划";
             default: return step;
         }
     }

@@ -6,12 +6,14 @@ import com.hailin.blogsystem.ai.workflow.AiWorkflowAdvanceResult;
 import com.hailin.blogsystem.ai.workflow.AiWorkflowStepEmitter;
 import com.hailin.blogsystem.ai.workflow.ArticleOptimizeWorkflowHandler;
 import com.hailin.blogsystem.ai.workflow.CreateArticleWorkflowHandler;
+import com.hailin.blogsystem.ai.workflow.LearningPlanWorkflowHandler;
 import com.hailin.blogsystem.ai.workflow.WorkflowHandler;
 import com.hailin.blogsystem.ai.workflow.WorkflowHandlerRegistry;
 import com.hailin.blogsystem.ai.workflow.WorkflowStatusSupport;
 import com.hailin.blogsystem.entity.AiSessions;
 import com.hailin.blogsystem.entity.AiWorkflowRun;
 import com.hailin.blogsystem.entity.dto.AiWorkflowCreateArticleDTO;
+import com.hailin.blogsystem.entity.dto.AiWorkflowLearningPlanDTO;
 import com.hailin.blogsystem.entity.dto.AiWorkflowOptimizeArticleDTO;
 import com.hailin.blogsystem.entity.dto.AiWorkflowStatus;
 import com.hailin.blogsystem.entity.dto.AiWorkflowStep;
@@ -48,6 +50,7 @@ public class AiWorkflowRunServiceImpl
     private final ObjectMapper objectMapper;
     private final CreateArticleWorkflowHandler createArticleWorkflowHandler;
     private final ArticleOptimizeWorkflowHandler articleOptimizeWorkflowHandler;
+    private final LearningPlanWorkflowHandler learningPlanWorkflowHandler;
     private final WorkflowHandlerRegistry workflowHandlerRegistry;
     private final AiSessionService aiSessionService;
     private final AiWorkflowStepLogService aiWorkflowStepLogService;
@@ -163,6 +166,60 @@ public class AiWorkflowRunServiceImpl
         }
     }
 
+    @Override  //创建学习规划 Workflow
+    @Transactional
+    public AiWorkflowRunVO createLearningPlanWorkflow(AiWorkflowLearningPlanDTO dto) {
+        return createLearningPlanWorkflow(dto, AiWorkflowStepEmitter.noop());
+    }
+    @Override
+    @Transactional
+    public AiWorkflowRunVO createLearningPlanWorkflow(AiWorkflowLearningPlanDTO dto, AiWorkflowStepEmitter emitter) {
+        Long userId = requireLogin();
+        long start = System.currentTimeMillis();
+
+        //和其他 workflow 一致：一个会话同时只能有一个任务
+        Long conversationId = dto == null ? null : dto.getConversationId();
+        checkActiveWorkflowConflict(conversationId, userId);
+
+        //create 只初始化 run（不执行 LLM），save 后再跑初始步骤
+        AiWorkflowAdvanceResult result = learningPlanWorkflowHandler.create(userId, dto, emitter);
+        save(result.getRun());
+
+        try {
+            result = learningPlanWorkflowHandler.runInitialSteps(result.getRun(), emitter);
+            updateById(result.getRun());
+
+            //绑定
+            bindSessionActiveWorkflow(result.getRun());
+
+            //写Step Log
+            recordWorkflowSuccess(
+                    result.getRun(),
+                    currentStep(result.getRun()),
+                    "创建学习规划工作流",
+                    outputStatus(result.getRun()),
+                    start
+            );
+
+            return toVo(result);
+        } catch (RuntimeException e) {
+            markFailed(result.getRun(), e);
+
+            //失败也绑定会话：前端刷新后还能从会话恢复 FAILED 面板和重试入口
+            bindSessionActiveWorkflow(result.getRun());
+
+            recordWorkflowFailure(
+                    result.getRun(),
+                    currentStep(result.getRun()),
+                    "创建学习规划工作流",
+                    e,
+                    start
+            );
+
+            return toVo(result.getRun());
+        }
+    }
+
     @Override  //查询 Workflow。
     public AiWorkflowRunVO getWorkflowRun(Long id) {
         //必须校验 userId，避免用户看到别人的 workflow。
@@ -192,6 +249,12 @@ public class AiWorkflowRunServiceImpl
             AiWorkflowAdvanceResult result = handler.approve(run, emitter);
             updateById(result.getRun());
             clearErrorMessage(run.getId());
+
+            //handler 内直接置 COMPLETED 的流程（如学习规划 SAVE_PLAN）不走 complete()，
+            // 这里统一收口：结束态清 session 绑定，避免刷新后误恢复已结束的 workflow
+            if (AiWorkflowStatus.COMPLETED.name().equals(result.getRun().getStatus())) {
+                clearSessionActiveWorkflow(result.getRun());
+            }
 
             //成功，记success日志
             recordWorkflowSuccess(
@@ -245,6 +308,11 @@ public class AiWorkflowRunServiceImpl
             AiWorkflowAdvanceResult result = handler.reject(run, feedback,emitter);
             updateById(result.getRun());
             clearErrorMessage(run.getId());
+
+            //否定反馈导致 CANCELLED（如"算了"）→ 清 session 绑定，让下一条消息回普通聊天
+            if (AiWorkflowStatus.CANCELLED.name().equals(result.getRun().getStatus())) {
+                clearSessionActiveWorkflow(result.getRun());
+            }
 
             recordWorkflowSuccess(
                     result.getRun(),

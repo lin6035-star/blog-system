@@ -4,6 +4,7 @@ import com.baomidou.mybatisplus.extension.service.IService;
 import com.hailin.blogsystem.ai.workflow.AiWorkflowStepEmitter;
 import com.hailin.blogsystem.entity.AiWorkflowRun;
 import com.hailin.blogsystem.entity.dto.AiWorkflowCreateArticleDTO;
+import com.hailin.blogsystem.entity.dto.AiWorkflowLearningPlanDTO;
 import com.hailin.blogsystem.entity.dto.AiWorkflowOptimizeArticleDTO;
 import com.hailin.blogsystem.entity.vo.AiWorkflowRunVO;
 import com.hailin.blogsystem.entity.vo.AiWorkflowStepLogVO;
@@ -19,6 +20,10 @@ public interface AiWorkflowRunService extends IService<AiWorkflowRun> {
     AiWorkflowRunVO createArticleOptimizeWorkflow(AiWorkflowOptimizeArticleDTO dto);
 
     AiWorkflowRunVO createArticleOptimizeWorkflow(AiWorkflowOptimizeArticleDTO dto, AiWorkflowStepEmitter emitter);
+
+    AiWorkflowRunVO createLearningPlanWorkflow(AiWorkflowLearningPlanDTO dto);
+
+    AiWorkflowRunVO createLearningPlanWorkflow(AiWorkflowLearningPlanDTO dto, AiWorkflowStepEmitter emitter);
 
     AiWorkflowRunVO getWorkflowRun(Long id);
 

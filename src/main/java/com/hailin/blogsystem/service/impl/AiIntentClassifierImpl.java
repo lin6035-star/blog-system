@@ -100,6 +100,11 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 这类请求不要求用户必须在编辑器页面。
                                 如果用户指定了主题，填写 topic。
                                 topic 只能从用户原话中提取；用户没有明确给出主题时，topic 必须为 null，禁止猜测、联想或编造主题。
+
+                                当用户表达学习某技术的想法或规划诉求（"我想学XX"、"不知道怎么开始"、"帮我规划学习路线"）时，输出 LEARNING_PLAN。
+                                是否真正制定计划由后端追问确认，分类器只负责"这是不是学习意图"，宁判勿漏。
+                                只判断意图，不提取任何结构化字段（学习目标由后端从原文解析，禁止编造）。
+                                如果只是询问知识、了解概念（"Redis 是什么"），输出 GENERAL_CHAT，不要输出 LEARNING_PLAN。
                                 如果用户指定了分类，填写 categoryName，默认为随笔分类。
                                 如果用户有额外要求，填写 requirements。
                                 不要在意图识别阶段生成完整正文。
