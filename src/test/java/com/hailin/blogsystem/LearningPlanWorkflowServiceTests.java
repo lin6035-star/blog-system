@@ -121,9 +121,10 @@ class LearningPlanWorkflowServiceTests {
 
         assertThat(created.getStatus()).isEqualTo(AiWorkflowStatus.WAITING_REQUIREMENT_CONFIRM.name());
         @SuppressWarnings("unchecked")
-        Map<String, Object> clarification = (Map<String, Object>) contextOf(created).get("clarification");
-        assertThat(clarification.get("required")).isEqualTo(true);
-        assertThat(String.valueOf(clarification.get("question"))).isNotBlank();
+        Map<String, Object> confirmation = (Map<String, Object>) contextOf(created).get("confirmation");
+        assertThat(confirmation.get("type")).isEqualTo("REQUIREMENT");
+        assertThat(confirmation.get("step")).isEqualTo("ANALYZE_GOAL");
+        assertThat(String.valueOf(confirmation.get("question"))).isNotBlank();
     }
 
     //2. 强模式：明确规划诉求 → 直接生成计划到确认（真实 LLM）

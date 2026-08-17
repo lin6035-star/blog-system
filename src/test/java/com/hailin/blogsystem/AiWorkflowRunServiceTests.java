@@ -362,7 +362,17 @@ class AiWorkflowRunServiceTests {
         @SuppressWarnings("unchecked")
         Map<String, Object> context = (Map<String, Object>) vo.getContext();
         assertThat(context.get("workflowVersion")).isEqualTo("1.0");
-        assertThat(context).containsKeys("requirement", "outline", "draft", "feedbackHistory");
+        assertThat(context).containsKeys("requirement", "stepResults", "feedbackHistory");
+
+        //结果数据统一放 stepResults，确认卡片记录停靠点（前端按 type 渲染确认面板）
+        @SuppressWarnings("unchecked")
+        Map<String, Object> stepResults = (Map<String, Object>) context.get("stepResults");
+        assertThat(String.valueOf(stepResults.get("outline"))).isNotBlank();
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> confirmation = (Map<String, Object>) context.get("confirmation");
+        assertThat(confirmation.get("type")).isEqualTo("OUTLINE");
+        assertThat(confirmation.get("step")).isEqualTo("GENERATE_OUTLINE");
 
         AiWorkflowRun saved = aiWorkflowRunMapper.selectById(Long.valueOf(vo.getId()));
         assertThat(saved).isNotNull();
@@ -382,8 +392,10 @@ class AiWorkflowRunServiceTests {
         AiWorkflowRunVO approved = aiWorkflowRunService.approve(Long.valueOf(created.getId()));
 
         assertThat(approved.getStatus()).isEqualTo(AiWorkflowStatus.WAITING_DRAFT_CONFIRM.name());
-        assertThat(approved.getContext().get("draft")).isNotNull();
-        assertThat(approved.getContext().get("qualityCheck")).isNotNull();
+        @SuppressWarnings("unchecked")
+        Map<String, Object> approvedStepResults = (Map<String, Object>) approved.getContext().get("stepResults");
+        assertThat(approvedStepResults.get("draft")).isNotNull();
+        assertThat(approvedStepResults.get("qualityCheck")).isNotNull();
 
         // reject → 记录反馈 + 重写草稿 + 重算质量检查
         // 质量通过 → 跳过草稿重新确认，直接进入 WAITING_FILL_CONFIRM
@@ -395,8 +407,10 @@ class AiWorkflowRunServiceTests {
         assertThat(reworked.getStatus()).isIn(
                 AiWorkflowStatus.WAITING_FILL_CONFIRM.name(),
                 AiWorkflowStatus.WAITING_DRAFT_CONFIRM.name()); // LLM 偶发质量不过时兜底
-        assertThat(reworked.getContext().get("draft")).isNotNull();
-        assertThat(reworked.getContext().get("qualityCheck")).isNotNull();
+        @SuppressWarnings("unchecked")
+        Map<String, Object> reworkedStepResults = (Map<String, Object>) reworked.getContext().get("stepResults");
+        assertThat(reworkedStepResults.get("draft")).isNotNull();
+        assertThat(reworkedStepResults.get("qualityCheck")).isNotNull();
 
         @SuppressWarnings("unchecked")
         Map<String, Object> context = (Map<String, Object>) reworked.getContext();
@@ -410,50 +424,6 @@ class AiWorkflowRunServiceTests {
         // 落库状态与响应一致
         AiWorkflowRun saved = aiWorkflowRunMapper.selectById(Long.valueOf(created.getId()));
         assertThat(saved.getStatus()).isEqualTo(reworked.getStatus());
-    }
-
-    @Test
-    void completeClosesWorkflowOnlyFromWaitingUserSave() {
-        UserContext.set(101L);
-
-        AiWorkflowRun run = new AiWorkflowRun();
-        run.setUserId(101L);
-        run.setWorkflowType("CREATE_ARTICLE");
-        run.setWorkflowVersion("1.0");
-        run.setStatus(AiWorkflowStatus.WAITING_USER_SAVE.name());
-        run.setCurrentStep("FILL_ARTICLE");
-        run.setContextJson("{}");
-        run.setCreatedAt(LocalDateTime.now());
-        run.setUpdatedAt(LocalDateTime.now());
-        aiWorkflowRunMapper.insert(run);
-
-        AiWorkflowRunVO vo = aiWorkflowRunService.complete(run.getId());
-
-        assertThat(vo.getStatus()).isEqualTo(AiWorkflowStatus.COMPLETED.name());
-        assertThat(vo.getContext()).isNotNull();
-
-        AiWorkflowRun saved = aiWorkflowRunMapper.selectById(run.getId());
-        assertThat(saved.getStatus()).isEqualTo(AiWorkflowStatus.COMPLETED.name());
-    }
-
-    @Test
-    void completeRejectsNonWaitingUserSaveStatus() {
-        UserContext.set(101L);
-
-        AiWorkflowRun run = new AiWorkflowRun();
-        run.setUserId(101L);
-        run.setWorkflowType("CREATE_ARTICLE");
-        run.setWorkflowVersion("1.0");
-        run.setStatus(AiWorkflowStatus.WAITING_DRAFT_CONFIRM.name());
-        run.setCurrentStep("QUALITY_CHECK");
-        run.setContextJson("{}");
-        run.setCreatedAt(LocalDateTime.now());
-        run.setUpdatedAt(LocalDateTime.now());
-        aiWorkflowRunMapper.insert(run);
-
-        assertThatThrownBy(() -> aiWorkflowRunService.complete(run.getId()))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("当前状态不允许完成 Workflow");
     }
 
     @Test//创建优化 Workflow
@@ -595,8 +565,8 @@ class AiWorkflowRunServiceTests {
                 .isEqualTo("优化方案太泛泛，请明确增加缓存穿透、缓存击穿和项目案例");
     }
 
-    @Test//确认优化稿后返回 editorAction 并等待用户保存
-    void approveOptimizeDraftReturnsEditorActionAndWaitsUserSave() {
+    @Test//确认优化稿后返回 editorAction，填充编辑器即完成
+    void approveOptimizeDraftReturnsEditorActionAndCompletes() {
         UserContext.set(101L);
 
         Articles article = createTestArticle(101L);
@@ -613,7 +583,7 @@ class AiWorkflowRunServiceTests {
         AiWorkflowRunVO filled = aiWorkflowRunService.approve(Long.valueOf(created.getId()));
 
         assertThat(filled.getWorkflowType()).isEqualTo("OPTIMIZE_ARTICLE");
-        assertThat(filled.getStatus()).isEqualTo(AiWorkflowStatus.WAITING_USER_SAVE.name());
+        assertThat(filled.getStatus()).isEqualTo(AiWorkflowStatus.COMPLETED.name());
         assertThat(filled.getCurrentStep()).isEqualTo("FILL_ARTICLE");
         assertThat(filled.getEditorAction()).isNotNull();
         assertThat(filled.getEditorAction().getType()).isEqualTo("fillArticle");

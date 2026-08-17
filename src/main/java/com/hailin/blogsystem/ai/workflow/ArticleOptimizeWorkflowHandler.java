@@ -1,26 +1,17 @@
 package com.hailin.blogsystem.ai.workflow;
 
 import com.hailin.blogsystem.ai.LlmErrorClassifier;
-import com.hailin.blogsystem.ai.TokenUsageAccumulator;
-import com.hailin.blogsystem.ai.rag.ArticleRagSearchService;
 import com.hailin.blogsystem.entity.AiEditorCommand;
 import com.hailin.blogsystem.entity.AiWorkflowRun;
 import com.hailin.blogsystem.entity.Articles;
-import com.hailin.blogsystem.entity.dto.AiIntent;
-import com.hailin.blogsystem.entity.dto.ArticleRagContext;
-import com.hailin.blogsystem.entity.dto.ArticleRagSearchResult;
+import com.hailin.blogsystem.entity.dto.AiWorkflowConfirmationType;
 import com.hailin.blogsystem.entity.dto.AiWorkflowOptimizeArticleDTO;
 import com.hailin.blogsystem.entity.dto.AiWorkflowStatus;
 import com.hailin.blogsystem.entity.dto.AiWorkflowStep;
 import com.hailin.blogsystem.entity.dto.AiWorkflowType;
 import com.hailin.blogsystem.service.ArticlesService;
-import com.hailin.blogsystem.service.AiUserMemoryService;
-import lombok.RequiredArgsConstructor;
-import org.springframework.ai.chat.client.ChatClient;
-import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.stereotype.Component;
 
-import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -33,29 +24,64 @@ import java.util.Map;
     → REWRITE_ARTICLE → CONTENT_CHECK
     → WAITING_DRAFT_CONFIRM  （优化稿已生成，等用户确认）
     → FILL_ARTICLE
-    → WAITING_USER_SAVE      （已填充编辑器，等用户保存）
+    → COMPLETED             （填充编辑器即完成）
     → COMPLETED
 每个等待态都可以 approve（同意推进）或 reject（带着意见重做当前阶段）
 */
 
 @Component
-@RequiredArgsConstructor
-public class ArticleOptimizeWorkflowHandler implements WorkflowHandler {
+public class ArticleOptimizeWorkflowHandler extends AbstractWorkflowHandler {
 
     private static final String WORKFLOW_VERSION = "1.0";
 
     private final ArticlesService articlesService;
-    private final ArticleRagSearchService articleRagSearchService;
-    private final AiUserMemoryService aiUserMemoryService;
-    private final ChatClient.Builder chatClientBuilder;
-    private final WorkflowStepRunner workflowStepRunner;
-    private final WorkflowContextSupport workflowContextSupport;
-    private final WorkflowStatusSupport workflowStatusSupport;
     private final WorkflowTokenRecorder workflowTokenRecorder;
+    private final LlmStreamCaller llmStreamCaller;
+    private final WorkflowKnowledgeSupport workflowKnowledgeSupport;
+    private final WorkflowQualitySupport workflowQualitySupport;
+
+    public ArticleOptimizeWorkflowHandler(
+            WorkflowContextSupport workflowContextSupport,
+            WorkflowStatusSupport workflowStatusSupport,
+            WorkflowStepRunner workflowStepRunner,
+            ArticlesService articlesService,
+            WorkflowTokenRecorder workflowTokenRecorder,
+            LlmStreamCaller llmStreamCaller,
+            WorkflowKnowledgeSupport workflowKnowledgeSupport,
+            WorkflowQualitySupport workflowQualitySupport
+    ) {
+        super(workflowContextSupport, workflowStatusSupport, workflowStepRunner);
+        this.articlesService = articlesService;
+        this.workflowTokenRecorder = workflowTokenRecorder;
+        this.llmStreamCaller = llmStreamCaller;
+        this.workflowKnowledgeSupport = workflowKnowledgeSupport;
+        this.workflowQualitySupport = workflowQualitySupport;
+    }
 
     @Override
     public String workflowType() {
         return AiWorkflowType.OPTIMIZE_ARTICLE.name();
+    }
+
+    //可预期业务拒绝 → 友好 AI 回复（入口 catch 调用）；null 表示真异常，照旧 sink.error
+    @Override
+    public String buildRejectedMessage(Throwable e) {
+        if (!(e instanceof IllegalArgumentException)) {
+            return null;
+        }
+
+        String message = e.getMessage();
+        if ("只能优化自己的文章".equals(message)) {
+            return "这篇文章不是你发布的，我不能直接帮你优化或填充编辑器。你可以让我从读者视角给出修改建议，但不能进入编辑保存流程。";
+        }
+
+        if ("文章不存在或已删除".equals(message)) {
+            return "这篇文章不存在或已被删除，暂时不能发起优化。";
+        }
+
+        return message == null || message.isBlank()
+                ? "当前文章暂时不能发起优化。"
+                : message;
     }
 
     // ==================== create ====================
@@ -152,6 +178,10 @@ public class ArticleOptimizeWorkflowHandler implements WorkflowHandler {
                 safeEmitter
         );
         stepResults.put("optimizationPlan", plan);
+        workflowContextSupport.putConfirmation(context,
+                AiWorkflowConfirmationType.PLAN,
+                AiWorkflowStep.GENERATE_OPTIMIZATION_PLAN.name(),
+                null);
 
         //初始链路结束：停在方案确认
         run.setStatus(AiWorkflowStatus.WAITING_PLAN_CONFIRM.name());
@@ -165,22 +195,23 @@ public class ArticleOptimizeWorkflowHandler implements WorkflowHandler {
     // ==================== approve ====================
 
     //WAITING_PLAN_CONFIRM → REWRITE_ARTICLE + CONTENT_CHECK → WAITING_DRAFT_CONFIRM
-    //WAITING_DRAFT_CONFIRM → FILL_ARTICLE → WAITING_USER_SAVE
+    //WAITING_DRAFT_CONFIRM → FILL_ARTICLE → COMPLETED
     @Override
-    public AiWorkflowAdvanceResult approve(AiWorkflowRun run, AiWorkflowStepEmitter emitter) {
-        AiWorkflowStepEmitter safeEmitter = emitter == null ? AiWorkflowStepEmitter.noop() : emitter;
-        AiWorkflowStatus status = workflowStatusSupport.parseStatus(run.getStatus());
-        Map<String, Object> context = workflowContextSupport.parseContext(run.getContextJson());
-        Map<String, Object> stepResults = workflowContextSupport.getStepResults(context);
-
+    protected AiWorkflowAdvanceResult doApprove(
+            AiWorkflowRun run,
+            AiWorkflowStatus status,
+            Map<String, Object> context,
+            Map<String, Object> stepResults,
+            AiWorkflowStepEmitter emitter
+    ) {
         switch (status) {
             case WAITING_PLAN_CONFIRM -> {
                 String optimizedContent = workflowStepRunner.run(
                         run.getId(),
                         AiWorkflowStep.REWRITE_ARTICLE,
                         "正在按方案重写文章...",
-                        () -> rewriteArticleByLLM(run, context, null, safeEmitter),
-                        safeEmitter
+                        () -> rewriteArticleByLLM(run, context, null, emitter),
+                        emitter
                 );
                 stepResults.put("optimizedContent", optimizedContent);
 
@@ -189,13 +220,13 @@ public class ArticleOptimizeWorkflowHandler implements WorkflowHandler {
                         AiWorkflowStep.CONTENT_CHECK,
                         "正在检查优化结果...",
                         () -> buildContentCheck(optimizedContent, context),
-                        safeEmitter
+                        emitter
                 );
                 stepResults.put("contentCheck", contentCheck);
 
                 // 第一次不合格 → 把检查问题喂回模型，自动重写一次
                 if (Boolean.FALSE.equals(contentCheck.get("passed"))) {
-                    String systemFeedback = buildQualityFeedbackForModel(contentCheck);
+                    String systemFeedback = workflowQualitySupport.buildQualityFeedbackForModel(contentCheck, "完整正文，不要只输出大纲或要点列表");
 
                     workflowContextSupport.appendFeedback(
                             context,
@@ -208,8 +239,8 @@ public class ArticleOptimizeWorkflowHandler implements WorkflowHandler {
                             run.getId(),
                             AiWorkflowStep.REWRITE_ARTICLE,
                             "优化结果未通过检查，正在重新改写...",
-                            () -> rewriteArticleByLLM(run, context, systemFeedback, safeEmitter),
-                            safeEmitter
+                            () -> rewriteArticleByLLM(run, context, systemFeedback, emitter),
+                            emitter
                     );
                     stepResults.put("optimizedContent", retriedContent);
 
@@ -218,13 +249,15 @@ public class ArticleOptimizeWorkflowHandler implements WorkflowHandler {
                             AiWorkflowStep.CONTENT_CHECK,
                             "正在重新执行质量检查...",
                             () -> buildContentCheck(retriedContent, context),
-                            safeEmitter
+                            emitter
                     );
                     stepResults.put("contentCheck", contentCheck);
                 }
 
-                run.setStatus(AiWorkflowStatus.WAITING_DRAFT_CONFIRM.name());
-                run.setCurrentStep(AiWorkflowStep.CONTENT_CHECK.name());
+                return waitForConfirm(run, context,
+                        AiWorkflowStatus.WAITING_DRAFT_CONFIRM,
+                        AiWorkflowStep.CONTENT_CHECK,
+                        AiWorkflowConfirmationType.DRAFT);
             }
             case WAITING_DRAFT_CONFIRM -> {
                 AiEditorCommand editorAction = workflowStepRunner.run(
@@ -232,22 +265,14 @@ public class ArticleOptimizeWorkflowHandler implements WorkflowHandler {
                         AiWorkflowStep.FILL_ARTICLE,
                         "正在填充编辑器...",
                         () -> buildEditorAction(context),
-                        safeEmitter
+                        emitter
                 );
 
-                run.setStatus(AiWorkflowStatus.WAITING_USER_SAVE.name());
-                run.setCurrentStep(AiWorkflowStep.FILL_ARTICLE.name());
-                run.setContextJson(workflowContextSupport.toJson(context));
-                workflowContextSupport.touch(run);
-
-                return AiWorkflowAdvanceResult.withEditorAction(run, editorAction);
+                //草稿确认已消费：清除卡片，填充编辑器即 Workflow 完成（用户自行保存/发布）
+                return finish(run, context, AiWorkflowStep.FILL_ARTICLE, editorAction);
             }
             default -> throw new IllegalArgumentException("当前状态不允许同意操作");
         }
-
-        run.setContextJson(workflowContextSupport.toJson(context));
-        workflowContextSupport.touch(run);
-        return AiWorkflowAdvanceResult.of(run);
     }
 
     // ==================== reject ====================
@@ -255,14 +280,14 @@ public class ArticleOptimizeWorkflowHandler implements WorkflowHandler {
     //WAITING_PLAN_CONFIRM → 带意见重新生成方案 → WAITING_PLAN_CONFIRM
     //WAITING_DRAFT_CONFIRM → 带意见重新重写 + 检查 → WAITING_DRAFT_CONFIRM
     @Override
-    public AiWorkflowAdvanceResult reject(AiWorkflowRun run, String feedback, AiWorkflowStepEmitter emitter) {
-        AiWorkflowStepEmitter safeEmitter = emitter == null ? AiWorkflowStepEmitter.noop() : emitter;
-        String normalizedFeedback = workflowContextSupport.normalizeRequired(feedback, "修改意见不能为空");
-        AiWorkflowStatus status = workflowStatusSupport.parseStatus(run.getStatus());
-        Map<String, Object> context = workflowContextSupport.parseContext(run.getContextJson());
-        Map<String, Object> stepResults = workflowContextSupport.getStepResults(context);
-        workflowContextSupport.appendFeedback(context, run.getCurrentStep(), run.getStatus(), normalizedFeedback);
-
+    protected AiWorkflowAdvanceResult doReject(
+            AiWorkflowRun run,
+            AiWorkflowStatus status,
+            Map<String, Object> context,
+            Map<String, Object> stepResults,
+            String feedback,
+            AiWorkflowStepEmitter emitter
+    ) {
         switch (status) {
             case WAITING_PLAN_CONFIRM -> {
                 String plan = workflowStepRunner.run(
@@ -275,20 +300,25 @@ public class ArticleOptimizeWorkflowHandler implements WorkflowHandler {
                                 getInputInstruction(context),
                                 String.valueOf(context.getOrDefault("memoryContext", "")),
                                 getRagReferences(context),
-                                normalizedFeedback,
-                                safeEmitter
+                                feedback,
+                                emitter
                         ),
-                        safeEmitter
+                        emitter
                 );
                 stepResults.put("optimizationPlan", plan);
+
+                return waitForConfirm(run, context,
+                        AiWorkflowStatus.WAITING_PLAN_CONFIRM,
+                        AiWorkflowStep.GENERATE_OPTIMIZATION_PLAN,
+                        AiWorkflowConfirmationType.PLAN);
             }
             case WAITING_DRAFT_CONFIRM -> {
                 String optimizedContent = workflowStepRunner.run(
                         run.getId(),
                         AiWorkflowStep.REWRITE_ARTICLE,
                         "正在按意见重新改写...",
-                        () -> rewriteArticleByLLM(run, context, normalizedFeedback, safeEmitter),
-                        safeEmitter
+                        () -> rewriteArticleByLLM(run, context, feedback, emitter),
+                        emitter
                 );
                 stepResults.put("optimizedContent", optimizedContent);
 
@@ -297,16 +327,17 @@ public class ArticleOptimizeWorkflowHandler implements WorkflowHandler {
                         AiWorkflowStep.CONTENT_CHECK,
                         "正在检查优化结果...",
                         () -> buildContentCheck(optimizedContent, context),
-                        safeEmitter
+                        emitter
                 );
                 stepResults.put("contentCheck", contentCheck);
+
+                return waitForConfirm(run, context,
+                        AiWorkflowStatus.WAITING_DRAFT_CONFIRM,
+                        AiWorkflowStep.CONTENT_CHECK,
+                        AiWorkflowConfirmationType.DRAFT);
             }
             default -> throw new IllegalArgumentException("当前状态不允许提交修改意见");
         }
-
-        run.setContextJson(workflowContextSupport.toJson(context));
-        workflowContextSupport.touch(run);
-        return AiWorkflowAdvanceResult.of(run);
     }
 
     // ==================== retry ====================
@@ -315,25 +346,25 @@ public class ArticleOptimizeWorkflowHandler implements WorkflowHandler {
     //REWRITE/CONTENT_CHECK 失败 → 恢复到 WAITING_DRAFT_CONFIRM
     //FILL_ARTICLE 失败 → 重新返回 editorAction
     @Override
-    public AiWorkflowAdvanceResult retry(AiWorkflowRun run, AiWorkflowStepEmitter emitter) {
-        AiWorkflowStep step = workflowStatusSupport.parseStep(run.getCurrentStep());
-
+    protected AiWorkflowAdvanceResult doRetry(
+            AiWorkflowRun run,
+            AiWorkflowStep step,
+            Map<String, Object> context,
+            Map<String, Object> stepResults,
+            AiWorkflowStepEmitter emitter
+    ) {
         switch (step) {
             case LOAD_ARTICLE, ANALYZE_ARTICLE, MEMORY_RETRIEVE, RAG_SEARCH, GENERATE_OPTIMIZATION_PLAN -> {
                 run.setErrorMessage(null);
                 return runInitialSteps(run, emitter);
             }
             case REWRITE_ARTICLE, CONTENT_CHECK -> {
-                AiWorkflowStepEmitter safeEmitter = emitter == null ? AiWorkflowStepEmitter.noop() : emitter;
-                Map<String, Object> context = workflowContextSupport.parseContext(run.getContextJson());
-                Map<String, Object> stepResults = workflowContextSupport.getStepResults(context);
-
                 String optimizedContent = workflowStepRunner.run(
                         run.getId(),
                         AiWorkflowStep.REWRITE_ARTICLE,
                         "正在重新改写...",
-                        () -> rewriteArticleByLLM(run, context, null, safeEmitter),
-                        safeEmitter
+                        () -> rewriteArticleByLLM(run, context, null, emitter),
+                        emitter
                 );
                 stepResults.put("optimizedContent", optimizedContent);
 
@@ -342,32 +373,22 @@ public class ArticleOptimizeWorkflowHandler implements WorkflowHandler {
                         AiWorkflowStep.CONTENT_CHECK,
                         "正在检查优化结果...",
                         () -> buildContentCheck(optimizedContent, context),
-                        safeEmitter
+                        emitter
                 );
                 stepResults.put("contentCheck", contentCheck);
 
-                run.setStatus(AiWorkflowStatus.WAITING_DRAFT_CONFIRM.name());
-                run.setCurrentStep(AiWorkflowStep.CONTENT_CHECK.name());
-                run.setContextJson(workflowContextSupport.toJson(context));
-                run.setErrorMessage(null);
-                workflowContextSupport.touch(run);
+                return waitForConfirm(run, context,
+                        AiWorkflowStatus.WAITING_DRAFT_CONFIRM,
+                        AiWorkflowStep.CONTENT_CHECK,
+                        AiWorkflowConfirmationType.DRAFT);
             }
             case FILL_ARTICLE -> {
-                Map<String, Object> context = workflowContextSupport.parseContext(run.getContextJson());
                 AiEditorCommand editorAction = buildEditorAction(context);
 
-                run.setStatus(AiWorkflowStatus.WAITING_USER_SAVE.name());
-                run.setCurrentStep(AiWorkflowStep.FILL_ARTICLE.name());
-                run.setContextJson(workflowContextSupport.toJson(context));
-                run.setErrorMessage(null);
-                workflowContextSupport.touch(run);
-
-                return AiWorkflowAdvanceResult.withEditorAction(run, editorAction);
+                return finish(run, context, AiWorkflowStep.FILL_ARTICLE, editorAction);
             }
             default -> throw new IllegalArgumentException("当前步骤不支持重试: " + step);
         }
-
-        return AiWorkflowAdvanceResult.of(run);
     }
 
     // ==================== 步骤实现 ====================
@@ -422,47 +443,13 @@ public class ArticleOptimizeWorkflowHandler implements WorkflowHandler {
 
     //读取用户长期记忆（失败兜底为空，不阻断流程）
     private String retrieveMemoryContext(Long userId, String requirement) {
-        if (userId == null) {
-            return "";
-        }
-
-        try {
-            String memoryPrompt = aiUserMemoryService.buildMemoryPrompt(userId, requirement);
-            return memoryPrompt == null ? "" : memoryPrompt;
-        } catch (Exception e) {
-            return "";
-        }
+        return workflowKnowledgeSupport.retrieveMemoryContext(userId, requirement);
     }
 
     //以文章标题/内容为主题检索站内相关文章（失败兜底空列表）
     private List<Map<String, Object>> retrieveRagReferences(Map<String, Object> articleInfo) {
-        try {
-            String query = String.valueOf(articleInfo.getOrDefault("title", ""));
-            AiIntent intent = new AiIntent();
-            intent.setIntent("ARTICLE_SEARCH");
-            intent.setKeyWord(query);
-
-            ArticleRagSearchResult result = articleRagSearchService.search(query, intent);
-
-            if (result == null || result.contexts() == null || result.contexts().isEmpty()) {
-                return new ArrayList<>();
-            }
-
-            return result.contexts().stream()
-                    .map(this::toRagReference)
-                    .toList();
-        } catch (Exception e) {
-            return new ArrayList<>();
-        }
-    }
-
-    private Map<String, Object> toRagReference(ArticleRagContext context) {
-        Map<String, Object> reference = new HashMap<>();
-        reference.put("articleId", context.articleId());
-        reference.put("title", context.title());
-        reference.put("chunkIndex", context.chunkIndex());
-        reference.put("snippet", context.content());
-        return reference;
+        String query = String.valueOf(articleInfo.getOrDefault("title", ""));
+        return workflowKnowledgeSupport.retrieveRagReferences(query, query);
     }
 
     //LLM 生成优化方案（只生成方案，不生成最终文章）
@@ -487,53 +474,28 @@ public class ArticleOptimizeWorkflowHandler implements WorkflowHandler {
             AiWorkflowStepEmitter emitter
     ) {
         try {
-            StringBuilder fullContent = new StringBuilder();
-            TokenUsageAccumulator usage = new TokenUsageAccumulator();
-
-            chatClientBuilder.build()
-                    .prompt()
-                    .options(OpenAiChatOptions.builder()
-                            .maxTokens(2000)
-                            .streamUsage(true)
-                            .build())
-                    .system("""
-                        你是博客文章优化专家，只输出 Markdown。
-                        不要输出解释，不要输出代码块包裹全文。
-                        基于原文、用户要求、用户写作偏好和站内相关文章参考，输出一份具体的优化方案。
-                        方案必须包含：
-                        1. 整体评估（原文优点与主要问题）
-                        2. 分项优化点（结构 / 内容 / 表达 / 技术深度）
-                        3. 预期改动范围（保留原文主体，只改该改的）
-                        只输出优化方案，不要重写文章正文。
-                        事实边界：不得新增原文、用户要求、站内参考中没有出现的具体数字、业务规模、性能指标、成功率、公司/站点生产经验。
-                        站内相关文章参考只用于补充技术背景，不能把参考文章中的业务数据、项目经验、结论当作当前文章事实。
-                        """)
-                    .user(buildPlanUserPrompt(articleInfo, instruction, memoryContext, ragReferences, feedback))
-                    .stream()
-                    .chatResponse()
-                    .timeout(Duration.ofSeconds(60))
-                    .doOnNext(response -> {
-                        String chunk = response.getResult() == null ? "" : response.getResult().getOutput().getText();
-                        if (chunk != null && !chunk.isEmpty()) {
-                            fullContent.append(chunk);
-                            emitter.emitContent(
-                                    AiWorkflowStep.GENERATE_OPTIMIZATION_PLAN.name(),
-                                    "optimizationPlan",
-                                    chunk
-                            );
-                        }
-                        usage.add(response.getMetadata().getUsage());
-                    })
-                    .blockLast();
-
-            workflowTokenRecorder.accumulate(run, usage);
-
-            String content = fullContent.toString();
-            if (content.isBlank()) {
-                throw new RuntimeException("优化方案生成失败：模型返回空内容");
-            }
-
-            return content;
+            LlmStreamCaller.LlmStreamResult result = llmStreamCaller.call(
+                    "优化方案生成失败：",
+                    AiWorkflowStep.GENERATE_OPTIMIZATION_PLAN,
+                    "optimizationPlan",
+                    emitter,
+                    """
+                    你是博客文章优化专家，只输出 Markdown。
+                    不要输出解释，不要输出代码块包裹全文。
+                    基于原文、用户要求、用户写作偏好和站内相关文章参考，输出一份具体的优化方案。
+                    方案必须包含：
+                    1. 整体评估（原文优点与主要问题）
+                    2. 分项优化点（结构 / 内容 / 表达 / 技术深度）
+                    3. 预期改动范围（保留原文主体，只改该改的）
+                    只输出优化方案，不要重写文章正文。
+                    事实边界：不得新增原文、用户要求、站内参考中没有出现的具体数字、业务规模、性能指标、成功率、公司/站点生产经验。
+                    站内相关文章参考只用于补充技术背景，不能把参考文章中的业务数据、项目经验、结论当作当前文章事实。
+                    """,
+                    buildPlanUserPrompt(articleInfo, instruction, memoryContext, ragReferences, feedback),
+                    2000
+            );
+            workflowTokenRecorder.accumulate(run, result.usage());
+            return result.content();
         } catch (RuntimeException e) {
             //LLM 失败不静默兜底：抛给 runStep 记 FAILED，Service 层 markFailed → 前端可重试；
             //消息分类成友好文案，原始堆栈由 Service 层日志保留
@@ -546,56 +508,31 @@ public class ArticleOptimizeWorkflowHandler implements WorkflowHandler {
     //LLM 按方案重写文章（保留原文主体，只输出优化后的完整 Markdown 正文）
     private String rewriteArticleByLLM(AiWorkflowRun run, Map<String, Object> context, String feedback, AiWorkflowStepEmitter emitter) {
         try {
-            StringBuilder fullContent = new StringBuilder();
-            TokenUsageAccumulator usage = new TokenUsageAccumulator();
-
-            chatClientBuilder.build()
-                    .prompt()
-                    .options(OpenAiChatOptions.builder()
-                            .maxTokens(8500)
-                            .streamUsage(true)
-                            .build())
-                    .system("""
-                        你是博客文章优化改写器。
-                        严格按优化方案重写文章，只输出优化后的完整 Markdown 正文。
-                        保留原文的技术细节、代码示例和作者风格，只优化结构与表达。
-                        优化时优先保留原文二级标题结构和顺序。
-                        不要把多个小节合并成单节，除非原文本来就只有一节。
-                        不要输出解释，不要输出代码块包裹全文。
-                        禁止输出优化方案、评估分析、分项标题。
-                        最终输出的内容应该像一篇可以直接发布的博客文章。
-                        每个二级标题下面必须有完整段落解释，不能只列要点。
-                        事实边界：不得新增原文、用户要求、优化方案、站内参考中没有出现的具体数字、业务规模、性能指标、成功率、公司/站点生产经验。
-                        如果需要补充案例，只能使用原文已有事实，或用“例如/假设场景”明确标注为示例，不能写成真实已发生结果。
-                        不要把“站内相关文章参考”描述成“本站生产实践”。
-                        站内相关文章参考只用于补充技术背景，不能把参考文章中的业务数据、项目经验、结论当作当前文章事实。
-                        """)
-                    .user(buildRewriteUserPrompt(context, feedback))
-                    .stream()
-                    .chatResponse()
-                    .timeout(Duration.ofSeconds(60))
-                    .doOnNext(response -> {
-                        String chunk = response.getResult() == null ? "" : response.getResult().getOutput().getText();
-                        if (chunk != null && !chunk.isEmpty()) {
-                            fullContent.append(chunk);
-                            emitter.emitContent(
-                                    AiWorkflowStep.REWRITE_ARTICLE.name(),
-                                    "optimizedContent",
-                                    chunk
-                            );
-                        }
-                        usage.add(response.getMetadata().getUsage());
-                    })
-                    .blockLast();
-
-            workflowTokenRecorder.accumulate(run, usage);
-
-            String markdown = fullContent.toString();
-            if (markdown.isBlank()) {
-                throw new RuntimeException("文章重写失败：模型返回空内容");
-            }
-
-            return markdown;
+            LlmStreamCaller.LlmStreamResult result = llmStreamCaller.call(
+                    "文章重写失败：",
+                    AiWorkflowStep.REWRITE_ARTICLE,
+                    "optimizedContent",
+                    emitter,
+                    """
+                    你是博客文章优化改写器。
+                    严格按优化方案重写文章，只输出优化后的完整 Markdown 正文。
+                    保留原文的技术细节、代码示例和作者风格，只优化结构与表达。
+                    优化时优先保留原文二级标题结构和顺序。
+                    不要把多个小节合并成单节，除非原文本来就只有一节。
+                    不要输出解释，不要输出代码块包裹全文。
+                    禁止输出优化方案、评估分析、分项标题。
+                    最终输出的内容应该像一篇可以直接发布的博客文章。
+                    每个二级标题下面必须有完整段落解释，不能只列要点。
+                    事实边界：不得新增原文、用户要求、优化方案、站内参考中没有出现的具体数字、业务规模、性能指标、成功率、公司/站点生产经验。
+                    如果需要补充案例，只能使用原文已有事实，或用“例如/假设场景”明确标注为示例，不能写成真实已发生结果。
+                    不要把“站内相关文章参考”描述成“本站生产实践”。
+                    站内相关文章参考只用于补充技术背景，不能把参考文章中的业务数据、项目经验、结论当作当前文章事实。
+                    """,
+                    buildRewriteUserPrompt(context, feedback),
+                    8500
+            );
+            workflowTokenRecorder.accumulate(run, result.usage());
+            return result.content();
         } catch (RuntimeException e) {
             //LLM 失败不静默兜底：抛给 runStep 记 FAILED，Service 层 markFailed → 前端可重试；
             //消息分类成友好文案，原始堆栈由 Service 层日志保留
@@ -628,7 +565,7 @@ public class ArticleOptimizeWorkflowHandler implements WorkflowHandler {
                 suggestions.add("代码块较多，注意代码缩进和语言标注");
             }
             // 大纲检测：输出像优化方案而非完整文章
-            if (looksLikeOutline(optimizedContent)) {
+            if (workflowQualitySupport.looksLikeOutline(optimizedContent)) {
                 issues.add("优化后内容像大纲或要点列表，缺少完整段落展开，请重新重写");
             }
         }
@@ -641,71 +578,7 @@ public class ArticleOptimizeWorkflowHandler implements WorkflowHandler {
     }
 
     /** 检测 markdown 是否像大纲/目录而非完整正文：标题多 + 列表多 + 长段落少 */
-    private boolean looksLikeOutline(String markdown) {
-        if (markdown == null || markdown.isBlank()) {
-            return false;
-        }
-
-        String[] lines = markdown.split("\\R");
-
-        int headingCount = 0;
-        int listCount = 0;
-        int longParagraphCount = 0;
-
-        for (String line : lines) {
-            String trimmed = line.trim();
-
-            if (trimmed.startsWith("#")) {
-                headingCount++;
-            } else if (trimmed.startsWith("- ") || trimmed.matches("^\\d+\\.\\s+.*")) {
-                listCount++;
-            } else if (trimmed.length() >= 80) {
-                longParagraphCount++;
-            }
-        }
-
-        return headingCount >= 3 && listCount >= 5 && longParagraphCount < 3;
-    }
-
     /** 把质量检查结果转成模型能理解的错误反馈 */
-    private String buildQualityFeedbackForModel(Map<String, Object> qualityCheck) {
-        List<String> issues = getStringList(qualityCheck.get("issues"));
-        List<String> suggestions = getStringList(qualityCheck.get("suggestions"));
-
-        StringBuilder feedback = new StringBuilder();
-        feedback.append("系统质量检查未通过，请重新生成完整正文，不要只输出大纲或要点列表。\n");
-
-        if (!issues.isEmpty()) {
-            feedback.append("必须修复的问题：\n");
-            for (String issue : issues) {
-                feedback.append("- ").append(issue).append("\n");
-            }
-        }
-
-        if (!suggestions.isEmpty()) {
-            feedback.append("建议改进：\n");
-            for (String suggestion : suggestions) {
-                feedback.append("- ").append(suggestion).append("\n");
-            }
-        }
-
-        feedback.append("要求：每个小节必须有完整段落解释，最终内容要像一篇可直接发布的技术博客。");
-        return feedback.toString();
-    }
-
-    private List<String> getStringList(Object value) {
-        if (value instanceof List<?> list) {
-            List<String> result = new ArrayList<>();
-            for (Object item : list) {
-                if (item != null && !String.valueOf(item).isBlank()) {
-                    result.add(String.valueOf(item));
-                }
-            }
-            return result;
-        }
-        return List.of();
-    }
-
     //从优化稿构建 fillArticle 指令
     private AiEditorCommand buildEditorAction(Map<String, Object> context) {
         Map<String, Object> stepResults = workflowContextSupport.getStepResults(context);

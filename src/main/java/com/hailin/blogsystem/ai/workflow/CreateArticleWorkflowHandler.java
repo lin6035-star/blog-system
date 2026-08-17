@@ -4,24 +4,17 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hailin.blogsystem.ai.LlmErrorClassifier;
-import com.hailin.blogsystem.ai.TokenUsageAccumulator;
-import com.hailin.blogsystem.ai.rag.ArticleRagSearchService;
 import com.hailin.blogsystem.entity.AiEditorCommand;
 import com.hailin.blogsystem.entity.AiWorkflowRun;
-import com.hailin.blogsystem.entity.dto.AiIntent;
-import com.hailin.blogsystem.entity.dto.ArticleRagContext;
-import com.hailin.blogsystem.entity.dto.ArticleRagSearchResult;
+import com.hailin.blogsystem.entity.dto.AiWorkflowConfirmationType;
 import com.hailin.blogsystem.entity.dto.AiWorkflowCreateArticleDTO;
 import com.hailin.blogsystem.entity.dto.AiWorkflowStatus;
 import com.hailin.blogsystem.entity.dto.AiWorkflowStep;
 import com.hailin.blogsystem.entity.dto.AiWorkflowType;
-import com.hailin.blogsystem.service.AiUserMemoryService;
-import lombok.RequiredArgsConstructor;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.stereotype.Component;
 
-import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -32,16 +25,16 @@ import java.util.Map;
      → WAITING_OUTLINE_CONFIRM      (大纲已生成)
      → WAITING_DRAFT_CONFIRM        (草稿+质量检查已生成)
      → WAITING_FILL_CONFIRM         (草稿已确认，等用户确认填充)
-     → WAITING_USER_SAVE            (已填充编辑器)
-     → COMPLETED
+     → COMPLETED                    (填充编辑器即完成；用户自行在编辑器保存/发布)
 每个等待态都可以 approve（同意进入下一阶段）或 reject（不同意，拿着意见重做当前阶段）
 */
 
 @Component
-@RequiredArgsConstructor
-public class CreateArticleWorkflowHandler implements WorkflowHandler {
+public class CreateArticleWorkflowHandler extends AbstractWorkflowHandler {
 
     private static final String WORKFLOW_VERSION = "1.0";
+    private static final String REQUIREMENT_QUESTION =
+            "你想写哪个主题？可以直接告诉我主题，比如 Redis 缓存、Kafka 消息队列、RAG 检索增强、项目复盘等。";
 
     @Override
     public String workflowType() {
@@ -49,13 +42,31 @@ public class CreateArticleWorkflowHandler implements WorkflowHandler {
     }
 
     private final ObjectMapper objectMapper;
-    private final ArticleRagSearchService articleRagSearchService;
-    private final AiUserMemoryService aiUserMemoryService;
     private final ChatClient.Builder chatClientBuilder;
-    private final WorkflowStepRunner workflowStepRunner;
-    private final WorkflowContextSupport workflowContextSupport;
-    private final WorkflowStatusSupport workflowStatusSupport;
     private final WorkflowTokenRecorder workflowTokenRecorder;
+    private final LlmStreamCaller llmStreamCaller;
+    private final WorkflowKnowledgeSupport workflowKnowledgeSupport;
+    private final WorkflowQualitySupport workflowQualitySupport;
+
+    public CreateArticleWorkflowHandler(
+            WorkflowContextSupport workflowContextSupport,
+            WorkflowStatusSupport workflowStatusSupport,
+            WorkflowStepRunner workflowStepRunner,
+            ObjectMapper objectMapper,
+            ChatClient.Builder chatClientBuilder,
+            WorkflowTokenRecorder workflowTokenRecorder,
+            LlmStreamCaller llmStreamCaller,
+            WorkflowKnowledgeSupport workflowKnowledgeSupport,
+            WorkflowQualitySupport workflowQualitySupport
+    ) {
+        super(workflowContextSupport, workflowStatusSupport, workflowStepRunner);
+        this.objectMapper = objectMapper;
+        this.chatClientBuilder = chatClientBuilder;
+        this.workflowTokenRecorder = workflowTokenRecorder;
+        this.llmStreamCaller = llmStreamCaller;
+        this.workflowKnowledgeSupport = workflowKnowledgeSupport;
+        this.workflowQualitySupport = workflowQualitySupport;
+    }
 
     //创建工作流
     public AiWorkflowAdvanceResult create(Long userId, AiWorkflowCreateArticleDTO dto) {
@@ -83,7 +94,10 @@ public class CreateArticleWorkflowHandler implements WorkflowHandler {
 
         if (isRequirementUnclear(requirement)) {  //isRequirementUnclear(requirement)判断需求是否模糊
             // 生成"你想写哪个主题？"提示文字
-            context.put("clarification", buildRequirementClarification());
+            workflowContextSupport.putConfirmation(context,
+                    AiWorkflowConfirmationType.REQUIREMENT,
+                    AiWorkflowStep.REQUIREMENT_ANALYZE.name(),
+                    REQUIREMENT_QUESTION);
 
             run.setStatus(AiWorkflowStatus.WAITING_REQUIREMENT_CONFIRM.name());
             run.setCurrentStep(AiWorkflowStep.REQUIREMENT_ANALYZE.name());
@@ -110,6 +124,7 @@ public class CreateArticleWorkflowHandler implements WorkflowHandler {
     public AiWorkflowAdvanceResult runInitialSteps(AiWorkflowRun run, AiWorkflowStepEmitter emitter) {
         AiWorkflowStepEmitter safeEmitter = emitter == null ? AiWorkflowStepEmitter.noop() : emitter;
         Map<String, Object> context = workflowContextSupport.parseContext(run.getContextJson());
+        Map<String, Object> stepResults = workflowContextSupport.getStepResults(context);
 
         Map<String, Object> requirementMap = workflowContextSupport.getMap(context, "requirement");
         String requirement = String.valueOf(requirementMap.getOrDefault("rawRequirement", ""));
@@ -125,7 +140,10 @@ public class CreateArticleWorkflowHandler implements WorkflowHandler {
         );
 
         if (!Boolean.TRUE.equals(clear)) {
-            context.put("clarification", buildRequirementClarification());
+            workflowContextSupport.putConfirmation(context,
+                    AiWorkflowConfirmationType.REQUIREMENT,
+                    AiWorkflowStep.REQUIREMENT_ANALYZE.name(),
+                    REQUIREMENT_QUESTION);
             run.setStatus(AiWorkflowStatus.WAITING_REQUIREMENT_CONFIRM.name());
             run.setCurrentStep(AiWorkflowStep.REQUIREMENT_ANALYZE.name());
             run.setContextJson(workflowContextSupport.toJson(context));
@@ -163,7 +181,11 @@ public class CreateArticleWorkflowHandler implements WorkflowHandler {
                 () -> buildOutlineByLLM(run, requirement, memoryContext, ragReferences, safeEmitter),
                 safeEmitter
         );
-        context.put("outline", outline);
+        stepResults.put("outline", outline);
+        workflowContextSupport.putConfirmation(context,
+                AiWorkflowConfirmationType.OUTLINE,
+                AiWorkflowStep.GENERATE_OUTLINE.name(),
+                null);
 
         run.setStatus(AiWorkflowStatus.WAITING_OUTLINE_CONFIRM.name());
         run.setCurrentStep(AiWorkflowStep.GENERATE_OUTLINE.name());
@@ -179,17 +201,20 @@ public class CreateArticleWorkflowHandler implements WorkflowHandler {
         return approve(run, AiWorkflowStepEmitter.noop());
     }
     @Override
-    public AiWorkflowAdvanceResult approve(AiWorkflowRun run,AiWorkflowStepEmitter emitter) {
-        AiWorkflowStatus status = workflowStatusSupport.parseStatus(run.getStatus());
-        Map<String, Object> context = workflowContextSupport.parseContext(run.getContextJson());
-
+    protected AiWorkflowAdvanceResult doApprove(
+            AiWorkflowRun run,
+            AiWorkflowStatus status,
+            Map<String, Object> context,
+            Map<String, Object> stepResults,
+            AiWorkflowStepEmitter emitter
+    ) {
         //遇到这个状态直接拦住，需求不明确不能直接同意
         if (status == AiWorkflowStatus.WAITING_REQUIREMENT_CONFIRM) {
             throw new IllegalArgumentException("请先补充写作主题");
         }
         //status是大纲已生成，等待用户反馈
         if (status == AiWorkflowStatus.WAITING_OUTLINE_CONFIRM) {
-            context.put("draft", workflowStepRunner.run(run.getId(),
+            stepResults.put("draft", workflowStepRunner.run(run.getId(),
                     AiWorkflowStep.GENERATE_DRAFT,
                     "正在生成正文草稿...",
                     () -> buildDraft(run, context, emitter),
@@ -202,11 +227,11 @@ public class CreateArticleWorkflowHandler implements WorkflowHandler {
                     () -> buildQualityCheck(context),
                     emitter
             );
-            context.put("qualityCheck", qualityCheck);
+            stepResults.put("qualityCheck", qualityCheck);
 
             // 第一次不合格 → 把检查问题喂回模型，自动重写一次
             if (Boolean.FALSE.equals(qualityCheck.get("passed"))) {
-                String systemFeedback = buildQualityFeedbackForModel(qualityCheck);
+                String systemFeedback = workflowQualitySupport.buildQualityFeedbackForModel(qualityCheck, "完整正文，不要只输出大纲或要点列表");
 
                 workflowContextSupport.appendFeedback(
                         context,
@@ -215,7 +240,7 @@ public class CreateArticleWorkflowHandler implements WorkflowHandler {
                         systemFeedback
                 );
 
-                context.put("draft", workflowStepRunner.run(run.getId(),
+                stepResults.put("draft", workflowStepRunner.run(run.getId(),
                         AiWorkflowStep.GENERATE_DRAFT,
                         "草稿未通过质量检查，正在重新生成正文...",
                         () -> rebuildDraft(run, context, systemFeedback, emitter),
@@ -228,41 +253,33 @@ public class CreateArticleWorkflowHandler implements WorkflowHandler {
                         () -> buildQualityCheck(context),
                         emitter
                 );
-                context.put("qualityCheck", qualityCheck);
+                stepResults.put("qualityCheck", qualityCheck);
             }
 
-            run.setStatus(AiWorkflowStatus.WAITING_DRAFT_CONFIRM.name());
-            run.setCurrentStep(AiWorkflowStep.QUALITY_CHECK.name());
-            run.setContextJson(workflowContextSupport.toJson(context));
-            workflowContextSupport.touch(run);
-
-            return AiWorkflowAdvanceResult.of(run);
+            return waitForConfirm(run, context,
+                    AiWorkflowStatus.WAITING_DRAFT_CONFIRM,
+                    AiWorkflowStep.QUALITY_CHECK,
+                    AiWorkflowConfirmationType.DRAFT);
         }
 
         //status停在草稿确认，等待用户反馈同意该阶段或者不同意
         if (status == AiWorkflowStatus.WAITING_DRAFT_CONFIRM) {
-            Map<String, Object> qualityCheck = workflowContextSupport.getMap(context, "qualityCheck");
+            Map<String, Object> qualityCheck = workflowContextSupport.getResultMap(context, "qualityCheck");
             if (Boolean.FALSE.equals(qualityCheck.get("passed"))) {
                 throw new IllegalArgumentException("草稿质量检查未通过，请根据检查问题提交修改意见");
             }
 
             //状态进入下一步，准备填充
-            run.setStatus(AiWorkflowStatus.WAITING_FILL_CONFIRM.name());
-            run.setCurrentStep(AiWorkflowStep.FILL_ARTICLE.name());
-            workflowContextSupport.touch(run);
-
-            return AiWorkflowAdvanceResult.of(run);
+            return waitForConfirm(run, context,
+                    AiWorkflowStatus.WAITING_FILL_CONFIRM,
+                    AiWorkflowStep.FILL_ARTICLE,
+                    AiWorkflowConfirmationType.FILL);
         }
 
         if (status == AiWorkflowStatus.WAITING_FILL_CONFIRM) {
-            //从 draft 构建 fillArticle 指令
+            //从 draft 构建 fillArticle 指令；填充确认已消费，填充编辑器即 Workflow 完成（用户自行保存/发布）
             AiEditorCommand editorAction = buildEditorAction(context);
-
-            run.setStatus(AiWorkflowStatus.WAITING_USER_SAVE.name());//前端收到 editorAction 填充编辑器
-            run.setCurrentStep(AiWorkflowStep.FILL_ARTICLE.name());
-            workflowContextSupport.touch(run);
-
-            return AiWorkflowAdvanceResult.withEditorAction(run, editorAction);
+            return finish(run, context, AiWorkflowStep.FILL_ARTICLE, editorAction);
         }
 
         throw new IllegalArgumentException("当前状态不允许同意操作");
@@ -270,24 +287,23 @@ public class CreateArticleWorkflowHandler implements WorkflowHandler {
 
     //不同意该阶段的方案，重新生成
     @Override
-    public AiWorkflowAdvanceResult reject(AiWorkflowRun run, String feedback,AiWorkflowStepEmitter emitter) {
-        String normalizedFeedback = workflowContextSupport.normalizeRequired(feedback, "修改意见不能为空");
-        AiWorkflowStatus status = workflowStatusSupport.parseStatus(run.getStatus());
-
-        Map<String, Object> context = workflowContextSupport.parseContext(run.getContextJson());
-        workflowContextSupport.appendFeedback(context, run.getCurrentStep(), run.getStatus(), normalizedFeedback);
-
+    protected AiWorkflowAdvanceResult doReject(
+            AiWorkflowRun run,
+            AiWorkflowStatus status,
+            Map<String, Object> context,
+            Map<String, Object> stepResults,
+            String feedback,
+            AiWorkflowStepEmitter emitter
+    ) {
         if (status == AiWorkflowStatus.WAITING_REQUIREMENT_CONFIRM) {
             Map<String, Object> requirementMap = workflowContextSupport.getMap(context, "requirement");
 
             String rawRequirement = String.valueOf(requirementMap.getOrDefault("rawRequirement", ""));
-            String mergedRequirement = (rawRequirement + " " + normalizedFeedback).trim();//合并反馈需求
+            String mergedRequirement = (rawRequirement + " " + feedback).trim();//合并反馈需求
 
             requirementMap.put("rawRequirement", mergedRequirement);
             requirementMap.put("topic", extractTopic(mergedRequirement));//重新提取主题
             requirementMap.put("keywords", extractSimpleKeywords(mergedRequirement));//重新提取关键字
-
-            context.put("clarification", Map.of("required", false));
 
             //需求澄清后也要读取 Memory，重新检索RAG
             String memoryContext = workflowStepRunner.run(run.getId(),
@@ -306,40 +322,40 @@ public class CreateArticleWorkflowHandler implements WorkflowHandler {
             );
             context.put("ragReferences", ragReferences);
             //(同 create 路径的 LLM 大纲生成)
-            context.put("outline", workflowStepRunner.run(run.getId(),
+            stepResults.put("outline", workflowStepRunner.run(run.getId(),
                     AiWorkflowStep.GENERATE_OUTLINE,
                     "正在生成文章大纲...",
                     () -> buildOutlineByLLM(run, mergedRequirement, memoryContext, ragReferences, emitter),
                     emitter
             ));
 
-            run.setStatus(AiWorkflowStatus.WAITING_OUTLINE_CONFIRM.name());
-            run.setCurrentStep(AiWorkflowStep.GENERATE_OUTLINE.name());
-            run.setContextJson(workflowContextSupport.toJson(context));
-            workflowContextSupport.touch(run);
-
-            return AiWorkflowAdvanceResult.of(run);
+            return waitForConfirm(run, context,
+                    AiWorkflowStatus.WAITING_OUTLINE_CONFIRM,
+                    AiWorkflowStep.GENERATE_OUTLINE,
+                    AiWorkflowConfirmationType.OUTLINE);
         }
 
          if (status == AiWorkflowStatus.WAITING_OUTLINE_CONFIRM) {
-             context.put("outline", workflowStepRunner.run(run.getId(),
+             stepResults.put("outline", workflowStepRunner.run(run.getId(),
                      AiWorkflowStep.GENERATE_OUTLINE,
                      "正在根据修改意见重写大纲...",
-                     () -> rebuildOutline(run, context, normalizedFeedback, emitter),
+                     () -> rebuildOutline(run, context, feedback, emitter),
                      emitter
              ));
 
-            run.setStatus(AiWorkflowStatus.WAITING_OUTLINE_CONFIRM.name());
-            run.setCurrentStep(AiWorkflowStep.GENERATE_OUTLINE.name());
+            return waitForConfirm(run, context,
+                    AiWorkflowStatus.WAITING_OUTLINE_CONFIRM,
+                    AiWorkflowStep.GENERATE_OUTLINE,
+                    AiWorkflowConfirmationType.OUTLINE);
         } else if (status == AiWorkflowStatus.WAITING_DRAFT_CONFIRM) {
-             context.put("draft", workflowStepRunner.run(run.getId(),
+             stepResults.put("draft", workflowStepRunner.run(run.getId(),
                      AiWorkflowStep.GENERATE_DRAFT,
                      "正在根据修改意见重写草稿...",
-                     () -> rebuildDraft(run, context, normalizedFeedback, emitter),
+                     () -> rebuildDraft(run, context, feedback, emitter),
                      emitter
              ));
 
-             context.put("qualityCheck", workflowStepRunner.run(run.getId(),
+             stepResults.put("qualityCheck", workflowStepRunner.run(run.getId(),
                      AiWorkflowStep.QUALITY_CHECK,
                      "正在执行质量检查...",
                      () -> buildQualityCheck(context),
@@ -347,33 +363,33 @@ public class CreateArticleWorkflowHandler implements WorkflowHandler {
              ));
 
             // 用户打回草稿后，必须重新停在草稿确认点，不能因为质量通过就跳过用户确认。
-            run.setStatus(AiWorkflowStatus.WAITING_DRAFT_CONFIRM.name());
-            run.setCurrentStep(AiWorkflowStep.QUALITY_CHECK.name());
+            return waitForConfirm(run, context,
+                    AiWorkflowStatus.WAITING_DRAFT_CONFIRM,
+                    AiWorkflowStep.QUALITY_CHECK,
+                    AiWorkflowConfirmationType.DRAFT);
         } else if (status == AiWorkflowStatus.WAITING_FILL_CONFIRM) {
-             context.put("draft", workflowStepRunner.run(run.getId(),
+             stepResults.put("draft", workflowStepRunner.run(run.getId(),
                      AiWorkflowStep.GENERATE_DRAFT,
                      "正在根据修改意见重写草稿...",
-                     () -> rebuildDraft(run, context, normalizedFeedback, emitter),
+                     () -> rebuildDraft(run, context, feedback, emitter),
                      emitter
              ));
 
-             context.put("qualityCheck", workflowStepRunner.run(run.getId(),
+             stepResults.put("qualityCheck", workflowStepRunner.run(run.getId(),
                      AiWorkflowStep.QUALITY_CHECK,
                      "正在执行质量检查...",
                      () -> buildQualityCheck(context),
                      emitter
              ));
+
             // 用户在填充前提出修改，说明需要重新看一遍新草稿。
-            run.setStatus(AiWorkflowStatus.WAITING_DRAFT_CONFIRM.name());
-            run.setCurrentStep(AiWorkflowStep.QUALITY_CHECK.name());
+            return waitForConfirm(run, context,
+                    AiWorkflowStatus.WAITING_DRAFT_CONFIRM,
+                    AiWorkflowStep.QUALITY_CHECK,
+                    AiWorkflowConfirmationType.DRAFT);
         } else {
             throw new IllegalArgumentException("当前状态不允许提交修改意见");
         }
-
-        run.setContextJson(workflowContextSupport.toJson(context));
-        workflowContextSupport.touch(run);
-
-        return AiWorkflowAdvanceResult.of(run);
     }
 
     /*retry 不是"从头再来"，而是从失败的步骤原地恢复。它和 reject 的区别：
@@ -382,11 +398,13 @@ public class CreateArticleWorkflowHandler implements WorkflowHandler {
     reject = 用户不满意 → 带着反馈重新生成（回退到确认点）
     retry  = 系统失败了 → 不带反馈重做当前步骤（回到确认点）*/
     @Override
-    public AiWorkflowAdvanceResult retry(AiWorkflowRun run,AiWorkflowStepEmitter emitter){
-        // 看死在哪
-        AiWorkflowStep step = workflowStatusSupport.parseStep(run.getCurrentStep());
-        Map<String,Object> context = workflowContextSupport.parseContext(run.getContextJson());
-
+    protected AiWorkflowAdvanceResult doRetry(
+            AiWorkflowRun run,
+            AiWorkflowStep step,
+            Map<String, Object> context,
+            Map<String, Object> stepResults,
+            AiWorkflowStepEmitter emitter
+    ) {
         //需求分析失败（理论上不会发生，防御性兜底）：直接从初始链路重跑
         if (step == AiWorkflowStep.REQUIREMENT_ANALYZE) {
             run.setErrorMessage(null);
@@ -419,7 +437,7 @@ public class CreateArticleWorkflowHandler implements WorkflowHandler {
             context.put("ragReferences", ragReferences);
 
             // 重新生成大纲
-            context.put("outline", workflowStepRunner.run(run.getId(),
+            stepResults.put("outline", workflowStepRunner.run(run.getId(),
                     AiWorkflowStep.GENERATE_OUTLINE,
                     "正在重新生成文章大纲...",
                     () -> buildOutlineByLLM(run, rawRequirement, memoryContext, ragReferences, emitter),
@@ -427,65 +445,44 @@ public class CreateArticleWorkflowHandler implements WorkflowHandler {
             ));
 
             //回到大纲确认
-            run.setStatus(AiWorkflowStatus.WAITING_OUTLINE_CONFIRM.name());
-            run.setCurrentStep(AiWorkflowStep.GENERATE_OUTLINE.name());
-            run.setContextJson(workflowContextSupport.toJson(context));
-            run.setErrorMessage(null);
-            workflowContextSupport.touch(run);
-
-            return AiWorkflowAdvanceResult.of(run);
+            return waitForConfirm(run, context,
+                    AiWorkflowStatus.WAITING_OUTLINE_CONFIRM,
+                    AiWorkflowStep.GENERATE_OUTLINE,
+                    AiWorkflowConfirmationType.OUTLINE);
         }
         if (step == AiWorkflowStep.GENERATE_DRAFT
                 || step == AiWorkflowStep.QUALITY_CHECK) {
-            context.put("draft", workflowStepRunner.run(run.getId(),
+            stepResults.put("draft", workflowStepRunner.run(run.getId(),
                     AiWorkflowStep.GENERATE_DRAFT,
                     "正在根据修改意见重写草稿...",
                     () -> buildDraft(run, context, emitter),
                     emitter
             ));
 
-            context.put("qualityCheck", workflowStepRunner.run(run.getId(),
+            stepResults.put("qualityCheck", workflowStepRunner.run(run.getId(),
                     AiWorkflowStep.QUALITY_CHECK,
                     "正在执行质量检查...",
                     () -> buildQualityCheck(context),
                     emitter
             ));
 
-            run.setStatus(AiWorkflowStatus.WAITING_DRAFT_CONFIRM.name());
-            run.setCurrentStep(AiWorkflowStep.QUALITY_CHECK.name());
-            run.setContextJson(workflowContextSupport.toJson(context));
-            run.setErrorMessage(null);
-            workflowContextSupport.touch(run);
-
-            return AiWorkflowAdvanceResult.of(run);
+            return waitForConfirm(run, context,
+                    AiWorkflowStatus.WAITING_DRAFT_CONFIRM,
+                    AiWorkflowStep.QUALITY_CHECK,
+                    AiWorkflowConfirmationType.DRAFT);
         }
 
         if (step == AiWorkflowStep.FILL_ARTICLE) {//失败在填充编辑器
-            // 重新生成 fillArticle 指令
+            // 重新生成 fillArticle 指令；填充确认已消费，填充编辑器即 Workflow 完成
             AiEditorCommand editorAction = buildEditorAction(context);
-
-            run.setStatus(AiWorkflowStatus.WAITING_USER_SAVE.name());
-            run.setCurrentStep(AiWorkflowStep.FILL_ARTICLE.name());
-            run.setErrorMessage(null);
-            workflowContextSupport.touch(run);
-
-            return AiWorkflowAdvanceResult.withEditorAction(run, editorAction);
+            return finish(run, context, AiWorkflowStep.FILL_ARTICLE, editorAction);
         }
 
         throw new IllegalArgumentException("当前步骤不支持重试: " + step);
     }
     //加记忆读取方法
     private String retrieveMemoryContext(Long userId, String requirement) {
-        if (userId == null) {
-            return "";
-        }
-
-        try {
-            String memoryPrompt = aiUserMemoryService.buildMemoryPrompt(userId, requirement);
-            return memoryPrompt == null ? "" : memoryPrompt;
-        } catch (Exception e) {
-            return "";
-        }
+        return workflowKnowledgeSupport.retrieveMemoryContext(userId, requirement);
     }
     //此方法创建一个workflow的初始状态包，后面整个文章工作流所有中间结果都往这个context塞，最后序列化为 context_json 存到ai_workflow_runs 表里
     private Map<String, Object> buildInitialContext(String requirement) {
@@ -504,13 +501,10 @@ public class CreateArticleWorkflowHandler implements WorkflowHandler {
         requirementMap.put("keywords", extractSimpleKeywords(requirement));//从文本提取关键字
         context.put("requirement", requirementMap);
 
-        context.put("clarification", new HashMap<>());
+        context.put("stepResults", new HashMap<>());
 
         context.put("memoryContext", "");
         context.put("ragReferences", new ArrayList<>());
-        context.put("outline", "");
-        context.put("draft", new HashMap<>());
-        context.put("qualityCheck", new HashMap<>());
         context.put("feedbackHistory", new ArrayList<>());
 
         return context;
@@ -521,32 +515,7 @@ public class CreateArticleWorkflowHandler implements WorkflowHandler {
      * RAG 检索失败时兜底返回空列表，不阻断 workflow 创建。
      */
     private List<Map<String, Object>> retrieveRagReferences(String requirement) {
-        try {
-            AiIntent intent = new AiIntent();
-            intent.setIntent("ARTICLE_SEARCH");
-            intent.setKeyWord(extractTopic(requirement));
-
-            ArticleRagSearchResult result = articleRagSearchService.search(requirement, intent);
-
-            if (result == null || result.contexts() == null || result.contexts().isEmpty()) {
-                return new ArrayList<>();
-            }
-
-            return result.contexts().stream()
-                    .map(this::toRagReference)
-                    .toList();
-        } catch (Exception e) {
-            return new ArrayList<>();
-        }
-    }
-
-    private Map<String, Object> toRagReference(ArticleRagContext context) {
-        Map<String, Object> reference = new HashMap<>();
-        reference.put("articleId", context.articleId());
-        reference.put("title", context.title());
-        reference.put("chunkIndex", context.chunkIndex());
-        reference.put("snippet", context.content());
-        return reference;
+        return workflowKnowledgeSupport.retrieveRagReferences(requirement, extractTopic(requirement));
     }
     private String rebuildOutline(AiWorkflowRun run, Map<String, Object> context, String feedback, AiWorkflowStepEmitter emitter) {
         Map<String, Object> requirement = workflowContextSupport.getMap(context, "requirement");
@@ -604,48 +573,23 @@ public class CreateArticleWorkflowHandler implements WorkflowHandler {
 
     private Map<String, Object> buildDraftByLLM(AiWorkflowRun run, Map<String, Object> context, AiWorkflowStepEmitter emitter) {
         try {
-            StringBuilder fullContent = new StringBuilder();
-            TokenUsageAccumulator usage = new TokenUsageAccumulator();
-
-            chatClientBuilder.build()
-                    .prompt()
-                    .options(OpenAiChatOptions.builder()
-                            .maxTokens(8500)
-                            .streamUsage(true)
-                            .build())
-                    .system("""
-                        你是博客正文生成器。
-                        只输出 Markdown 正文。
-                        不要输出 JSON。
-                        不要输出代码块包裹全文。
-                        正文需要结构清晰，有标题、小节、解释和项目实践细节。
-                        """)
-                    .user(buildDraftMarkdownPrompt(context))
-                    .stream()
-                    .chatResponse()
-                    .timeout(Duration.ofSeconds(60))
-                    .doOnNext(response -> {
-                        String chunk = response.getResult() == null ? "" : response.getResult().getOutput().getText();
-                        if (chunk != null && !chunk.isEmpty()) {
-                            fullContent.append(chunk);
-                            emitter.emitContent(
-                                    AiWorkflowStep.GENERATE_DRAFT.name(),
-                                    "draft.content",
-                                    chunk
-                            );
-                        }
-                        usage.add(response.getMetadata().getUsage());
-                    })
-                    .blockLast();
-
-            workflowTokenRecorder.accumulate(run, usage);
-
-            String markdown = fullContent.toString();
-            if (markdown.isBlank()) {
-                throw new RuntimeException("草稿生成失败：模型返回空内容");
-            }
-
-            return buildDraftFromMarkdown(markdown, context);
+            LlmStreamCaller.LlmStreamResult result = llmStreamCaller.call(
+                    "草稿生成失败：",
+                    AiWorkflowStep.GENERATE_DRAFT,
+                    "draft.content",
+                    emitter,
+                    """
+                    你是博客正文生成器。
+                    只输出 Markdown 正文。
+                    不要输出 JSON。
+                    不要输出代码块包裹全文。
+                    正文需要结构清晰，有标题、小节、解释和项目实践细节。
+                    """,
+                    buildDraftMarkdownPrompt(context),
+                    8500
+            );
+            workflowTokenRecorder.accumulate(run, result.usage());
+            return buildDraftFromMarkdown(result.content(), context);
         } catch (RuntimeException e) {
             //LLM 失败不静默兜底：抛给 runStep 记 FAILED，Service 层 markFailed → 前端可重试；
             //消息分类成友好文案，原始堆栈由 Service 层日志保留
@@ -660,7 +604,7 @@ public class CreateArticleWorkflowHandler implements WorkflowHandler {
         Map<String, Object> requirement = workflowContextSupport.getMap(context, "requirement");
 
         String rawRequirement = String.valueOf(requirement.getOrDefault("rawRequirement", ""));
-        String outline = String.valueOf(context.getOrDefault("outline", ""));
+        String outline = workflowContextSupport.getResultString(context, "outline");
         String memoryContext = String.valueOf(context.getOrDefault("memoryContext", ""));
 
         Object ragValue = context.get("ragReferences");
@@ -764,7 +708,7 @@ public class CreateArticleWorkflowHandler implements WorkflowHandler {
     private String buildDraftUserPrompt(Map<String, Object> context) {
         Map<String, Object> requirement = workflowContextSupport.getMap(context, "requirement");
         String rawRequirement = String.valueOf(requirement.getOrDefault("rawRequirement", ""));
-        String outline = String.valueOf(context.getOrDefault("outline", ""));
+        String outline = workflowContextSupport.getResultString(context, "outline");
         String memoryContext = String.valueOf(context.getOrDefault("memoryContext", ""));
 
         Object ragValue = context.get("ragReferences");
@@ -930,9 +874,9 @@ public class CreateArticleWorkflowHandler implements WorkflowHandler {
      * suggestions：软提示，仅展示给用户参考，不阻塞流程
      */
     private Map<String, Object> buildQualityCheck(Map<String, Object> context) {
-        Map<String, Object> draft = workflowContextSupport.getMap(context, "draft");
+        Map<String, Object> draft = workflowContextSupport.getResultMap(context, "draft");
         Map<String, Object> requirement = workflowContextSupport.getMap(context, "requirement");
-        String outline = String.valueOf(context.getOrDefault("outline", ""));
+        String outline = workflowContextSupport.getResultString(context, "outline");
         String memoryContext = String.valueOf(context.getOrDefault("memoryContext", ""));
         List<Map<String, Object>> ragReferences = getList(context, "ragReferences");
 
@@ -1001,7 +945,7 @@ public class CreateArticleWorkflowHandler implements WorkflowHandler {
         }
 
         // 6. 大纲检测：正文像大纲或要点列表
-        if (!workflowContextSupport.isBlank(content) && looksLikeOutline(content)) {
+        if (!workflowContextSupport.isBlank(content) && workflowQualitySupport.looksLikeOutline(content)) {
             issues.add("正文像大纲或要点列表，缺少完整段落展开");
         }
 
@@ -1014,31 +958,6 @@ public class CreateArticleWorkflowHandler implements WorkflowHandler {
     }
 
     /** 检测 markdown 是否像大纲/目录而非完整正文：标题多 + 列表多 + 长段落少 */
-    private boolean looksLikeOutline(String markdown) {
-        if (markdown == null || markdown.isBlank()) {
-            return false;
-        }
-
-        String[] lines = markdown.split("\\R");
-
-        int headingCount = 0;
-        int listCount = 0;
-        int longParagraphCount = 0;
-
-        for (String line : lines) {
-            String trimmed = line.trim();
-
-            if (trimmed.startsWith("#")) {
-                headingCount++;
-            } else if (trimmed.startsWith("- ") || trimmed.matches("^\\d+\\.\\s+.*")) {
-                listCount++;
-            } else if (trimmed.length() >= 80) {
-                longParagraphCount++;
-            }
-        }
-
-        return headingCount >= 3 && listCount >= 5 && longParagraphCount < 3;
-    }
 
     /**
      * 从大纲 Markdown 中提取小节标题，排除首个 # 文章标题。
@@ -1076,7 +995,7 @@ public class CreateArticleWorkflowHandler implements WorkflowHandler {
 
     //从 draft 构建 fillArticle 指令
     private AiEditorCommand buildEditorAction(Map<String, Object> context) {
-        Map<String, Object> draft = workflowContextSupport.getMap(context, "draft");
+        Map<String, Object> draft = workflowContextSupport.getResultMap(context, "draft");
 
         AiEditorCommand command = new AiEditorCommand();
         command.setType("fillArticle");
@@ -1142,12 +1061,6 @@ public class CreateArticleWorkflowHandler implements WorkflowHandler {
         }
         return false;
     }
-    private Map<String, Object> buildRequirementClarification() {
-        Map<String, Object> clarification = new HashMap<>();
-        clarification.put("required", true);
-        clarification.put("question", "你想写哪个主题？可以直接告诉我主题，比如 Redis 缓存、Kafka 消息队列、RAG 检索增强、项目复盘等。");
-        return clarification;
-    }
 
     //接入LLM
     private String buildOutlineByLLM(AiWorkflowRun run,
@@ -1165,46 +1078,22 @@ public class CreateArticleWorkflowHandler implements WorkflowHandler {
                                      List<Map<String, Object>> ragReferences,
                                      AiWorkflowStepEmitter emitter) {
         try {
-            StringBuilder fullContent = new StringBuilder();
-            TokenUsageAccumulator usage = new TokenUsageAccumulator();
-
-            chatClientBuilder.build()
-                    .prompt()
-                    .options(OpenAiChatOptions.builder()
-                            .streamUsage(true)
-                            .build())
-                    .system("""
-                        你是博客文章大纲生成器，只输出 Markdown。
-                        不要输出解释，不要输出代码块，不要输出多余前后缀。
-                        必须结合用户需求、长期记忆和站内相关文章参考。
-                        大纲要体现真实技术点、项目实践和知识体系一致性。
-                        """)
-                    .user(buildOutlineUserPrompt(requirement, feedback, memoryContext, ragReferences))
-                    .stream()
-                    .chatResponse()
-                    .timeout(Duration.ofSeconds(60))
-                    .doOnNext(response -> {
-                        String chunk = response.getResult() == null ? "" : response.getResult().getOutput().getText();
-                        if (chunk != null && !chunk.isEmpty()) {
-                            fullContent.append(chunk);
-                            emitter.emitContent(
-                                    AiWorkflowStep.GENERATE_OUTLINE.name(),
-                                    "outline",
-                                    chunk
-                            );
-                        }
-                        usage.add(response.getMetadata().getUsage());
-                    })
-                    .blockLast();
-
-            workflowTokenRecorder.accumulate(run, usage);
-
-            String content = fullContent.toString();
-            if (content.isBlank()) {
-                throw new RuntimeException("大纲生成失败：模型返回空内容");
-            }
-
-            return cleanMarkdown(content);
+            LlmStreamCaller.LlmStreamResult result = llmStreamCaller.call(
+                    "大纲生成失败：",
+                    AiWorkflowStep.GENERATE_OUTLINE,
+                    "outline",
+                    emitter,
+                    """
+                    你是博客文章大纲生成器，只输出 Markdown。
+                    不要输出解释，不要输出代码块，不要输出多余前后缀。
+                    必须结合用户需求、长期记忆和站内相关文章参考。
+                    大纲要体现真实技术点、项目实践和知识体系一致性。
+                    """,
+                    buildOutlineUserPrompt(requirement, feedback, memoryContext, ragReferences),
+                    null
+            );
+            workflowTokenRecorder.accumulate(run, result.usage());
+            return cleanMarkdown(result.content());
         } catch (RuntimeException e) {
             //LLM 失败不静默兜底：抛给 runStep 记 FAILED，Service 层 markFailed → 前端可重试；
             //消息分类成友好文案，原始堆栈由 Service 层日志保留
@@ -1280,42 +1169,4 @@ public class CreateArticleWorkflowHandler implements WorkflowHandler {
         return text;
     }
 
-    /** 把质量检查结果转成模型能理解的错误反馈 */
-    private String buildQualityFeedbackForModel(Map<String, Object> qualityCheck) {
-        List<String> issues = getStringList(qualityCheck.get("issues"));
-        List<String> suggestions = getStringList(qualityCheck.get("suggestions"));
-
-        StringBuilder feedback = new StringBuilder();
-        feedback.append("系统质量检查未通过，请重新生成完整正文，不要只输出大纲或要点列表。\n");
-
-        if (!issues.isEmpty()) {
-            feedback.append("必须修复的问题：\n");
-            for (String issue : issues) {
-                feedback.append("- ").append(issue).append("\n");
-            }
-        }
-
-        if (!suggestions.isEmpty()) {
-            feedback.append("建议改进：\n");
-            for (String suggestion : suggestions) {
-                feedback.append("- ").append(suggestion).append("\n");
-            }
-        }
-
-        feedback.append("要求：每个小节必须有完整段落解释，最终内容要像一篇可直接发布的技术博客。");
-        return feedback.toString();
-    }
-
-    private List<String> getStringList(Object value) {
-        if (value instanceof List<?> list) {
-            List<String> result = new ArrayList<>();
-            for (Object item : list) {
-                if (item != null && !String.valueOf(item).isBlank()) {
-                    result.add(String.valueOf(item));
-                }
-            }
-            return result;
-        }
-        return List.of();
-    }
 }

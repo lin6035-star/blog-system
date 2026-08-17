@@ -1,19 +1,6 @@
-DROP TABLE IF EXISTS article_tags;
-DROP TABLE IF EXISTS comment_likes;
-DROP TABLE IF EXISTS article_likes;
-DROP TABLE IF EXISTS article_favorites;
-DROP TABLE IF EXISTS article_comments;
-DROP TABLE IF EXISTS articles;
-DROP TABLE IF EXISTS categories;
-DROP TABLE IF EXISTS user_follows;
-DROP TABLE IF EXISTS ai_messages;
-DROP TABLE IF EXISTS ai_sessions;
-DROP TABLE IF EXISTS ai_workflow_runs;
-DROP TABLE IF EXISTS users;
-DROP TABLE IF EXISTS ai_user_memory_candidates;
-DROP TABLE IF EXISTS ai_user_memories;
-
-CREATE TABLE articles (
+-- 多测试类共享 H2 内存库（DB_CLOSE_DELAY=-1），每个 Spring 上下文启动都会执行本文件。
+-- 因此所有语句必须幂等：不 DROP（会删掉其他上下文的表），CREATE 用 IF NOT EXISTS。
+CREATE TABLE IF NOT EXISTS articles (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     category_id BIGINT,
     author_id BIGINT,
@@ -33,20 +20,20 @@ CREATE TABLE articles (
     share_count INT DEFAULT 0
 );
 
-CREATE TABLE tags (
+CREATE TABLE IF NOT EXISTS tags (
     id BIGINT PRIMARY KEY,
     name VARCHAR(100),
     created_at TIMESTAMP,
     updated_at TIMESTAMP
 );
 
-CREATE TABLE article_tags (
+CREATE TABLE IF NOT EXISTS article_tags (
     article_id BIGINT NOT NULL,
     tag_id BIGINT NOT NULL,
     PRIMARY KEY (article_id, tag_id)
 );
 
-CREATE TABLE categories (
+CREATE TABLE IF NOT EXISTS categories (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     name VARCHAR(100),
     code VARCHAR(100),
@@ -56,7 +43,7 @@ CREATE TABLE categories (
     updated_at TIMESTAMP
 );
 
-CREATE TABLE users (
+CREATE TABLE IF NOT EXISTS users (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     username VARCHAR(100),
     password_hash VARCHAR(255),
@@ -73,7 +60,7 @@ CREATE TABLE users (
     deleted_at TIMESTAMP
 );
 
-CREATE TABLE user_follows (
+CREATE TABLE IF NOT EXISTS user_follows (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     follower_id BIGINT NOT NULL,
     following_id BIGINT NOT NULL,
@@ -83,10 +70,10 @@ CREATE TABLE user_follows (
     CONSTRAINT uk_follow UNIQUE (follower_id, following_id)
 );
 
-CREATE INDEX idx_follower ON user_follows (follower_id, deleted_at);
-CREATE INDEX idx_following ON user_follows (following_id, deleted_at);
+CREATE INDEX IF NOT EXISTS idx_follower ON user_follows (follower_id, deleted_at);
+CREATE INDEX IF NOT EXISTS idx_following ON user_follows (following_id, deleted_at);
 
-CREATE TABLE article_comments (
+CREATE TABLE IF NOT EXISTS article_comments (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     article_id BIGINT NOT NULL,
     user_id BIGINT NOT NULL,
@@ -101,28 +88,28 @@ CREATE TABLE article_comments (
     deleted_by BIGINT
 );
 
-CREATE TABLE comment_likes (
+CREATE TABLE IF NOT EXISTS comment_likes (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     comment_id BIGINT NOT NULL,
     user_id BIGINT NOT NULL,
     created_at TIMESTAMP
 );
 
-CREATE TABLE article_likes (
+CREATE TABLE IF NOT EXISTS article_likes (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     article_id BIGINT NOT NULL,
     user_id BIGINT NOT NULL,
     create_time TIMESTAMP
 );
 
-CREATE TABLE article_favorites (
+CREATE TABLE IF NOT EXISTS article_favorites (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     article_id BIGINT NOT NULL,
     user_id BIGINT NOT NULL,
     create_time TIMESTAMP
 );
 
-CREATE TABLE ai_sessions (
+CREATE TABLE IF NOT EXISTS ai_sessions (
     id BIGINT PRIMARY KEY,
     user_id BIGINT NOT NULL,
     title VARCHAR(100) NOT NULL DEFAULT '新对话',
@@ -131,7 +118,7 @@ CREATE TABLE ai_sessions (
     updated_at TIMESTAMP
 );
 
-CREATE TABLE ai_messages (
+CREATE TABLE IF NOT EXISTS ai_messages (
     id BIGINT PRIMARY KEY,
     session_id BIGINT NOT NULL,
     workflow_run_id BIGINT,
@@ -142,7 +129,7 @@ CREATE TABLE ai_messages (
     created_at TIMESTAMP
 );
 
-CREATE TABLE ai_workflow_runs (
+CREATE TABLE IF NOT EXISTS ai_workflow_runs (
     id BIGINT PRIMARY KEY,
     user_id BIGINT NOT NULL,
     conversation_id BIGINT,
@@ -161,7 +148,7 @@ CREATE TABLE ai_workflow_runs (
     updated_at TIMESTAMP NOT NULL
 );
 
-CREATE TABLE ai_user_memories (
+CREATE TABLE IF NOT EXISTS ai_user_memories (
                                   id BIGINT PRIMARY KEY,
                                   user_id BIGINT NOT NULL,
                                   memory_type VARCHAR(32) NOT NULL,
@@ -176,11 +163,11 @@ CREATE TABLE ai_user_memories (
                                   CONSTRAINT uk_user_type_key UNIQUE (user_id, memory_type, memory_key)
 );
 
-CREATE INDEX idx_user_enabled ON ai_user_memories (user_id, enabled);
-CREATE INDEX idx_user_type_enabled ON ai_user_memories (user_id, memory_type, enabled);
-CREATE INDEX idx_user_importance ON ai_user_memories (user_id, enabled, importance);
+CREATE INDEX IF NOT EXISTS idx_user_enabled ON ai_user_memories (user_id, enabled);
+CREATE INDEX IF NOT EXISTS idx_user_type_enabled ON ai_user_memories (user_id, memory_type, enabled);
+CREATE INDEX IF NOT EXISTS idx_user_importance ON ai_user_memories (user_id, enabled, importance);
 
-CREATE TABLE ai_user_memory_candidates (
+CREATE TABLE IF NOT EXISTS ai_user_memory_candidates (
     id BIGINT PRIMARY KEY,
     user_id BIGINT NOT NULL,
     session_id BIGINT,
@@ -202,10 +189,10 @@ CREATE TABLE ai_user_memory_candidates (
     decided_at TIMESTAMP
 );
 
-CREATE INDEX idx_memory_candidate_user_status ON ai_user_memory_candidates (user_id, status);
-CREATE INDEX idx_memory_candidate_user_type_key ON ai_user_memory_candidates (user_id, memory_type, memory_key);
-CREATE INDEX idx_memory_candidate_target_memory_id ON ai_user_memory_candidates (target_memory_id);
-CREATE INDEX idx_memory_candidate_status_created_at ON ai_user_memory_candidates (status, created_at);
+CREATE INDEX IF NOT EXISTS idx_memory_candidate_user_status ON ai_user_memory_candidates (user_id, status);
+CREATE INDEX IF NOT EXISTS idx_memory_candidate_user_type_key ON ai_user_memory_candidates (user_id, memory_type, memory_key);
+CREATE INDEX IF NOT EXISTS idx_memory_candidate_target_memory_id ON ai_user_memory_candidates (target_memory_id);
+CREATE INDEX IF NOT EXISTS idx_memory_candidate_status_created_at ON ai_user_memory_candidates (status, created_at);
 
 
 CREATE TABLE IF NOT EXISTS ai_workflow_step_logs (
@@ -252,7 +239,7 @@ CREATE TABLE IF NOT EXISTS ai_workflow_step_logs (
     COMMENT='AI Workflow步骤执行日志';
 
 -- 学习计划（LEARNING_PLAN Workflow 业务对象，H2 测试库）
-CREATE TABLE learning_plans (
+CREATE TABLE IF NOT EXISTS learning_plans (
     id BIGINT PRIMARY KEY,
     user_id BIGINT NOT NULL,
     title VARCHAR(200) NOT NULL,
@@ -262,9 +249,9 @@ CREATE TABLE learning_plans (
     created_at TIMESTAMP NOT NULL,
     updated_at TIMESTAMP NOT NULL
 );
-CREATE UNIQUE INDEX uk_learning_plans_run_id ON learning_plans(source_workflow_run_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uk_learning_plans_run_id ON learning_plans(source_workflow_run_id);
 
-CREATE TABLE learning_stages (
+CREATE TABLE IF NOT EXISTS learning_stages (
     id BIGINT PRIMARY KEY,
     plan_id BIGINT NOT NULL,
     order_num INT NOT NULL DEFAULT 0,
@@ -273,4 +260,4 @@ CREATE TABLE learning_stages (
     created_at TIMESTAMP NOT NULL,
     updated_at TIMESTAMP NOT NULL
 );
-CREATE INDEX idx_learning_stages_plan ON learning_stages(plan_id, order_num);
+CREATE INDEX IF NOT EXISTS idx_learning_stages_plan ON learning_stages(plan_id, order_num);

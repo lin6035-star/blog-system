@@ -7,12 +7,10 @@ import com.hailin.blogsystem.service.LearningPlansService;
 import com.hailin.blogsystem.utils.Result;
 import com.hailin.blogsystem.utils.UserContext;
 import lombok.RequiredArgsConstructor;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PathVariable;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
+import java.util.Map;
 
 @RestController
 @RequestMapping("/api/learning-plans")
@@ -31,5 +29,27 @@ public class LearningPlansController {
     @GetMapping("/{id}")
     public Result<LearningPlansDetailVO> detail(@PathVariable Long id) {
         return Result.success(learningPlanService.getDetail(id, UserContext.get()));
+    }
+
+    //任务勾选：body {"done": true/false}，taskIndex 为任务在阶段 tasks 列表中的下标（从 0 开始）
+    @PatchMapping("/{planId}/stages/{stageId}/tasks/{taskIndex}")
+    public Result<Void> updateTaskDone(
+            @PathVariable Long planId,
+            @PathVariable Long stageId,
+            @PathVariable int taskIndex,
+            @RequestBody Map<String, Boolean> body) {
+        Boolean done = body == null ? null : body.get("done");
+        if (done == null) {
+            throw new IllegalArgumentException("done 参数不能为空");
+        }
+        learningPlanService.updateTaskDone(planId, stageId, taskIndex, done, UserContext.get());
+        return Result.success(null);
+    }
+
+    //删除学习规划
+    @DeleteMapping("/{id}")
+    public Result<Void> deleteMine(@PathVariable Long id) {
+        learningPlanService.deletePlan(id, UserContext.get());
+        return Result.success(null);
     }
 }

@@ -76,6 +76,11 @@ public class WorkflowStatusSupport {
             case "ANALYZE_GOAL": return "分析学习目标";
             case "GENERATE_PLAN": return "生成结构化学习计划";
             case "SAVE_PLAN": return "保存学习计划";
+            case "LOAD_PLAN": return "加载学习计划";
+            case "ANALYZE_CHANGE": return "分析调整诉求";
+            case "LOCATE_STAGE": return "定位难点阶段";
+            case "GENERATE_TASKS": return "拆解任务点";
+            case "APPEND_TASKS": return "追加任务点";
             default: return step;
         }
     }

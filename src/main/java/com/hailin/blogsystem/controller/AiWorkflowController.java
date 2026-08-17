@@ -55,11 +55,6 @@ public class AiWorkflowController {
         return Result.success(aiWorkflowRunService.reject(id, dto.getFeedback()));
     }
 
-    @PostMapping("/{id}/complete")
-    public Result<AiWorkflowRunVO> complete(@PathVariable Long id) {
-        return Result.success(aiWorkflowRunService.complete(id));
-    }
-
     @PostMapping("/{id}/cancel")
     public Result<Void> cancel(@PathVariable Long id) {
         aiWorkflowRunService.cancel(id);

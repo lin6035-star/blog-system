@@ -17,7 +17,14 @@ public enum AiWorkflowStep {
 
     ANALYZE_GOAL(13),  // analyze_goal 分析学习目标，信息不足则追问
     GENERATE_PLAN(14), // generate_plan 生成结构化学习计划
-    SAVE_PLAN(15);     // save_plan 幂等保存学习计划（upsert）
+    SAVE_PLAN(15),     // save_plan 幂等保存学习计划（upsert）
+
+    LOAD_PLAN(16),     // load_plan 加载用户已有学习计划（含任务进度）
+    ANALYZE_CHANGE(17), // analyze_change 分析调整诉求，信息不足则追问
+
+    LOCATE_STAGE(18),  // locate_stage 定位难点所在阶段，信息不足则追问
+    GENERATE_TASKS(19), // generate_tasks 拆解难点为新增任务点
+    APPEND_TASKS(20);   // append_tasks 追加任务点到对应阶段
 
     private final int order;
 
