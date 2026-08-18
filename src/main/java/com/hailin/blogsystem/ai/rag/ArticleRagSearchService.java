@@ -25,7 +25,9 @@ public class ArticleRagSearchService {
     private static final List<String> ARTICLE_SEARCH_STOP_WORDS = List.of(
             "有没有", "关于", "相关", "文章", "内容", "找一下", "搜索", "推荐",
             "一下", "什么", "怎么", "如何", "这个", "那个", "一篇", "几篇",
-            "帮我", "请问", "的"
+            "帮我", "请问", "的",
+            // 中文语气词，避免污染 keyword 检索
+            "啊", "呢", "吗", "吧", "哦", "呀", "哈", "嘛", "欸", "呗", "喽"
     );
 
     private final ArticleRagRetrieveService articleRagRetrieveService;

@@ -1,6 +1,9 @@
 package com.hailin.blogsystem;
 
+import com.hailin.blogsystem.ai.rag.ArticleRagIndexService;
+import com.hailin.blogsystem.ai.rag.ArticleRagSyncService;
 import com.hailin.blogsystem.entity.Articles;
+import com.hailin.blogsystem.constants.RedisConstants;
 import com.hailin.blogsystem.service.ArticlesService;
 import com.hailin.blogsystem.utils.JwtUtil;
 import org.junit.jupiter.api.BeforeEach;
@@ -8,8 +11,13 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
+
+import java.util.List;
+import java.util.Set;
 
 import static org.hamcrest.Matchers.hasSize;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -30,11 +38,44 @@ class ArticlesControllerTests {
     @Autowired
     private JwtUtil jwtUtil;
 
+    @Autowired
+    private StringRedisTemplate stringRedisTemplate;
+
+    @MockBean
+    private ArticleRagSyncService articleRagSyncService;
+
     @BeforeEach
-    void resetViewCounts() {
-        Articles article = articlesService.getById(1L);
-        article.setViewCount(12);
-        articlesService.updateById(article);
+    void resetArticleState() {
+        Articles article1 = articlesService.getById(1L);
+        article1.setViewCount(12);
+
+        Articles article3 = articlesService.getById(3L);
+        article3.setViewCount(100);
+
+        Articles article4 = articlesService.getById(4L);
+        article4.setViewCount(1);
+
+        articlesService.updateBatchById(List.of(article1, article3, article4));
+        cleanRedisKeys();
+    }
+
+    private void cleanRedisKeys() {
+        try {
+            deleteByPattern(RedisConstants.ARTICLE_LIST_KEY_PREFIX + "*");
+            deleteByPattern(RedisConstants.ARTICLE_DETAIL_KEY_PREFIX + "*");
+            deleteByPattern(RedisConstants.ARTICLE_VIEW_KEY_PREFIX + "*");
+            stringRedisTemplate.delete(RedisConstants.ARTICLE_HOT_KEY);
+            stringRedisTemplate.delete(RedisConstants.CATEGORY_LIST_KEY);
+        } catch (Exception ignored) {
+            // Redis 不可用时，业务会走 DB 兜底；测试清理也不阻断。
+        }
+    }
+
+    private void deleteByPattern(String pattern) {
+        Set<String> keys = stringRedisTemplate.keys(pattern);
+        if (keys != null && !keys.isEmpty()) {
+            stringRedisTemplate.delete(keys);
+        }
     }
 
     @Test
@@ -47,7 +88,7 @@ class ArticlesControllerTests {
                 .andExpect(jsonPath("$.data.list", hasSize(3)))
                 .andExpect(jsonPath("$.data.list[0].id").value(4))
                 .andExpect(jsonPath("$.data.list[0].authorName").value("Author Nick"))
-                .andExpect(jsonPath("$.data.list[0].categoryName").value("Backend"))
+                .andExpect(jsonPath("$.data.list[0].categoryName").value("AI / Agent"))
                 .andExpect(jsonPath("$.data.total").value(3))
                 .andExpect(jsonPath("$.data.page").value(1))
                 .andExpect(jsonPath("$.data.pageSize").value(10));
@@ -140,7 +181,7 @@ class ArticlesControllerTests {
                 .andExpect(jsonPath("$.data.id").value(1))
                 .andExpect(jsonPath("$.data.title").value("Published Article"))
                 .andExpect(jsonPath("$.data.authorName").value("Author Nick"))
-                .andExpect(jsonPath("$.data.categoryName").value("Backend"))
+                .andExpect(jsonPath("$.data.categoryName").value("AI / Agent"))
                 .andExpect(jsonPath("$.data.content").value("Published content"));
     }
 
@@ -174,10 +215,8 @@ class ArticlesControllerTests {
         mockMvc.perform(get("/api/articles/1")
                         .header("Authorization", "Bearer " + readerToken))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.code").value(0));
-
-        Articles article = articlesService.getById(1L);
-        org.assertj.core.api.Assertions.assertThat(article.getViewCount()).isEqualTo(13);
+                .andExpect(jsonPath("$.code").value(0))
+                .andExpect(jsonPath("$.data.viewCount").value(13));
     }
 
     @Test
@@ -193,8 +232,10 @@ class ArticlesControllerTests {
         mockMvc.perform(get("/api/categories"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.code").value(0))
-                .andExpect(jsonPath("$.data", hasSize(2)))
-                .andExpect(jsonPath("$.data[0].code").value("ai"))
-                .andExpect(jsonPath("$.data[1].code").value("backend"));
+                .andExpect(jsonPath("$.data", hasSize(4)))
+                .andExpect(jsonPath("$.data[0].code").value("ai-agent"))
+                .andExpect(jsonPath("$.data[1].code").value("java-backend"))
+                .andExpect(jsonPath("$.data[2].code").value("project-practice"))
+                .andExpect(jsonPath("$.data[3].code").value("notes"));
     }
 }

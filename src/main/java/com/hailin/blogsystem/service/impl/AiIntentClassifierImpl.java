@@ -33,8 +33,15 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
             if(aiIntent.getIntent() == null || aiIntent.getIntent().isBlank()){
                 return generalChat();
             }
-            log.info("AI意图识别结果: intent={}, actionType={}, articleId={}, authorId={}, userId={}",
-                    aiIntent.getIntent(), aiIntent.getActionType(), aiIntent.getArticleId(), aiIntent.getAuthorId(), aiIntent.getUserId());
+            log.info("AI意图识别结果: intent={}, confidence={}, planRef={}, stageRef={}, actionType={}, articleId={}, authorId={}, userId={}",
+                    aiIntent.getIntent(),
+                    aiIntent.getConfidence(),
+                    aiIntent.getLearningPlanRef(),
+                    aiIntent.getLearningStageRef(),
+                    aiIntent.getActionType(),
+                    aiIntent.getArticleId(),
+                    aiIntent.getAuthorId(),
+                    aiIntent.getUserId());
 
             return aiIntent;
         }
@@ -54,8 +61,13 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 - ARTICLE_ACTION
                                 - NAVIGATE
                                 - EDITOR_ACTION
+                                - CREATE_ARTICLE_WORKFLOW
+                                - OPTIMIZE_ARTICLE_WORKFLOW
                                 - ARTICLE_DETAIL_QA
                                 - ARTICLE_SEARCH
+                                - LEARNING_PLAN_QUERY
+                                - LEARNING_PROGRESS
+                                - LEARNING_ASSIST
                 
                                 当用户只是问普通技术问题、闲聊、解释概念时，输出 GENERAL_CHAT。
                 
@@ -68,23 +80,8 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 ARTICLE_DETAIL_QA 不需要 actionType。
                                 如果缺少 articleId，输出 GENERAL_CHAT。
                                  
-                                actionType 可选：
-                                - likeArticle
-                                - unlikeArticle
-                                - favoriteArticle
-                                - unfavoriteArticle
-                                - followAuthor
-                                - unfollowAuthor
-                                - copyArticleLink
-                                - scrollToComments
-                                - saveDraft
-                                - publish
-                                - fillArticle
-                                - scrollToTop
-                
-                                输出格式：
-                                {"intent":"GENERAL_CHAT","actionType":null,"articleId":null,"userId":null,"content":null}
-                
+                                actionType 可选：likeArticle, unlikeArticle, favoriteArticle, unfavoriteArticle, followAuthor, unfollowAuthor, copyArticleLink, scrollToComments, saveDraft, publish, fillArticle, scrollToTop。
+
                                 当用户要求跳转页面、打开页面、进入页面、回到某页时，输出 NAVIGATE。
                                 当 pageType 是 article-detail，且用户要求查看该作者或者进入该作者的主页时，输出 NAVIGATE。
                                 
@@ -109,15 +106,38 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 
                                 如果用户说“打开第 X 篇文章”，但没有明确文章ID，不要猜ID，输出 GENERAL_CHAT。
                                 
-                                当用户要求帮他写一篇文章、生成博文、起草博客、写一篇关于某主题的内容时，输出 EDITOR_ACTION，actionType=fillArticle。
-               
+                                当用户要求帮他写一篇关于特定主题的文章、博客、博文、草稿、大纲时，输出 CREATE_ARTICLE_WORKFLOW。
+                                这类请求不要求用户必须在编辑器页面。
                                 如果用户指定了主题，填写 topic。
-                                如果用户指定了分类，填写 categoryName,默认为随笔分类.
+                                topic 只能从用户原话中提取；用户没有明确给出主题时，topic 必须为 null，禁止猜测、联想或编造主题。
+
+                                当用户表达学习某技术的想法或规划诉求（"我想学XX"、"不知道怎么开始"、"帮我规划学习路线"）时，输出 LEARNING_PLAN。
+                                是否真正制定计划由后端追问确认，分类器只负责"这是不是学习意图"，宁判勿漏。
+                                只判断意图，不提取任何结构化字段（学习目标由后端从原文解析，禁止编造）。
+                                如果只是询问知识、了解概念（"Redis 是什么"），输出 GENERAL_CHAT，不要输出 LEARNING_PLAN。
+                                当用户询问或查看自己已有的学习计划、阶段或进度（"我有几个学习规划"、"我的MySQL学习计划学到哪了"、"看看我的学习进度"）时，输出 LEARNING_PLAN_QUERY——这类问题由查询工具回答，不是制定或修改计划的诉求。
+                                当用户要求调整、压缩、重排、延长、缩短、重新生成已有学习计划或进度时，输出 LEARNING_PROGRESS。
+                                当用户表达某个学习计划、阶段或任务难度过高、卡住、理解困难，
+                                并希望解释、拆解或增加辅助任务时，输出 LEARNING_ASSIST。
+                                例如："我感觉微服务计划中的阶段二挺难的"、
+                                "第二阶段有点啃不动，帮我拆小一点"、"Redis 计划里的缓存击穿看不懂"。
+                                只要语义表达了已有计划中的困难，不要求出现固定词语。
+                                对 LEARNING_PROGRESS / LEARNING_ASSIST：
+                                - learningPlanRef：用户原话明确提到的计划名称或关键词，没有则 null
+                                - learningStageRef：用户原话明确提到的阶段或任务名称，没有则 null
+                                - 不允许猜测、编造计划名、阶段名或 ID
+                                对所有意图输出 confidence，范围为 0 到 1，表示本次意图判断置信度。
+                                如果用户指定了分类，填写 categoryName，默认为随笔分类。
                                 如果用户有额外要求，填写 requirements。
                                 不要在意图识别阶段生成完整正文。
-                                
+
+                                当 pageType 是 article-detail，且用户要求优化、改进、润色、重写当前文章时，输出 OPTIMIZE_ARTICLE_WORKFLOW，并填写 articleId（从页面上下文中获取）。
+                                这类请求不需要用户在编辑器页面。
+                                如果缺少 articleId，输出 GENERAL_CHAT。
+                                不要在意图识别阶段生成优化方案。
+
                                 输出格式：
-                                {"intent":"GENERAL_CHAT","actionType":null,"articleId":null,"userId":null,"content":null,"target":null,"param":null,"topic":null,"categoryName":null,"requirements":null}
+                                {"intent":"GENERAL_CHAT","confidence":0.98,"learningPlanRef":null,"learningStageRef":null,"actionType":null,"articleId":null,"userId":null,"content":null,"target":null,"param":null,"topic":null,"categoryName":null,"requirements":null}
                
                                 当用户在写文章页面要求保存草稿、存草稿、保存文章时，输出 EDITOR_ACTION，actionType=saveDraft。
                 
@@ -126,9 +146,7 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 只有 pageType 是 editor-new 或 editor-edit 时，才输出 EDITOR_ACTION。
                                 如果用户不在编辑器页面却要求保存或发布，仍然输出 EDITOR_ACTION，让后端/前端提示用户先进入编辑器。
                                 
-                                必须输出合法 JSON。
-                                不要输出 markdown。
-                                不要输出代码块。
+                                只输出纯 JSON，禁止 markdown、代码块或任何额外文本。
                """;
     }
 
@@ -163,6 +181,7 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
     private AiIntent generalChat() {
         AiIntent intent = new AiIntent();
         intent.setIntent("GENERAL_CHAT");
+        intent.setConfidence(0.0);
         return intent;
     }
 

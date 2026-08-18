@@ -46,7 +46,8 @@ public class WebMvcConfig implements WebMvcConfigurer {
                         "/api/articles/*/like",
                         "/api/articles/*/favorite",
                         "/api/users/*/follow",
-                        "/api/ai/**"
+                        "/api/ai/**",
+                        "/api/learning-plans/**"
                 )
                 .excludePathPatterns("/api/comments/*/replies",
                                      // "/api/ai/chat",  // 【已废弃】非流式接口

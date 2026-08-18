@@ -9,6 +9,7 @@ import java.time.LocalDateTime;
 public class AiMessageVO {
     private String id;
     private String sessionId;
+    private String workflowRunId;
     private String role;  //user or assistant
     private String content;
     private String pageContext;
@@ -19,6 +20,9 @@ public class AiMessageVO {
         AiMessageVO aiMessageVO = new AiMessageVO();
         aiMessageVO.setId(String.valueOf(aiMessages.getId()));
         aiMessageVO.setSessionId(String.valueOf(aiMessages.getSessionId()));
+        if (aiMessages.getWorkflowRunId() != null) {
+            aiMessageVO.setWorkflowRunId(String.valueOf(aiMessages.getWorkflowRunId()));
+        }
         aiMessageVO.setRole(aiMessages.getRole());
         aiMessageVO.setContent(aiMessages.getContent());
         aiMessageVO.setPageContext(aiMessages.getPageContext());

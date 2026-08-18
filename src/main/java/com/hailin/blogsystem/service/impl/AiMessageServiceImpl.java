@@ -1,20 +1,29 @@
 package com.hailin.blogsystem.service.impl;
 
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.errorprone.annotations.Var;
+import com.hailin.blogsystem.ai.TokenUsageAccumulator;
+import com.hailin.blogsystem.ai.workflow.CreateArticleWorkflowHandler;
+import com.hailin.blogsystem.ai.workflow.WorkflowContextSupport;
+import com.hailin.blogsystem.ai.workflow.WorkflowHandlerRegistry;
+import com.hailin.blogsystem.entity.dto.AiWorkflowLearningPlanDTO;
 import com.hailin.blogsystem.ai.rag.ArticleRagPromptBuilder;
 import com.hailin.blogsystem.ai.rag.ArticleRagRetrieveService;
 import com.hailin.blogsystem.ai.rag.ArticleRagSearchService;
 import com.hailin.blogsystem.ai.tool.AiToolActionRegistry;
 import com.hailin.blogsystem.ai.tool.AiUserProfileTools;
+import com.hailin.blogsystem.ai.workflow.AiWorkflowStepEmitter;
 import com.hailin.blogsystem.constants.BlogConstants;
 import com.hailin.blogsystem.entity.*;
 import com.hailin.blogsystem.entity.dto.*;
 import com.hailin.blogsystem.entity.vo.*;
 import com.hailin.blogsystem.mapper.AiMessageMapper;
 import com.hailin.blogsystem.mapper.AiSessionMapper;
+import com.hailin.blogsystem.mapper.AiWorkflowRunMapper;
+import com.hailin.blogsystem.mapper.AiWorkflowStepLogMapper;
 import com.hailin.blogsystem.service.*;
 import com.hailin.blogsystem.utils.UserContext;
 import lombok.RequiredArgsConstructor;
@@ -22,8 +31,10 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.FluxSink;
 import reactor.core.publisher.Mono;
 import reactor.core.publisher.SignalType;
+import reactor.core.scheduler.Schedulers;
 
 import java.time.LocalDateTime;
 import java.util.*;
@@ -48,9 +59,16 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
     private final ArticleRagPromptBuilder articleRagPromptBuilder;
     private final ArticleRagSearchService articleRagSearchService;
     private final AiMemoryCandidateExtractorService aiMemoryCandidateExtractorService;
+    private final AiWorkflowRunService aiWorkflowRunService;
+    private final AiWorkflowRunMapper aiWorkflowRunMapper;
+    private final AiWorkflowStepLogMapper aiWorkflowStepLogMapper;
+    private final CreateArticleWorkflowHandler createArticleWorkflowHandler;
+    private final WorkflowContextSupport workflowContextSupport;
+    private final WorkflowHandlerRegistry workflowHandlerRegistry;
 
     private final AiSessionService aiSessionService;
     private final ObjectMapper objectMapper;
+    private final LearningPlansService learningPlansService;
 
     private static final String ROLE_USER = "user";
     private static final String ROLE_ASSISTANT = "assistant";
@@ -176,14 +194,118 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             getOwnedSession(sessionId, userId);
         }
 
-        AiIntent intent = aiIntentClassifier.classify(message,pageContext);
+        AiSessions session = getOwnedSession(sessionId,userId);
+
+        if(session.getActiveWorkflowRunId() != null){
+            return streamContinueActiveWorkflow(
+                    message,
+                    pageContext,
+                    rawPageContextJson,
+                    userId,
+                    session
+            );
+        }
+
+        // 先用 LLM 分类意图，再决定是否起 Workflow——不在入口猜自然语言（分类后还有确定性兜底）
+        AiIntent intent = classifyWithFallback(message, pageContext);
+
+        // 优化文章意图（OPTIMIZE_ARTICLE_WORKFLOW，需页面带 articleId）→ 起优化 Workflow
+        if (isOptimizeArticleWorkflowIntent(intent, pageContext)
+                || looksLikeOptimizeArticleRequest(message, pageContext)) {
+            return streamArticleOptimizeWorkflowFromIntent(
+                    message,
+                    intent,
+                    pageContext,
+                    rawPageContextJson,
+                    userId,
+                    sessionId
+            );
+        }
+
+        // 创建文章意图（CREATE_ARTICLE_WORKFLOW 或兼容的 EDITOR_ACTION+fillArticle）→ 起 Workflow
+        if (isCreateArticleWorkflowIntent(intent)) {
+            return streamCreateArticleWorkflowFromIntent(
+                    message,
+                    intent,
+                    pageContext,
+                    rawPageContextJson,
+                    userId,
+                    sessionId
+            );
+        }
+
+        //学习难点攻坚：优先信任 LLM 语义分类，旧正则只在分类失败时兜底。
+        if (isLearningAssistIntent(intent) && hasUsableLearningConfidence(intent)) {
+            Optional<Flux<AiChatEventVO>> routed = routeLearningAssistWorkflow(
+                    message,
+                    intent.getLearningPlanRef(),
+                    pageContext,
+                    rawPageContextJson,
+                    userId,
+                    sessionId
+            );
+            if (routed.isPresent()) {
+                return routed.get();
+            }
+        }
+        if (shouldUseLegacyLearningFallback(intent) && looksLikeLearningDifficultyRequest(message)) {
+            Optional<Flux<AiChatEventVO>> routed = routeLearningAssistWorkflow(
+                    message,
+                    null,
+                    pageContext,
+                    rawPageContextJson,
+                    userId,
+                    sessionId
+            );
+            if (routed.isPresent()) {
+                return routed.get();
+            }
+        }
+
+        //学习进度调整：优先信任 LLM 语义分类，旧正则只在分类失败时兜底。
+        if (shouldRouteToLearningProgressWorkflow(intent, message)) {
+            Optional<Flux<AiChatEventVO>> routed = routeLearningProgressWorkflow(
+                    message,
+                    intent == null ? null : intent.getLearningPlanRef(),
+                    pageContext,
+                    rawPageContextJson,
+                    userId,
+                    sessionId
+            );
+            if (routed.isPresent()) {
+                return routed.get();
+            }
+            //没有 ACTIVE 计划时，沿用原有兜底：进入学习计划 Workflow 创建新计划。
+            return streamLearningPlanWorkflowFromIntent(
+                    message,
+                    intent,
+                    pageContext,
+                    rawPageContextJson,
+                    userId,
+                    sessionId
+            );
+        }
+
+        // 学习规划意图（LEARNING_PLAN 或确定性规则命中，查询句除外）→ 起学习规划 Workflow
+        if (shouldRouteToLearningPlanWorkflow(intent, message)) {
+            return streamLearningPlanWorkflowFromIntent(
+                    message,
+                    intent,
+                    pageContext,
+                    rawPageContextJson,
+                    userId,
+                    sessionId
+            );
+        }
+
+
         AiArticleActionCommand articleActionFromIntent = buildArticleActionFromIntent(intent, pageContext);
         String extraPromptContext = buildExtraPromptContextFromIntent(intent, pageContext);
         if (extraPromptContext == null || extraPromptContext.isBlank()) {
             extraPromptContext = buildArticleDetailContextFromIntent(intent, pageContext);
         }
-        
-        
+
+
         AiNavigateCommand navigateFromIntent = buildNavigateFromIntent(intent,pageContext);
         AiEditorCommand editorActionFromIntent = buildEditorActionFromIntent(intent,message);
 
@@ -216,7 +338,6 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         userMessage.setCreatedAt(LocalDateTime.now());
         save(userMessage);
 
-        AiSessions session = getOwnedSession(sessionId, userId);
         StringBuilder fullReply = new StringBuilder();
 
         AiChatEventVO paramEvent = AiChatEventVO.builder()
@@ -228,7 +349,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 .build();
 
         String requestId = UUID.randomUUID().toString();
-        Flux<AiChatEventVO> dataEvents = aiModelService.streamChat(prompt,requestId)
+        TokenUsageAccumulator usage = new TokenUsageAccumulator();
+        Flux<AiChatEventVO> dataEvents = aiModelService.streamChat(prompt,requestId,usage)
                 .doOnNext(fullReply::append)
                 .map(chunk -> AiChatEventVO.builder()
                         .eventType(AiChatEventType.DATA.getValue())
@@ -237,6 +359,11 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
 
         Mono<AiChatEventVO> stopEvent = Mono.fromSupplier(() -> {
             AiMessages assistantMessage = saveStreamAssistantMessage(sessionId,userId,rawPageContextJson, fullReply.toString());
+            //token 用量落库（含工具调用多轮累计）
+            if (usage.getTotalTokens() > 0) {
+                assistantMessage.setTokenCount((long) usage.getTotalTokens());
+                updateById(assistantMessage);
+            }
 
             // 异步提取候选记忆（规则预筛命中才写入，不会阻塞 SSE）
             aiMemoryCandidateExtractorService.extractAfterChat(
@@ -271,6 +398,10 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
 
             if (editorAction == null) {
                 editorAction = getEditorActionOrInfer(requestId, message);
+            }
+            // fillArticle 只能从 Workflow 的 editorAction 出来，普通聊天不允许直接填充文章
+            if (editorAction != null && "fillArticle".equals(editorAction.getType())) {
+                editorAction = null;
             }
             if(editorAction != null){
                 eventData.put("editorAction", editorAction);
@@ -312,15 +443,1210 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         })
                 ;
     }
+
+    /** 文章创作意图但没有明确主题 → 追问主题，不起 Workflow */
+    private Flux<AiChatEventVO> streamAskArticleTopic(
+            String message,
+            String rawPageContextJson,
+            Long userId,
+            Long sessionId
+    ) {
+        AiMessages userMessage = new AiMessages();
+        userMessage.setSessionId(sessionId);
+        userMessage.setRole(ROLE_USER);
+        userMessage.setContent(message);
+        userMessage.setPageContext(rawPageContextJson);
+        userMessage.setCreatedAt(LocalDateTime.now());
+        save(userMessage);
+
+        String reply = "可以，想写什么主题？\n比如 Redis 缓存、Kafka 消息队列、RAG 检索增强这些";
+
+        AiMessages assistantMessage = saveStreamAssistantMessage(
+                sessionId,
+                userId,
+                rawPageContextJson,
+                reply
+        );
+
+        AiSessions updatedSession = getOwnedSession(sessionId, userId);
+
+        AiChatEventVO paramEvent = AiChatEventVO.builder()
+                .eventType(AiChatEventType.PARAM.getValue())
+                .eventData(Map.of(
+                        "session", AiSessionVO.from(updatedSession),
+                        "userMessage", AiMessageVO.from(userMessage)
+                ))
+                .build();
+
+        Map<String, Object> eventData = new HashMap<>();
+        eventData.put("session", AiSessionVO.from(updatedSession));
+        eventData.put("assistantMessage", AiMessageVO.from(assistantMessage));
+        eventData.put("references", List.of());
+
+        AiChatEventVO stopEvent = AiChatEventVO.builder()
+                .eventType(AiChatEventType.STOP.getValue())
+                .eventData(eventData)
+                .build();
+
+        return Flux.just(paramEvent, stopEvent);
+    }
+
+    /** 从意图分类结果创建文章 Workflow，绑定到当前 session */
+    /** 统一入口判断：新意图 CREATE_ARTICLE_WORKFLOW，或历史兼容 EDITOR_ACTION + fillArticle */
+    private boolean isCreateArticleWorkflowIntent(AiIntent intent) {
+        if (intent == null) {
+            return false;
+        }
+        if ("CREATE_ARTICLE_WORKFLOW".equals(intent.getIntent())) {
+            return true;
+        }
+        return "EDITOR_ACTION".equals(intent.getIntent())
+                && "fillArticle".equals(intent.getActionType());
+    }
+
+    /** 优化文章意图：OPTIMIZE_ARTICLE_WORKFLOW，且页面上下文带有 articleId 才可进入 */
+    private boolean isOptimizeArticleWorkflowIntent(AiIntent intent, PageContextDTO pageContext) {
+        if (intent == null || !"OPTIMIZE_ARTICLE_WORKFLOW".equals(intent.getIntent())) {
+            return false;
+        }
+        return pageContext != null
+                && pageContext.getArticleId() != null
+                && !pageContext.getArticleId().isBlank();
+    }
+
+    /** 从意图分类结果创建文章优化 Workflow */
+    private Flux<AiChatEventVO> streamArticleOptimizeWorkflowFromIntent(
+            String message,
+            AiIntent intent,
+            PageContextDTO pageContext,
+            String rawPageContextJson,
+            Long userId,
+            Long sessionId
+    ) {
+        AiMessages userMessage = new AiMessages();
+        userMessage.setSessionId(sessionId);
+        userMessage.setRole(ROLE_USER);
+        userMessage.setContent(message);
+        userMessage.setPageContext(rawPageContextJson);
+        userMessage.setCreatedAt(LocalDateTime.now());
+        save(userMessage);
+
+        AiWorkflowOptimizeArticleDTO workflowDTO = new AiWorkflowOptimizeArticleDTO();
+        workflowDTO.setConversationId(sessionId);
+        workflowDTO.setArticleId(Long.valueOf(pageContext.getArticleId()));
+        workflowDTO.setInstruction(message);
+        workflowDTO.setPageContext(pageContext);
+
+        AiChatEventVO paramEvent = AiChatEventVO.builder()
+                .eventType(AiChatEventType.PARAM.getValue())
+                .eventData(Map.of(
+                        "session", AiSessionVO.from(getOwnedSession(sessionId, userId)),
+                        "userMessage", AiMessageVO.from(userMessage)
+                ))
+                .build();
+
+        Flux<AiChatEventVO> workflowEvents = Flux.create(sink ->
+                Schedulers.boundedElastic().schedule(() -> {
+                    UserContext.set(userId);
+                    try {
+                        AiWorkflowStepEmitter emitter = new AiWorkflowStepEmitter() {
+                            @Override
+                            public void emit(String step, String status, String stepMessage) {
+                                // 初次创建时 step 事件可以先不推给前端
+                            }
+
+                            @Override
+                            public void emitContent(String step, String field, String delta) {
+                                if ("optimizationPlan".equals(field) || "optimizedContent".equals(field)) {
+                                    sink.next(AiChatEventVO.builder()
+                                            .eventType(AiChatEventType.DATA.getValue())
+                                            .eventData(delta)
+                                            .build());
+                                }
+                            }
+                        };
+
+                        AiWorkflowRunVO workflow = aiWorkflowRunService.createArticleOptimizeWorkflow(workflowDTO, emitter);
+
+                        AiMessages assistantMessage = saveStreamAssistantMessage(
+                                sessionId,
+                                userId,
+                                rawPageContextJson,
+                                buildOptimizeWorkflowAssistantContent(workflow),
+                                Long.valueOf(workflow.getId())
+                        );
+
+                        AiSessions updatedSession = getOwnedSession(sessionId, userId);
+
+                        Map<String, Object> eventData = new HashMap<>();
+                        eventData.put("session", AiSessionVO.from(updatedSession));
+                        eventData.put("assistantMessage", AiMessageVO.from(assistantMessage));
+                        eventData.put("references", List.of());
+                        eventData.put("workflow", workflow);
+
+                        sink.next(AiChatEventVO.builder()
+                                .eventType(AiChatEventType.STOP.getValue())
+                                .eventData(eventData)
+                                .build());
+
+                        sink.complete();
+                    } catch (Throwable e) {
+                        emitRejectedOrError(sink, sessionId, userId, rawPageContextJson,
+                                AiWorkflowType.OPTIMIZE_ARTICLE.name(), e);
+                    } finally {
+                        UserContext.clear();
+                    }
+                })
+        );
+
+        return Flux.concat(Flux.just(paramEvent), workflowEvents);
+    }
+
+    private String buildOptimizeWorkflowAssistantContent(AiWorkflowRunVO workflow) {
+        Object contextValue = workflow == null ? null : workflow.getContext();
+        if (!(contextValue instanceof Map<?, ?> context)) {
+            return "已创建文章优化 Workflow，请先确认优化方案。";
+        }
+
+        Object stepResultsValue = context.get("stepResults");
+        if (!(stepResultsValue instanceof Map<?, ?> stepResults)) {
+            return "已创建文章优化 Workflow，请先确认优化方案。";
+        }
+
+        Object plan = stepResults.get("optimizationPlan");
+        if (plan == null || String.valueOf(plan).isBlank()) {
+            return "已创建文章优化 Workflow，请先确认优化方案。";
+        }
+
+        return "已创建文章优化 Workflow，请先确认下面的优化方案。\n\n" + plan;
+    }
+
+    /** 优化 Workflow 的可预期业务拒绝 → 返回友好的 AI 回复文案；非预期异常返回 null 交给 sink.error */
+    /**
+     * Workflow 入口统一异常收口：可预期业务拒绝 → 友好 AI 回复 + STOP 正常收尾；
+     * 真异常（无友好回复）→ 原样 sink.error。拒绝文案由各 Workflow Handler 的
+     * buildRejectedMessage 提供（业务规则归 Handler）。
+     */
+    private void emitRejectedOrError(
+            FluxSink<AiChatEventVO> sink,
+            Long sessionId,
+            Long userId,
+            String rawPageContextJson,
+            String workflowType,
+            Throwable e
+    ) {
+        String friendly = workflowHandlerRegistry.get(workflowType).buildRejectedMessage(e);
+        if (friendly == null) {
+            sink.error(e);
+            return;
+        }
+
+        AiMessages assistantMessage = saveStreamAssistantMessage(
+                sessionId,
+                userId,
+                rawPageContextJson,
+                friendly,
+                null
+        );
+
+        AiSessions updatedSession = getOwnedSession(sessionId, userId);
+
+        Map<String, Object> eventData = new HashMap<>();
+        eventData.put("session", AiSessionVO.from(updatedSession));
+        eventData.put("assistantMessage", AiMessageVO.from(assistantMessage));
+        eventData.put("references", List.of());
+
+        sink.next(AiChatEventVO.builder()
+                .eventType(AiChatEventType.STOP.getValue())
+                .eventData(eventData)
+                .build());
+
+        sink.complete();
+    }
+
+    /** 意图分类 + 确定性兜底：LLM 分类不稳定，明显的写文章请求即使分错也强制走 Workflow（内部还有需求分析/澄清） */
+    private AiIntent classifyWithFallback(String message, PageContextDTO pageContext) {
+        AiIntent intent = aiIntentClassifier.classify(message, pageContext);
+        //查询优先：询问/查看已有计划（"我有几个学习规划""学到哪了"）→ 强制普通聊天走查询 Tool。
+        // 即使分类器判成 LEARNING_PLAN 也纠正——查询句误进制定 Workflow 是答非所问的 CTA，代价远高于制定句误进普通聊天。
+        if (looksLikeLearningPlanQueryRequest(message)) {
+            log.info("查询排除命中：\"{}\" 放行普通聊天", message);
+            intent.setIntent("GENERAL_CHAT");
+            return intent;
+        }
+        if (!isCreateArticleWorkflowIntent(intent) && looksLikeCreateArticleRequest(message)) {
+            log.info("意图分类兜底命中：\"{}\" 强制走 CREATE_ARTICLE_WORKFLOW", message);
+            intent = buildCreateArticleWorkflowIntent(message);
+        }
+        //学习规划兜底：明确的规划请求即使分类出错也强制走 LearningPlanWorkflow
+        if (!isCreateArticleWorkflowIntent(intent)
+                && !isLearningPlanIntent(intent)
+                && !isLearningAssistIntent(intent)
+                && !isLearningProgressIntent(intent)
+                && !isLearningPlanQueryIntent(intent)
+                && looksLikeLearningPlanRequest(message)) {
+            log.info("意图分类兜底命中：\"{}\" 强制走 LEARNING_PLAN", message);
+            intent = buildLearningPlanWorkflowIntent();
+        }
+        return intent;
+    }
+
+    private boolean isLearningPlanIntent(AiIntent intent) {
+        return intent != null && "LEARNING_PLAN".equals(intent.getIntent());
+    }
+
+    private boolean isLearningAssistIntent(AiIntent intent) {
+        return intent != null && "LEARNING_ASSIST".equals(intent.getIntent());
+    }
+
+    private boolean isLearningProgressIntent(AiIntent intent) {
+        return intent != null && "LEARNING_PROGRESS".equals(intent.getIntent());
+    }
+
+    private boolean isLearningPlanQueryIntent(AiIntent intent) {
+        return intent != null && "LEARNING_PLAN_QUERY".equals(intent.getIntent());
+    }
+
+    private boolean hasUsableLearningConfidence(AiIntent intent) {
+        if (intent == null) {
+            return false;
+        }
+        Double confidence = intent.getConfidence();
+        return confidence == null || confidence >= 0.55;
+    }
+
+    private boolean shouldUseLegacyLearningFallback(AiIntent intent) {
+        return intent == null
+                || intent.getConfidence() == null
+                || intent.getConfidence() <= 0.0;
+    }
+
+    private Optional<Flux<AiChatEventVO>> routeLearningAssistWorkflow(
+            String message,
+            String learningPlanRef,
+            PageContextDTO pageContext,
+            String rawPageContextJson,
+            Long userId,
+            Long sessionId
+    ) {
+        List<LearningPlans> mentioned = resolveMentionedActivePlans(userId, learningPlanRef, message);
+        if (mentioned.size() == 1) {
+            return Optional.of(streamLearningAssistWorkflowFromIntent(
+                    message,
+                    mentioned.get(0),
+                    List.of(),
+                    pageContext,
+                    rawPageContextJson,
+                    userId,
+                    sessionId
+            ));
+        }
+
+        List<LearningPlans> actives = activeLearningPlans(userId);
+        if (actives.size() == 1) {
+            return Optional.of(streamLearningAssistWorkflowFromIntent(
+                    message,
+                    actives.get(0),
+                    List.of(),
+                    pageContext,
+                    rawPageContextJson,
+                    userId,
+                    sessionId
+            ));
+        }
+        if (actives.size() > 1) {
+            List<AiWorkflowLearningAssistDTO.Candidate> candidates = actives.stream()
+                    .map(plan -> new AiWorkflowLearningAssistDTO.Candidate(plan.getId(), plan.getTitle()))
+                    .toList();
+            return Optional.of(streamLearningAssistWorkflowFromIntent(
+                    message,
+                    null,
+                    candidates,
+                    pageContext,
+                    rawPageContextJson,
+                    userId,
+                    sessionId
+            ));
+        }
+
+        //没有 ACTIVE 计划时，攻坚请求继续走普通聊天，不自动创建新计划。
+        return Optional.empty();
+    }
+
+    private Optional<Flux<AiChatEventVO>> routeLearningProgressWorkflow(
+            String message,
+            String learningPlanRef,
+            PageContextDTO pageContext,
+            String rawPageContextJson,
+            Long userId,
+            Long sessionId
+    ) {
+        List<LearningPlans> mentioned = resolveMentionedActivePlans(userId, learningPlanRef, message);
+        if (mentioned.size() == 1) {
+            return Optional.of(streamLearningProgressWorkflowFromIntent(
+                    message,
+                    mentioned.get(0),
+                    List.of(),
+                    pageContext,
+                    rawPageContextJson,
+                    userId,
+                    sessionId
+            ));
+        }
+
+        List<LearningPlans> actives = activeLearningPlans(userId);
+        if (actives.size() == 1) {
+            return Optional.of(streamLearningProgressWorkflowFromIntent(
+                    message,
+                    actives.get(0),
+                    List.of(),
+                    pageContext,
+                    rawPageContextJson,
+                    userId,
+                    sessionId
+            ));
+        }
+        if (actives.size() > 1) {
+            List<AiWorkflowLearningProgressDTO.Candidate> candidates = actives.stream()
+                    .map(plan -> new AiWorkflowLearningProgressDTO.Candidate(plan.getId(), plan.getTitle()))
+                    .toList();
+            return Optional.of(streamLearningProgressWorkflowFromIntent(
+                    message,
+                    null,
+                    candidates,
+                    pageContext,
+                    rawPageContextJson,
+                    userId,
+                    sessionId
+            ));
+        }
+
+        //没有 ACTIVE 计划时，保留原行为：调用方继续走新建学习计划流程。
+        return Optional.empty();
+    }
+
+    private List<LearningPlans> resolveMentionedActivePlans(Long userId, String learningPlanRef, String message) {
+        String reference = learningPlanRef == null || learningPlanRef.isBlank()
+                ? message
+                : learningPlanRef;
+        List<LearningPlans> mentioned = learningPlansService.matchActivePlansByMessage(userId, reference);
+        if (mentioned.isEmpty() && !Objects.equals(reference, message)) {
+            return learningPlansService.matchActivePlansByMessage(userId, message);
+        }
+        return mentioned;
+    }
+
+    private List<LearningPlans> activeLearningPlans(Long userId) {
+        return learningPlansService.listByUser(userId).stream()
+                .filter(plan -> LearningPlans.STATUS_ACTIVE.equals(plan.getStatus()))
+                .toList();
+    }
+
+    //主路由学习规划分支的进入条件：分类器判 LEARNING_PLAN 或制定兜底命中，且不是查询句。
+    //查询句双保险——即使分类器/制定兜底误判，查询排除也能拦下（"你帮我看看我有几个学习规划"含"帮我+学"会命中制定兜底）。
+    private boolean shouldRouteToLearningPlanWorkflow(AiIntent intent, String message) {
+        return (isLearningPlanIntent(intent) || looksLikeLearningPlanRequest(message))
+                && !looksLikeLearningPlanQueryRequest(message);
+    }
+
+    private boolean shouldRouteToLearningProgressWorkflow(AiIntent intent, String message) {
+        return (isLearningProgressIntent(intent) && hasUsableLearningConfidence(intent))
+                || (shouldUseLegacyLearningFallback(intent) && looksLikeLearningProgressRequest(message));
+    }
+
+    //入口兜底：学习意图本身（想/要/帮我 + 学/入门/进阶 + 目标对象）即起 workflow。
+    //是否真正制定计划由 handler 追问确认（human-in-the-loop 兜底），入口只负责"意图不漏"。
+    //只保留"动词+对象"组合——纯名词命中（"学习规划"字样）会把查询句误伤，已删除，查询句由 looksLikeLearningPlanQueryRequest 放行。
+    //判断错了最多多问一轮（可接受），不追求规则全覆盖——那是打地鼠。
+    private boolean looksLikeLearningPlanRequest(String message) {
+        if (message == null || message.isBlank()) {
+            return false;
+        }
+        String text = message.trim();
+        return text.matches(".*(想|要|帮我|打算).{0,10}?(学|学习|入门|进阶|掌握).{1,30}.*");
+    }
+
+    //查询排除：询问/查看已有计划（查词/询问词 + 计划词，两种语序）→ 不进任何 Workflow。
+    //宁大勿小——查询句误进制定 Workflow 是答非所问的 CTA，代价远高于制定句误进普通聊天（LLM 还能直接答）。
+    private boolean looksLikeLearningPlanQueryRequest(String message) {
+        if (message == null || message.isBlank()) {
+            return false;
+        }
+        String text = message.trim();
+        return text.matches(".*(看看|查|有几个|有哪些|多少个|学到哪|进行到哪|做到哪|进度|计划是什么|都有什么).{0,12}(学习)?(计划|规划|路线|进度).*")
+                || text.matches(".*(我)?(的)?(学习)?(计划|规划|路线).{0,10}(学到哪|进行到哪|做到哪|怎么样|是什么|有哪些|几个).*");
+    }
+
+    private AiIntent buildLearningPlanWorkflowIntent() {
+        AiIntent intent = new AiIntent();
+        intent.setIntent("LEARNING_PLAN");
+        return intent;
+    }
+
+    private boolean looksLikeCreateArticleRequest(String message) {
+        if (message == null || message.isBlank()) {
+            return false;
+        }
+
+        if (containsAny(message, "优化", "改进", "润色", "重写", "完善", "提升", "修改")) {
+            return false;
+        }
+
+        String text = message.trim();
+        return text.matches(".*(帮我|给我|请|生成|写|创作).*(一篇|篇).*(文章|博客|博文|草稿|大纲).*")
+                || text.matches(".*(写一篇|生成一篇|创作一篇).*(文章|博客|博文).*");
+    }
+
+    private AiIntent buildCreateArticleWorkflowIntent(String message) {
+        AiIntent intent = new AiIntent();
+        intent.setIntent("CREATE_ARTICLE_WORKFLOW");
+        intent.setTopic(message);
+        return intent;
+    }
+
+    private Flux<AiChatEventVO> streamCreateArticleWorkflowFromIntent(
+            String message,
+            AiIntent intent,
+            PageContextDTO pageContext,
+            String rawPageContextJson,
+            Long userId,
+            Long sessionId
+    ) {
+        AiMessages userMessage = new AiMessages();
+        userMessage.setSessionId(sessionId);
+        userMessage.setRole(ROLE_USER);
+        userMessage.setContent(message);
+        userMessage.setPageContext(rawPageContextJson);
+        userMessage.setCreatedAt(LocalDateTime.now());
+        save(userMessage);
+
+        // requirement 只用原始 message：intent.topic / requirements 是 LLM 结构化输出，会幻觉。
+        // 主题是否明确交给 CreateArticleWorkflowHandler.isRequirementUnclear 确定性规则判断（LLM 判断意图，规则判断参数）
+        String requirement = message;
+
+        AiWorkflowCreateArticleDTO workflowDTO = new AiWorkflowCreateArticleDTO();
+        workflowDTO.setConversationId(sessionId);
+        workflowDTO.setRequirement(requirement);
+        workflowDTO.setPageContext(pageContext);
+
+        AiChatEventVO paramEvent = AiChatEventVO.builder()
+                .eventType(AiChatEventType.PARAM.getValue())
+                .eventData(Map.of(
+                        "session", AiSessionVO.from(getOwnedSession(sessionId, userId)),
+                        "userMessage", AiMessageVO.from(userMessage)
+                ))
+                .build();
+
+        Flux<AiChatEventVO> workflowEvents = Flux.create(sink ->
+                Schedulers.boundedElastic().schedule(() -> {
+                    UserContext.set(userId);
+                    try {
+                        AiWorkflowStepEmitter emitter = new AiWorkflowStepEmitter() {
+                            @Override
+                            public void emit(String step, String status, String stepMessage) {
+                                // 初次创建时 step 事件可以先不推给前端
+                            }
+
+                            @Override
+                            public void emitContent(String step, String field, String delta) {
+                                if ("outline".equals(field)) {
+                                    sink.next(AiChatEventVO.builder()
+                                            .eventType(AiChatEventType.DATA.getValue())
+                                            .eventData(delta)
+                                            .build());
+                                }
+                            }
+                        };
+
+                        // ServiceImpl 的 create 内部会绑定 session 的 activeWorkflowRunId
+                        AiWorkflowRunVO workflow = aiWorkflowRunService.createArticleWorkflow(workflowDTO, emitter);
+
+                        AiMessages assistantMessage = saveStreamAssistantMessage(
+                                sessionId,
+                                userId,
+                                rawPageContextJson,
+                                buildWorkflowAssistantContent(workflow),
+                                Long.valueOf(workflow.getId())
+                        );
+
+                        AiSessions updatedSession = getOwnedSession(sessionId, userId);
+
+                        Map<String, Object> eventData = new HashMap<>();
+                        eventData.put("session", AiSessionVO.from(updatedSession));
+                        eventData.put("assistantMessage", AiMessageVO.from(assistantMessage));
+                        eventData.put("references", List.of());
+                        eventData.put("workflow", workflow);
+
+                        sink.next(AiChatEventVO.builder()
+                                .eventType(AiChatEventType.STOP.getValue())
+                                .eventData(eventData)
+                                .build());
+
+                        sink.complete();
+                    } catch (Throwable e) {
+                        emitRejectedOrError(sink, sessionId, userId, rawPageContextJson,
+                                AiWorkflowType.CREATE_ARTICLE.name(), e);
+                    } finally {
+                        UserContext.clear();
+                    }
+                })
+        );
+
+        return Flux.concat(Flux.just(paramEvent), workflowEvents);
+    }
+
+    //学习规划 Workflow 创建入口：goal 只用原始 message（不信任 intent 结构化字段，topic 幻觉教训）
+    private Flux<AiChatEventVO> streamLearningPlanWorkflowFromIntent(
+            String message,
+            AiIntent intent,
+            PageContextDTO pageContext,
+            String rawPageContextJson,
+            Long userId,
+            Long sessionId
+    ) {
+        AiMessages userMessage = new AiMessages();
+        userMessage.setSessionId(sessionId);
+        userMessage.setRole(ROLE_USER);
+        userMessage.setContent(message);
+        userMessage.setPageContext(rawPageContextJson);
+        userMessage.setCreatedAt(LocalDateTime.now());
+        save(userMessage);
+
+        AiWorkflowLearningPlanDTO workflowDTO = new AiWorkflowLearningPlanDTO();
+        workflowDTO.setConversationId(sessionId);
+        workflowDTO.setGoal(message);
+
+        AiChatEventVO paramEvent = AiChatEventVO.builder()
+                .eventType(AiChatEventType.PARAM.getValue())
+                .eventData(Map.of(
+                        "session", AiSessionVO.from(getOwnedSession(sessionId, userId)),
+                        "userMessage", AiMessageVO.from(userMessage)
+                ))
+                .build();
+
+        Flux<AiChatEventVO> workflowEvents = Flux.create(sink ->
+                Schedulers.boundedElastic().schedule(() -> {
+                    UserContext.set(userId);
+                    try {
+                        AiWorkflowStepEmitter emitter = new AiWorkflowStepEmitter() {
+                            @Override
+                            public void emit(String step, String status, String stepMessage) {
+                                // 初次创建时 step 事件可以先不推给前端
+                            }
+
+                            @Override
+                            public void emitContent(String step, String field, String delta) {
+                                // 计划 JSON 不流式推前端，确认面板从 workflow 数据渲染
+                            }
+                        };
+
+                        // ServiceImpl 的 create 内部会绑定 session 的 activeWorkflowRunId
+                        AiWorkflowRunVO workflow = aiWorkflowRunService.createLearningPlanWorkflow(workflowDTO, emitter);
+
+                        AiMessages assistantMessage = saveStreamAssistantMessage(
+                                sessionId,
+                                userId,
+                                rawPageContextJson,
+                                buildLearningPlanAssistantContent(workflow),
+                                Long.valueOf(workflow.getId())
+                        );
+
+                        AiSessions updatedSession = getOwnedSession(sessionId, userId);
+
+                        Map<String, Object> eventData = new HashMap<>();
+                        eventData.put("session", AiSessionVO.from(updatedSession));
+                        eventData.put("assistantMessage", AiMessageVO.from(assistantMessage));
+                        eventData.put("references", List.of());
+                        eventData.put("workflow", workflow);
+
+                        sink.next(AiChatEventVO.builder()
+                                .eventType(AiChatEventType.STOP.getValue())
+                                .eventData(eventData)
+                                .build());
+
+                        sink.complete();
+                    } catch (Throwable e) {
+                        emitRejectedOrError(sink, sessionId, userId, rawPageContextJson,
+                                AiWorkflowType.LEARNING_PLAN.name(), e);
+                    } finally {
+                        UserContext.clear();
+                    }
+                })
+        );
+
+        return Flux.concat(Flux.just(paramEvent), workflowEvents);
+    }
+
+    //学习进度 Workflow 创建入口：planId 用入口查到的 ACTIVE 计划，request 只用原始 message（不信任 intent 结构化字段）
+    private Flux<AiChatEventVO> streamLearningProgressWorkflowFromIntent(
+            String message,
+            LearningPlans targetPlan,
+            List<AiWorkflowLearningProgressDTO.Candidate> candidates,
+            PageContextDTO pageContext,
+            String rawPageContextJson,
+            Long userId,
+            Long sessionId
+    ) {
+        AiMessages userMessage = new AiMessages();
+        userMessage.setSessionId(sessionId);
+        userMessage.setRole(ROLE_USER);
+        userMessage.setContent(message);
+        userMessage.setPageContext(rawPageContextJson);
+        userMessage.setCreatedAt(LocalDateTime.now());
+        save(userMessage);
+
+        AiWorkflowLearningProgressDTO workflowDTO = new AiWorkflowLearningProgressDTO();
+        workflowDTO.setConversationId(sessionId);
+        workflowDTO.setPlanId(targetPlan == null ? null : targetPlan.getId());
+        workflowDTO.setCandidates(candidates == null || candidates.isEmpty() ? null : candidates);
+        workflowDTO.setRequest(message);
+
+        AiChatEventVO paramEvent = AiChatEventVO.builder()
+                .eventType(AiChatEventType.PARAM.getValue())
+                .eventData(Map.of(
+                        "session", AiSessionVO.from(getOwnedSession(sessionId, userId)),
+                        "userMessage", AiMessageVO.from(userMessage)
+                ))
+                .build();
+
+        Flux<AiChatEventVO> workflowEvents = Flux.create(sink ->
+                Schedulers.boundedElastic().schedule(() -> {
+                    UserContext.set(userId);
+                    try {
+                        AiWorkflowStepEmitter emitter = new AiWorkflowStepEmitter() {
+                            @Override
+                            public void emit(String step, String status, String stepMessage) {
+                                // 初次创建时 step 事件可以先不推给前端
+                            }
+
+                            @Override
+                            public void emitContent(String step, String field, String delta) {
+                                // 计划 JSON 不流式推前端，确认面板从 workflow 数据渲染
+                            }
+                        };
+
+                        // ServiceImpl 的 create 内部会绑定 session 的 activeWorkflowRunId
+                        AiWorkflowRunVO workflow = aiWorkflowRunService.createLearningProgressWorkflow(workflowDTO, emitter);
+
+                        AiMessages assistantMessage = saveStreamAssistantMessage(
+                                sessionId,
+                                userId,
+                                rawPageContextJson,
+                                buildLearningProgressAssistantContent(workflow),
+                                Long.valueOf(workflow.getId())
+                        );
+
+                        AiSessions updatedSession = getOwnedSession(sessionId, userId);
+
+                        Map<String, Object> eventData = new HashMap<>();
+                        eventData.put("session", AiSessionVO.from(updatedSession));
+                        eventData.put("assistantMessage", AiMessageVO.from(assistantMessage));
+                        eventData.put("references", List.of());
+                        eventData.put("workflow", workflow);
+
+                        sink.next(AiChatEventVO.builder()
+                                .eventType(AiChatEventType.STOP.getValue())
+                                .eventData(eventData)
+                                .build());
+
+                        sink.complete();
+                    } catch (Throwable e) {
+                        emitRejectedOrError(sink, sessionId, userId, rawPageContextJson,
+                                AiWorkflowType.LEARNING_PROGRESS.name(), e);
+                    } finally {
+                        UserContext.clear();
+                    }
+                })
+        );
+
+        return Flux.concat(Flux.just(paramEvent), workflowEvents);
+    }
+
+    //入口兜底：调整类动词 + 计划/进度/阶段/任务关键词 → 学习进度 Workflow 候选。
+    //是否真走 PROGRESS 还要有 ACTIVE 计划（findLatestActivePlan），没有则退回 LEARNING_PLAN 新建。
+    //判断错了最多多问一轮或新建一个计划（可接受），不追求规则全覆盖。
+    private boolean looksLikeLearningProgressRequest(String message) {
+        if (message == null || message.isBlank()) {
+            return false;
+        }
+        String text = message.trim();
+        return text.matches(".*(调整|改一下|改改|修改|更新|重新|重排|压缩|加快|延长|缩短|去掉|删掉|加点|加个|换个).{0,12}(学习)?(计划|进度|阶段|任务|安排|节奏).*")
+                || text.matches(".*(调整|修改|更新|重新|压缩|加快|缩短).{0,8}(学习|学).*");
+    }
+
+    //难点攻坚兜底：难度词 + 计划类名词，双向语序（"Redis 计划看不懂" / "看不懂计划里的缓存击穿"）。
+    // 判断错了最多多问一轮或不进 Workflow（普通聊天照样能讲解该难点），不追求规则全覆盖。
+    private boolean looksLikeLearningDifficultyRequest(String message) {
+        if (message == null || message.isBlank()) {
+            return false;
+        }
+        String text = message.trim();
+        String difficulty = "(卡住|卡壳|不会|看不懂|看不太懂|没看懂|好难|太难|很难|不理解|不明白|弄不明白|总是忘|总忘|记不住|学不会|学不明白|搞不懂)";
+        String planWord = "(计划|规划|任务|阶段|进度)";
+        return text.matches(".*" + planWord + ".{0,12}?" + difficulty + ".*")
+                || text.matches(".*" + difficulty + ".{0,12}?" + planWord + ".*");
+    }
+
+    //学习难点攻坚 Workflow 创建入口：planId 用入口查到的 ACTIVE 计划，request 只用原始 message（不信任 intent 结构化字段）
+    private Flux<AiChatEventVO> streamLearningAssistWorkflowFromIntent(
+            String message,
+            LearningPlans targetPlan,
+            List<AiWorkflowLearningAssistDTO.Candidate> candidates,
+            PageContextDTO pageContext,
+            String rawPageContextJson,
+            Long userId,
+            Long sessionId
+    ) {
+        AiMessages userMessage = new AiMessages();
+        userMessage.setSessionId(sessionId);
+        userMessage.setRole(ROLE_USER);
+        userMessage.setContent(message);
+        userMessage.setPageContext(rawPageContextJson);
+        userMessage.setCreatedAt(LocalDateTime.now());
+        save(userMessage);
+
+        AiWorkflowLearningAssistDTO workflowDTO = new AiWorkflowLearningAssistDTO();
+        workflowDTO.setConversationId(sessionId);
+        workflowDTO.setPlanId(targetPlan == null ? null : targetPlan.getId());
+        workflowDTO.setCandidates(candidates == null || candidates.isEmpty() ? null : candidates);
+        workflowDTO.setRequest(message);
+
+        AiChatEventVO paramEvent = AiChatEventVO.builder()
+                .eventType(AiChatEventType.PARAM.getValue())
+                .eventData(Map.of(
+                        "session", AiSessionVO.from(getOwnedSession(sessionId, userId)),
+                        "userMessage", AiMessageVO.from(userMessage)
+                ))
+                .build();
+
+        Flux<AiChatEventVO> workflowEvents = Flux.create(sink ->
+                Schedulers.boundedElastic().schedule(() -> {
+                    UserContext.set(userId);
+                    try {
+                        AiWorkflowStepEmitter emitter = new AiWorkflowStepEmitter() {
+                            @Override
+                            public void emit(String step, String status, String stepMessage) {
+                                // 初次创建时 step 事件可以先不推给前端
+                            }
+
+                            @Override
+                            public void emitContent(String step, String field, String delta) {
+                                // 拆解 JSON 不流式推前端，确认面板从 workflow 数据渲染
+                            }
+                        };
+
+                        // ServiceImpl 的 create 内部会绑定 session 的 activeWorkflowRunId
+                        AiWorkflowRunVO workflow = aiWorkflowRunService.createLearningAssistWorkflow(workflowDTO, emitter);
+
+                        AiMessages assistantMessage = saveStreamAssistantMessage(
+                                sessionId,
+                                userId,
+                                rawPageContextJson,
+                                buildLearningAssistAssistantContent(workflow),
+                                Long.valueOf(workflow.getId())
+                        );
+
+                        AiSessions updatedSession = getOwnedSession(sessionId, userId);
+
+                        Map<String, Object> eventData = new HashMap<>();
+                        eventData.put("session", AiSessionVO.from(updatedSession));
+                        eventData.put("assistantMessage", AiMessageVO.from(assistantMessage));
+                        eventData.put("references", List.of());
+                        eventData.put("workflow", workflow);
+
+                        sink.next(AiChatEventVO.builder()
+                                .eventType(AiChatEventType.STOP.getValue())
+                                .eventData(eventData)
+                                .build());
+
+                        sink.complete();
+                    } catch (Throwable e) {
+                        emitRejectedOrError(sink, sessionId, userId, rawPageContextJson,
+                                AiWorkflowType.LEARNING_ASSIST.name(), e);
+                    } finally {
+                        UserContext.clear();
+                    }
+                })
+        );
+
+        return Flux.concat(Flux.just(paramEvent), workflowEvents);
+    }
+
+    //学习进度 CTA：调整诉求不清时给"已加载计划 + 进度 + 怎么调整"引导；其他情况引导确认面板
+    private String buildLearningProgressAssistantContent(AiWorkflowRunVO workflow) {
+        Object contextValue = workflow == null ? null : workflow.getContext();
+        if (!(contextValue instanceof Map<?, ?> context)) {
+            return "已创建学习进度 Workflow，请在下方面板确认调整后的学习计划。";
+        }
+        Object confirmation = context.get("confirmation");
+        if (confirmation instanceof Map<?, ?> c && "REQUIREMENT".equals(String.valueOf(c.get("type")))) {
+            StringBuilder content = new StringBuilder();
+            Object oldPlanObj = context.get("oldPlan");
+            if (!(oldPlanObj instanceof Map<?, ?>)) {
+                //选计划阶段（候选歧义，尚未加载计划）→ 直接显示候选列表问题
+                Object question = c.get("question");
+                if (question != null && !String.valueOf(question).isBlank()) {
+                    return String.valueOf(question);
+                }
+                content.append("已加载你当前的学习计划。");
+            } else if (oldPlanObj instanceof Map<?, ?> oldPlan) {
+                Object title = oldPlan.get("title");
+                if (title != null && !String.valueOf(title).isBlank()) {
+                    content.append("已加载你当前的学习计划《").append(title).append("》");
+                } else {
+                    content.append("已加载你当前的学习计划");
+                }
+                int done = 0;
+                int total = 0;
+                if (oldPlan.get("stages") instanceof List<?> stages) {
+                    for (Object s : stages) {
+                        if (!(s instanceof Map<?, ?> stage) || !(stage.get("tasks") instanceof List<?> tasks)) {
+                            continue;
+                        }
+                        for (Object t : tasks) {
+                            if (t instanceof Map<?, ?> task) {
+                                total++;
+                                if (Boolean.TRUE.equals(task.get("done"))) {
+                                    done++;
+                                }
+                            }
+                        }
+                    }
+                }
+                content.append("（已完成 ").append(done).append("/").append(total).append(" 项）。");
+            } else {
+                content.append("已加载你当前的学习计划。");
+            }
+            content.append("告诉我具体想怎么调整——比如：加个新阶段、压缩整体周期、替换某些任务，")
+                    .append("我会基于当前进度重新排一版计划。");
+            return content.toString();
+        }
+        return "已创建学习进度 Workflow，请在下方面板确认调整后的学习计划。";
+    }
+
+    //攻坚助手消息：选计划/选阶段 → 显示候选列表问题；生成完成 → 讲解 + 任务点数引导确认面板
+    private String buildLearningAssistAssistantContent(AiWorkflowRunVO workflow) {
+        Object contextValue = workflow == null ? null : workflow.getContext();
+        if (!(contextValue instanceof Map<?, ?> context)) {
+            return "已创建难点攻坚 Workflow，请在下方面板确认拆解出的任务点。";
+        }
+        Object confirmation = context.get("confirmation");
+        if (confirmation instanceof Map<?, ?> c && "REQUIREMENT".equals(String.valueOf(c.get("type")))) {
+            //选计划/选阶段候选列表问题直接展示（说明文字在卡片 question 里）
+            Object question = c.get("question");
+            if (question != null && !String.valueOf(question).isBlank()) {
+                return String.valueOf(question);
+            }
+            return "你想攻克哪个阶段？请回复序号或阶段名。";
+        }
+        //生成完成：讲解随消息留存 + 引导确认面板
+        Object stepResultsObj = context.get("stepResults");
+        if (stepResultsObj instanceof Map<?, ?> stepResults && stepResults.get("plan") instanceof Map<?, ?> plan) {
+            StringBuilder content = new StringBuilder();
+            Object explanation = plan.get("explanation");
+            if (explanation != null && !String.valueOf(explanation).isBlank()) {
+                content.append(explanation).append("\n\n");
+            }
+            int taskCount = 0;
+            if (plan.get("stages") instanceof List<?> stages) {
+                for (Object s : stages) {
+                    if (s instanceof Map<?, ?> stage && stage.get("tasks") instanceof List<?> tasks) {
+                        taskCount += tasks.size();
+                    }
+                }
+            }
+            content.append("已拆解为 ").append(taskCount).append(" 个任务点，请在下方面板确认。");
+            return content.toString();
+        }
+        return "已创建难点攻坚 Workflow，请在下方面板确认拆解出的任务点。";
+    }
+
+    //弱模式 CTA：先给入门建议模板 + 站内引用，结尾抛钩子；其他情况引导确认面板
+    private String buildLearningPlanAssistantContent(AiWorkflowRunVO workflow) {
+        Object contextValue = workflow == null ? null : workflow.getContext();
+        if (!(contextValue instanceof Map<?, ?> context)) {
+            return "已创建学习规划 Workflow，请在下方面板确认生成的学习计划。";
+        }
+        Object confirmation = context.get("confirmation");
+        if (confirmation instanceof Map<?, ?> c && "REQUIREMENT".equals(String.valueOf(c.get("type")))) {
+            StringBuilder content = new StringBuilder();
+            content.append("想系统学一门技术，一般建议按“基础 → 进阶 → 实践”三步走：")
+                    .append("先吃透核心概念和原理，再深入源码与底层机制，最后用项目练手巩固。");
+
+            Object ragObj = context.get("ragContext");
+            if (ragObj instanceof Map<?, ?> rag
+                    && rag.get("references") instanceof List<?> refs
+                    && !refs.isEmpty()) {
+                content.append("\n\n站内还有 ").append(refs.size())
+                        .append(" 篇相关文章，制定计划时我会把它们作为学习材料。");
+            }
+
+            content.append("\n\n如果你愿意，我可以帮你制定一份详细的学习计划——")
+                    .append("顺便告诉我：你现在的基础怎么样？计划学多久？");
+            return content.toString();
+        }
+        return "已创建学习规划 Workflow，请在下方面板确认生成的学习计划。";
+    }
+
+    private String buildWorkflowAssistantContent(AiWorkflowRunVO workflow) {
+        Object contextValue = workflow == null ? null : workflow.getContext();
+        if (!(contextValue instanceof Map<?, ?> context)) {
+            return "已创建文章创作 Workflow，请先确认生成方案。";
+        }
+
+        @SuppressWarnings("unchecked")
+        String outline = workflowContextSupport.getResultString(
+                (Map<String, Object>) (Object) context, "outline");
+        if (outline.isBlank()) {
+            return "已创建文章创作 Workflow，请先确认生成方案。";
+        }
+
+        return "已创建文章创作 Workflow，请先确认下面的大纲。\n\n" + outline;
+    }
+
+    /** 会话有 active workflow 时，优先把用户输入交给 Workflow 处理 */
+    private Flux<AiChatEventVO> streamContinueActiveWorkflow(
+            String message,
+            PageContextDTO pageContext,
+            String rawPageContextJson,
+            Long userId,
+            AiSessions session
+    ) {
+        Long sessionId = session.getId();
+        Long workflowRunId = session.getActiveWorkflowRunId();
+
+        AiMessages userMessage = new AiMessages();
+        userMessage.setSessionId(sessionId);
+        userMessage.setRole(ROLE_USER);
+        userMessage.setContent(message);
+        userMessage.setPageContext(rawPageContextJson);
+        userMessage.setCreatedAt(LocalDateTime.now());
+        save(userMessage);
+
+        // 查 workflow
+        AiWorkflowRunVO workflow;
+        try {
+            workflow = aiWorkflowRunService.getWorkflowRun(workflowRunId);
+        } catch (Exception e) {
+            // Workflow 不存在或无权访问 → 清空绑定，回普通聊天
+            clearSessionActiveWorkflow(session);
+            return fallbackToNormalChatAfterWorkflowGone(
+                    message, pageContext, rawPageContextJson, userId, sessionId, userMessage);
+        }
+
+        if (workflow == null) {
+            clearSessionActiveWorkflow(session);
+            return fallbackToNormalChatAfterWorkflowGone(
+                    message, pageContext, rawPageContextJson, userId, sessionId, userMessage);
+        }
+
+        AiWorkflowStatus status;
+        try {
+            status = AiWorkflowStatus.valueOf(workflow.getStatus());
+        } catch (Exception e) {
+            clearSessionActiveWorkflow(session);
+            return fallbackToNormalChatAfterWorkflowGone(
+                    message, pageContext, rawPageContextJson, userId, sessionId, userMessage);
+        }
+
+        // 已结束的状态 → 清空绑定，回普通聊天
+        if (status == AiWorkflowStatus.COMPLETED
+                || status == AiWorkflowStatus.CANCELLED
+                || status == AiWorkflowStatus.FAILED) {
+            clearSessionActiveWorkflow(session);
+            return fallbackToNormalChatAfterWorkflowGone(
+                    message, pageContext, rawPageContextJson, userId, sessionId, userMessage);
+        }
+
+        // WAITING_REQUIREMENT_CONFIRM：用户输入当作补充需求，走 reject 流程
+        if (status == AiWorkflowStatus.WAITING_REQUIREMENT_CONFIRM) {
+            try {
+                workflow = aiWorkflowRunService.reject(workflowRunId, message);
+            } catch (Exception e) {
+                log.warn("Workflow 补充需求失败: workflowRunId={}, error={}", workflowRunId, e.getMessage());
+                // 失败不阻塞，返回当前 workflow 状态让用户看到错误
+            }
+            return buildWorkflowStopFlux(sessionId, userId, rawPageContextJson, userMessage, workflow);
+        }
+
+        // WAITING_PLAN_CONFIRM / WAITING_OUTLINE_CONFIRM / WAITING_DRAFT_CONFIRM / WAITING_FILL_CONFIRM
+        // 这些状态下的确认操作应走前端 approve/reject 按钮，普通输入提示用户
+        if (status == AiWorkflowStatus.WAITING_PLAN_CONFIRM
+                || status == AiWorkflowStatus.WAITING_OUTLINE_CONFIRM
+                || status == AiWorkflowStatus.WAITING_DRAFT_CONFIRM
+                || status == AiWorkflowStatus.WAITING_FILL_CONFIRM) {
+            AiMessages assistantMessage = saveStreamAssistantMessage(
+                    sessionId, userId, rawPageContextJson,
+                    "当前 Workflow 正在等待确认，请使用底部的按钮操作。"
+                            + "\n- 同意：继续下一步"
+                            + "\n- 不同意：输入修改意见后发送",
+                    workflowRunId
+            );
+            return buildSimpleStopFlux(sessionId, userId, userMessage, assistantMessage, workflow);
+        }
+
+        // RUNNING / PAUSED 等：静默返回当前 workflow 状态
+        return buildWorkflowStopFlux(sessionId, userId, rawPageContextJson, userMessage, workflow);
+    }
+
+    /** Workflow 已结束或不存在时，清空绑定并回退到普通聊天 */
+    private Flux<AiChatEventVO> fallbackToNormalChatAfterWorkflowGone(
+            String message,
+            PageContextDTO pageContext,
+            String rawPageContextJson,
+            Long userId,
+            Long sessionId,
+            AiMessages userMessage
+    ) {
+        AiIntent intent = classifyWithFallback(message, pageContext);
+
+        // 重新检查是否需要起新 Workflow：主题必须能从原文证明（确定性规则，不信任 classifier 的 topic）
+        if (isCreateArticleWorkflowIntent(intent)
+                && !createArticleWorkflowHandler.isRequirementUnclear(message)) {
+            // 删除已保存的 userMessage（新 Workflow 方法会重新保存）
+            removeById(userMessage.getId());
+            return streamCreateArticleWorkflowFromIntent(
+                    message, intent, pageContext, rawPageContextJson, userId, sessionId);
+        }
+
+        // 否则走普通 SSE 聊天（复用流式逻辑，但 userMessage 已经保存了）
+        AiPrompt prompt = aiPromptService.buildPrompt(message, pageContext, sessionId);
+
+        // 和主聊天路径对齐：非详情页问答时检索站内文章
+        ArticleRagSearchResult ragSearchResult = isArticleDetailQa(intent)
+                ? null
+                : articleRagSearchService.search(message, intent);
+        List<ArticleRagContext> ragContexts = ragSearchResult == null
+                ? List.of()
+                : ragSearchResult.contexts();
+        if (ragSearchResult != null) {
+            appendRagContextToPrompt(prompt, ragContexts);
+        }
+
+        StringBuilder fullReply = new StringBuilder();
+
+        AiSessions updatedSession = getOwnedSession(sessionId, userId);
+
+        AiChatEventVO paramEvent = AiChatEventVO.builder()
+                .eventType(AiChatEventType.PARAM.getValue())
+                .eventData(Map.of(
+                        "session", AiSessionVO.from(updatedSession),
+                        "userMessage", AiMessageVO.from(userMessage)
+                ))
+                .build();
+
+        String requestId = UUID.randomUUID().toString();
+        TokenUsageAccumulator usage = new TokenUsageAccumulator();
+        Flux<AiChatEventVO> dataEvents = aiModelService.streamChat(prompt, requestId, usage)
+                .doOnNext(fullReply::append)
+                .map(chunk -> AiChatEventVO.builder()
+                        .eventType(AiChatEventType.DATA.getValue())
+                        .eventData(chunk)
+                        .build());
+
+        Mono<AiChatEventVO> stopEvent = Mono.fromSupplier(() -> {
+            AiMessages assistantMessage = saveStreamAssistantMessage(
+                    sessionId, userId, rawPageContextJson, fullReply.toString());
+            //token 用量落库（含工具调用多轮累计）
+            if (usage.getTotalTokens() > 0) {
+                assistantMessage.setTokenCount((long) usage.getTotalTokens());
+                updateById(assistantMessage);
+            }
+
+            AiSessions updated = getOwnedSession(sessionId, userId);
+
+            Map<String, Object> eventData = new HashMap<>();
+            eventData.put("session", AiSessionVO.from(updated));
+            eventData.put("assistantMessage", AiMessageVO.from(assistantMessage));
+            eventData.put("references", toRagReferences(ragContexts));
+
+            return AiChatEventVO.builder()
+                    .eventType(AiChatEventType.STOP.getValue())
+                    .eventData(eventData)
+                    .build();
+        });
+
+        return Flux.concat(
+                Flux.just(paramEvent),
+                dataEvents,
+                stopEvent
+        ).doFinally(signalType -> aiToolActionRegistry.clear(requestId));
+    }
+
+    /** 构建带 workflow 的 STOP Flux（无流式内容） */
+    private Flux<AiChatEventVO> buildWorkflowStopFlux(
+            Long sessionId, Long userId, String rawPageContextJson,
+            AiMessages userMessage, AiWorkflowRunVO workflow
+    ) {
+        AiMessages assistantMessage = saveStreamAssistantMessage(
+                sessionId, userId, rawPageContextJson,
+                buildWorkflowAssistantContent(workflow),
+                workflow == null ? null : Long.valueOf(workflow.getId()));
+
+        return buildSimpleStopFlux(sessionId, userId, userMessage, assistantMessage, workflow);
+    }
+
+    /** 构建简单 STOP Flux（带 assistantMessage 和可选的 workflow） */
+    private Flux<AiChatEventVO> buildSimpleStopFlux(
+            Long sessionId, Long userId,
+            AiMessages userMessage, AiMessages assistantMessage,
+            AiWorkflowRunVO workflow
+    ) {
+        AiSessions updatedSession = getOwnedSession(sessionId, userId);
+
+        AiChatEventVO paramEvent = AiChatEventVO.builder()
+                .eventType(AiChatEventType.PARAM.getValue())
+                .eventData(Map.of(
+                        "session", AiSessionVO.from(updatedSession),
+                        "userMessage", AiMessageVO.from(userMessage)
+                ))
+                .build();
+
+        Map<String, Object> eventData = new HashMap<>();
+        eventData.put("session", AiSessionVO.from(updatedSession));
+        eventData.put("assistantMessage", AiMessageVO.from(assistantMessage));
+        eventData.put("references", List.of());
+        if (workflow != null) {
+            eventData.put("workflow", workflow);
+        }
+
+        AiChatEventVO stopEvent = AiChatEventVO.builder()
+                .eventType(AiChatEventType.STOP.getValue())
+                .eventData(eventData)
+                .build();
+
+        return Flux.just(paramEvent, stopEvent);
+    }
+
+    /** 清空 session 的 activeWorkflowRunId */
+    private void clearSessionActiveWorkflow(AiSessions session) {
+        if (session.getActiveWorkflowRunId() == null) {
+            return;
+        }
+        session.setActiveWorkflowRunId(null);
+    }
+
     //保存停止生成的内容
     private AiMessages saveStreamAssistantMessage(
             Long sessionId,
             Long userId,
             String rawPageContextJson,
             String content
+    ) {
+        return saveStreamAssistantMessage(sessionId, userId, rawPageContextJson, content, null);
+    }
+    private AiMessages saveStreamAssistantMessage(
+            Long sessionId,
+            Long userId,
+            String rawPageContextJson,
+            String content,
+            Long workflowRunId
     ){
         AiMessages assistantMessage = new AiMessages();
         assistantMessage.setSessionId(sessionId);
+        if (workflowRunId != null) {
+            assistantMessage.setWorkflowRunId(String.valueOf(workflowRunId));
+        }
         assistantMessage.setRole(ROLE_ASSISTANT);
         assistantMessage.setContent(content);
         assistantMessage.setPageContext(rawPageContextJson);
@@ -355,7 +1681,43 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         userMessage.setContent(message);
         userMessage.setCreatedAt(LocalDateTime.now());
 
-        AiIntent intent = aiIntentClassifier.classify(message, pageContext);
+        // 先用 LLM 分类意图（游客同样先分类再决定，带确定性兜底）
+        AiIntent intent = classifyWithFallback(message, pageContext);
+
+        // 创建文章意图 → 有主题提示登录，没主题追问
+        if (isCreateArticleWorkflowIntent(intent)) {
+            AiMessageVO assistantMessage = new AiMessageVO();
+            assistantMessage.setId("guest-ai-" + System.currentTimeMillis());
+            assistantMessage.setSessionId("guest");
+            assistantMessage.setRole("assistant");
+            // 主题必须能从原文证明（确定性规则，不信任 classifier 的 topic）
+            if (!createArticleWorkflowHandler.isRequirementUnclear(message)) {
+                assistantMessage.setContent("文章创作 Workflow 需要登录后使用，请先登录后再试。");
+            } else {
+                assistantMessage.setContent("可以，想写什么主题？\n比如 Redis 缓存、Kafka 消息队列、RAG 检索增强这些");
+            }
+            assistantMessage.setCreatedAt(LocalDateTime.now());
+
+            Map<String, Object> eventData = new HashMap<>();
+            eventData.put("session", guestSession);
+            eventData.put("assistantMessage", assistantMessage);
+            eventData.put("references", List.of());
+
+            return Flux.just(
+                    AiChatEventVO.builder()
+                            .eventType(AiChatEventType.PARAM.getValue())
+                            .eventData(Map.of(
+                                    "session", guestSession,
+                                    "userMessage", userMessage
+                            ))
+                            .build(),
+                    AiChatEventVO.builder()
+                            .eventType(AiChatEventType.STOP.getValue())
+                            .eventData(eventData)
+                            .build()
+            );
+        }
+
         AiArticleActionCommand articleActionFromIntent = buildArticleActionFromIntent(intent, pageContext);
         String extraPromptContext = buildExtraPromptContextFromIntent(intent, pageContext);
         if (extraPromptContext == null || extraPromptContext.isBlank()) {
@@ -395,7 +1757,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 .build();
 
         String requestId = UUID.randomUUID().toString();
-        Flux<AiChatEventVO> dataEvents = aiModelService.streamChat(prompt,requestId)
+        Flux<AiChatEventVO> dataEvents = aiModelService.streamChat(prompt,requestId,new TokenUsageAccumulator())
                 .doOnNext(fullReply::append)
                 .map(chunk -> AiChatEventVO.builder()
                         .eventType(AiChatEventType.DATA.getValue())
@@ -433,6 +1795,10 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             AiEditorCommand editorAction = editorActionFromIntent;
             if (editorAction == null) {
                 editorAction = getEditorActionOrInfer(requestId, message);
+            }
+            // fillArticle 只能从 Workflow 的 editorAction 出来，普通聊天不允许直接填充文章
+            if (editorAction != null && "fillArticle".equals(editorAction.getType())) {
+                editorAction = null;
             }
             if(editorAction != null){
                 eventData.put("editorAction", editorAction);
@@ -968,6 +2334,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
     }
 
     @Override
+    @Transactional
     public void deleteMessage(Long sessionId, Long messageId) {
         Long userId = UserContext.get();
         if (userId == null) {
@@ -990,6 +2357,63 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             throw new IllegalArgumentException("消息不属于该会话");
         }
 
+        // 实体里 workflowRunId 是 String（雪花 ID 前端精度约定），库里是 BIGINT
+        Long workflowRunId = message.getWorkflowRunId() == null
+                ? null
+                : Long.valueOf(message.getWorkflowRunId());
+
         removeById(messageId);
+
+        if (workflowRunId != null) {
+            cleanupWorkflowIfNoMessageReferences(session, workflowRunId);
+        }
+    }
+
+    /** 删除消息后联动清理：若 Workflow 已无消息引用且已结束，连带删除 step log 和 run */
+    private void cleanupWorkflowIfNoMessageReferences(AiSessions session, Long workflowRunId) {
+        Long refCount = lambdaQuery()
+                .eq(AiMessages::getWorkflowRunId, workflowRunId)
+                .count();
+
+        if (refCount != null && refCount > 0) {
+            return;
+        }
+
+        AiWorkflowRun run = aiWorkflowRunMapper.selectById(workflowRunId);
+        if (run == null) {
+            return;
+        }
+
+        // 严格模式：只允许删除已结束 Workflow 的消息，进行中必须走取消流程
+        if (!isFinishedWorkflowStatus(run.getStatus())) {
+            throw new IllegalArgumentException("Workflow 正在进行中，请先取消后再删除消息");
+        }
+
+        aiWorkflowStepLogMapper.delete(new LambdaQueryWrapper<AiWorkflowStepLog>()
+                .eq(AiWorkflowStepLog::getWorkflowRunId, workflowRunId));
+
+        aiWorkflowRunMapper.deleteById(workflowRunId);
+    }
+
+    private boolean isFinishedWorkflowStatus(String status) {
+        return AiWorkflowStatus.COMPLETED.name().equals(status)
+                || AiWorkflowStatus.CANCELLED.name().equals(status)
+                || AiWorkflowStatus.FAILED.name().equals(status);
+    }
+
+    //加一个确定性优化兜底
+    private boolean looksLikeOptimizeArticleRequest(String message, PageContextDTO pageContext) {
+        if (message == null || message.isBlank()) {
+            return false;
+        }
+        if (pageContext == null
+                || pageContext.getArticleId() == null
+                || pageContext.getArticleId().isBlank()) {
+            return false;
+        }
+
+        String text = message.trim();
+        return text.matches(".*(优化|改进|润色|重写|完善|提升|修改).*(这篇|当前|这篇文章|文章).*")
+                || text.matches(".*(帮我|请|可以).*(优化|改进|润色|重写|完善|提升|修改).*");
     }
 }

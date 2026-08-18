@@ -5,11 +5,15 @@ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hailin.blogsystem.entity.AiMessages;
 import com.hailin.blogsystem.entity.AiSessions;
+import com.hailin.blogsystem.entity.AiWorkflowRun;
+import com.hailin.blogsystem.entity.AiWorkflowStepLog;
 import com.hailin.blogsystem.entity.dto.AiCreateSessionDTO;
 import com.hailin.blogsystem.entity.vo.AiSessionVO;
 import com.hailin.blogsystem.entity.vo.PageVO;
 import com.hailin.blogsystem.mapper.AiMessageMapper;
 import com.hailin.blogsystem.mapper.AiSessionMapper;
+import com.hailin.blogsystem.mapper.AiWorkflowRunMapper;
+import com.hailin.blogsystem.mapper.AiWorkflowStepLogMapper;
 import com.hailin.blogsystem.service.AiSessionService;
 import com.hailin.blogsystem.utils.UserContext;
 import lombok.RequiredArgsConstructor;
@@ -18,6 +22,9 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Objects;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
@@ -25,6 +32,8 @@ public class AiSessionServiceImpl extends ServiceImpl<AiSessionMapper, AiSession
 implements AiSessionService {
 
     private final AiMessageMapper aiMessageMapper;
+    private final AiWorkflowRunMapper aiWorkflowRunMapper;
+    private final AiWorkflowStepLogMapper aiWorkflowStepLogMapper;
     private static final String DEFAULT_TITLE = "新对话";
 
     @Override  //1.新建会话
@@ -83,19 +92,45 @@ implements AiSessionService {
         Long userId = UserContext.get();
         Long sessionId = Long.valueOf(id);
 
-        boolean exists = lambdaQuery()
+        AiSessions session = lambdaQuery()
                 .eq(AiSessions::getId, sessionId)
                 .eq(AiSessions::getUserId, userId)
-                .exists();
+                .one();
 
-        if(exists == false){
+        if (session == null) {
             throw new IllegalArgumentException("该会话不存在");
         }
 
-        aiMessageMapper.delete(new LambdaQueryWrapper<AiMessages>()
-                .eq(AiMessages::getSessionId,sessionId));
-        removeById(sessionId);
+        List<AiMessages> sessionMessages = aiMessageMapper.selectList(
+                new LambdaQueryWrapper<AiMessages>()
+                        .eq(AiMessages::getSessionId, sessionId)
+        );
 
+        // 先收集消息引用的 workflow_run_id，再删消息，否则 run 会残留
+        Set<Long> workflowRunIds = sessionMessages.stream()
+                .map(AiMessages::getWorkflowRunId)
+                .filter(Objects::nonNull)
+                .map(Long::valueOf)
+                .collect(Collectors.toSet());
+
+        if (session.getActiveWorkflowRunId() != null) {
+            workflowRunIds.add(session.getActiveWorkflowRunId());
+        }
+
+        aiMessageMapper.delete(new LambdaQueryWrapper<AiMessages>()
+                .eq(AiMessages::getSessionId, sessionId));
+
+        if (!workflowRunIds.isEmpty()) {
+            aiWorkflowStepLogMapper.delete(new LambdaQueryWrapper<AiWorkflowStepLog>()
+                    .in(AiWorkflowStepLog::getWorkflowRunId, workflowRunIds));
+
+            aiWorkflowRunMapper.delete(new LambdaQueryWrapper<AiWorkflowRun>()
+                    .eq(AiWorkflowRun::getUserId, userId)
+                    .eq(AiWorkflowRun::getConversationId, sessionId)
+                    .in(AiWorkflowRun::getId, workflowRunIds));
+        }
+
+        removeById(sessionId);
     }
 
 }

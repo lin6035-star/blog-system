@@ -14,6 +14,7 @@ public class AiMessages {
     private Long id;  //消息ID
 
     private Long sessionId;  //会话ID
+    private String workflowRunId;
     private String role;  //角色
     private String content;  //消息内容
     private String pageContext;  //页面上下文

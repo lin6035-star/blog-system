@@ -12,11 +12,16 @@ public class AiSessionVO {
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
 
+    private String activeWorkflowRunId;
+
 
     public static AiSessionVO from(AiSessions aiSessions) {
         AiSessionVO aiSessionVO = new AiSessionVO();
         aiSessionVO.setId(String.valueOf(aiSessions.getId()));
         aiSessionVO.setTitle(aiSessions.getTitle());
+        if (aiSessions.getActiveWorkflowRunId() != null) {
+            aiSessionVO.setActiveWorkflowRunId(String.valueOf(aiSessions.getActiveWorkflowRunId()));
+        }
         aiSessionVO.setCreatedAt(aiSessions.getCreatedAt());
         aiSessionVO.setUpdatedAt(aiSessions.getUpdatedAt());
         return aiSessionVO;

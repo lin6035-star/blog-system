@@ -15,5 +15,6 @@ public class AiEditorCommand {
     private String categoryName;
     private String summary;
     private String content;
+    private Long articleId;
 
 }

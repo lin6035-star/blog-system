@@ -12,7 +12,7 @@ import java.time.LocalDateTime;
 @TableName("users")
 public class Users {
 
-    @TableId( type = IdType.AUTO)
+    @TableId( type = IdType.ASSIGN_ID)
     private Long id;
     private String username;  //用户名
     private String passwordHash;  //密码哈希

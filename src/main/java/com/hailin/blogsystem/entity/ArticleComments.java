@@ -12,7 +12,7 @@ import java.time.LocalDateTime;
 @Data
 @TableName("article_comments")
 public class ArticleComments {
-    @TableId(type = IdType.AUTO)
+    @TableId(type = IdType.ASSIGN_ID)
     private Long id;
     private Long articleId;
     private Long userId;

@@ -11,7 +11,7 @@ import java.time.LocalDateTime;
 @TableName("user_follows")
 public class UserFollows {
 
-    @TableId( type = IdType.AUTO)
+    @TableId(type = IdType.ASSIGN_ID)
     private Long id;
     private Long followerId;  //关注者的id
     private Long followingId;  //被关注者id
