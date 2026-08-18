@@ -28,11 +28,21 @@ public class BlogAiProperties {
     }
 
     @Data
-    public static class Rag{
+    public static class Rag {
         private int topK = 3;
         private double similarityThreshold = 0.65;
         private Async async = new Async();
         private Rebuild rebuild = new Rebuild();
+        private Rerank rerank = new Rerank();
+    }
+
+    @Data
+    public static class Rerank {
+        private boolean enabled = true;
+        private String model = "gte-rerank-v2";
+        private String workspaceId;
+        private int topN = 5;
+        private int maxDocuments = 30;
     }
 
     @Data

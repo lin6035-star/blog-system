@@ -92,6 +92,12 @@ blog:
         queue-capacity: 30
         thread-name-prefix: memory-extract-
     rag:
+      rerank:
+        enabled: true
+        model: gte-rerank-v2
+        workspace-id: ${ALIYUN_WORKSPACE_ID:}
+        top-n: 5
+        max-documents: 30
       top-k: 3
       similarity-threshold: 0.65
       enabled: true
