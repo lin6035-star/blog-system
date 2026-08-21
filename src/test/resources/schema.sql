@@ -261,3 +261,52 @@ CREATE TABLE IF NOT EXISTS learning_stages (
     updated_at TIMESTAMP NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_learning_stages_plan ON learning_stages(plan_id, order_num);
+
+CREATE TABLE IF NOT EXISTS ai_episodic_memories (
+                                                    id BIGINT PRIMARY KEY,
+                                                    user_id BIGINT NOT NULL,
+                                                    session_id BIGINT,
+                                                    project_key VARCHAR(64) NOT NULL DEFAULT '01myBlog',
+    memory_type VARCHAR(32) NOT NULL,
+    title VARCHAR(120) NOT NULL,
+    content CLOB NOT NULL,
+    importance INT NOT NULL DEFAULT 6,
+    confidence DECIMAL(3,2) NOT NULL DEFAULT 0.80,
+    source_message_ids CLOB,
+    content_hash VARCHAR(64) NOT NULL,
+    occurred_at TIMESTAMP NOT NULL,
+    last_retrieved_at TIMESTAMP,
+    retrieval_count INT NOT NULL DEFAULT 0,
+    created_at TIMESTAMP,
+    updated_at TIMESTAMP,
+    CONSTRAINT uk_episodic_user_project_hash UNIQUE (user_id, project_key, content_hash)
+    );
+
+CREATE INDEX IF NOT EXISTS idx_episodic_user_project_time
+    ON ai_episodic_memories (user_id, project_key, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_episodic_user_type
+    ON ai_episodic_memories (user_id, memory_type);
+CREATE INDEX IF NOT EXISTS idx_episodic_importance
+    ON ai_episodic_memories (user_id, project_key, importance);
+
+
+CREATE TABLE IF NOT EXISTS ai_conversation_summaries (
+                                                         id BIGINT PRIMARY KEY,
+                                                         user_id BIGINT NOT NULL,
+                                                         session_id BIGINT NOT NULL,
+                                                         summary CLOB NOT NULL,
+                                                         summary_json CLOB,
+                                                         covered_until_message_id BIGINT,
+                                                         covered_message_count INT NOT NULL DEFAULT 0,
+                                                         version INT NOT NULL DEFAULT 1,
+                                                         last_compressed_at TIMESTAMP,
+                                                         compressing BOOLEAN NOT NULL DEFAULT FALSE,
+                                                         created_at TIMESTAMP NOT NULL,
+                                                         updated_at TIMESTAMP NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_ai_conversation_summary_session
+    ON ai_conversation_summaries (session_id);
+
+CREATE INDEX IF NOT EXISTS idx_ai_conversation_summary_user_session
+    ON ai_conversation_summaries (user_id, session_id);

@@ -33,4 +33,22 @@ public class MemoryExtractionAsyncConfig {
 
         return executor;
     }
+
+    /**
+     * 会话压缩专用线程池。
+     * 与记忆提取分开：stopEvent 里三个异步任务（语义提取 / 情景提取 / 压缩）共用小池会被 LLM 调用阻塞排队，
+     * 压缩可能延迟十几秒才启动，前端轮询抓不到"压缩中"状态。独立池保证压缩尽快执行。
+     */
+    @Bean("conversationSummaryExecutor")
+    public Executor conversationSummaryExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(1);
+        executor.setMaxPoolSize(1);
+        executor.setQueueCapacity(50);
+        executor.setThreadNamePrefix("summary-compress-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        executor.initialize();
+
+        return executor;
+    }
 }

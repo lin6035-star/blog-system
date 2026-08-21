@@ -4,6 +4,7 @@ import com.hailin.blogsystem.ai.rag.ArticleRagSearchService;
 import com.hailin.blogsystem.entity.dto.AiIntent;
 import com.hailin.blogsystem.entity.dto.ArticleRagContext;
 import com.hailin.blogsystem.entity.dto.ArticleRagSearchResult;
+import com.hailin.blogsystem.service.AiEpisodicMemoryService;
 import com.hailin.blogsystem.service.AiUserMemoryService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
@@ -23,18 +24,35 @@ public class WorkflowKnowledgeSupport {
 
     private final AiUserMemoryService aiUserMemoryService;
     private final ArticleRagSearchService articleRagSearchService;
+    private final AiEpisodicMemoryService aiEpisodicMemoryService;
 
     //记忆检索失败兜底空串
     public String retrieveMemoryContext(Long userId, String requirement) {
         if (userId == null) {
             return "";
         }
+
+        StringBuilder sb = new StringBuilder();
+
         try {
             String memoryPrompt = aiUserMemoryService.buildMemoryPrompt(userId, requirement);
-            return memoryPrompt == null ? "" : memoryPrompt;
+            if (memoryPrompt != null && !memoryPrompt.isBlank()) {
+                sb.append(memoryPrompt).append("\n\n---\n\n");
+            }
         } catch (Exception e) {
-            return "";
+            // 记忆检索失败不阻断 Workflow
         }
+
+        try {
+            String episodicPrompt = aiEpisodicMemoryService.buildEpisodicPrompt(userId, requirement);
+            if (episodicPrompt != null && !episodicPrompt.isBlank()) {
+                sb.append(episodicPrompt).append("\n\n---\n\n");
+            }
+        } catch (Exception e) {
+            // 情景记忆检索失败不阻断 Workflow
+        }
+
+        return sb.toString().trim();
     }
 
     //RAG 检索失败兜底空列表，不阻断流程

@@ -135,6 +135,10 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 这类请求不需要用户在编辑器页面。
                                 如果缺少 articleId，输出 GENERAL_CHAT。
                                 不要在意图识别阶段生成优化方案。
+                                
+                                当用户说自己在做博客项目、文章项目、Agent 项目，并咨询技术方案、架构选型、实现方式时，输出 GENERAL_CHAT。
+                                 不要因为问题中出现“博客”“文章”“RAG”就输出 ARTICLE_SEARCH。
+                                 只有用户明确要求“找文章 / 搜博客 / 推荐站内文章 / 有没有相关文章”时，才输出 ARTICLE_SEARCH。
 
                                 输出格式：
                                 {"intent":"GENERAL_CHAT","confidence":0.98,"learningPlanRef":null,"learningStageRef":null,"actionType":null,"articleId":null,"userId":null,"content":null,"target":null,"param":null,"topic":null,"categoryName":null,"requirements":null}

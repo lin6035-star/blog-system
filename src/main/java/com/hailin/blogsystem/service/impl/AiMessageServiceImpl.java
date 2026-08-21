@@ -65,6 +65,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
     private final CreateArticleWorkflowHandler createArticleWorkflowHandler;
     private final WorkflowContextSupport workflowContextSupport;
     private final WorkflowHandlerRegistry workflowHandlerRegistry;
+    private final AiEpisodicMemoryExtractorService aiEpisodicMemoryExtractorService;
+    private final AiConversationSummaryService aiConversationSummaryService;
 
     private final AiSessionService aiSessionService;
     private final ObjectMapper objectMapper;
@@ -311,6 +313,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
 
         // 拼完整 prompt（含历史记忆 + 页面上下文 + 当前问题）
         AiPrompt prompt = aiPromptService.buildPrompt(message, pageContext, sessionId);
+        prompt.setArticleToolsEnabled(shouldEnableArticleTools(intent));
         appendExtraPromptContext(prompt,extraPromptContext);  //将第一次模型回复的拼进prompt
 
         String actionResultPromptContext = buildActionResultPromptContext(navigateFromIntent);
@@ -373,6 +376,19 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                     message,
                     fullReply.toString()
             );
+
+            // 异步提取情景记忆：记录重要事件、决策、里程碑和计划，不阻塞 SSE
+            aiEpisodicMemoryExtractorService.extractAfterChat(
+                    userId,
+                    sessionId,
+                    userMessage.getId(),
+                    assistantMessage.getId(),
+                    message,
+                    fullReply.toString()
+            );
+
+            //会话压缩
+            aiConversationSummaryService.compressAfterChat(userId, sessionId);
 
             AiSessions updatedSession = getOwnedSession(sessionId, userId);
 
@@ -1511,6 +1527,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
 
         // 否则走普通 SSE 聊天（复用流式逻辑，但 userMessage 已经保存了）
         AiPrompt prompt = aiPromptService.buildPrompt(message, pageContext, sessionId);
+        prompt.setArticleToolsEnabled(shouldEnableArticleTools(intent));
 
         // 和主聊天路径对齐：非详情页问答时检索站内文章
         ArticleRagSearchResult ragSearchResult = isArticleDetailQa(intent)
@@ -1729,6 +1746,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
 
         // 拼 prompt（游客无 sessionId，跳过历史记忆）
         AiPrompt prompt = aiPromptService.buildPrompt(message, pageContext, null);
+        prompt.setArticleToolsEnabled(shouldEnableArticleTools(intent));
         appendExtraPromptContext(prompt, extraPromptContext);
 
         String actionResultPromptContext = buildActionResultPromptContext(navigateFromIntent);
@@ -2216,7 +2234,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
 
     //在当前文章详情页回答问题时，不走全站RAG
     private boolean isArticleDetailQa(AiIntent intent){
-        return intent != null && "ARTICLEDETAIL_QA".equals(intent.getIntent());
+        return intent != null && "ARTICLE_DETAIL_QA".equals(intent.getIntent());
     }
     private String resolveArticleIdFromIntent(AiIntent intent,PageContextDTO pageContext){
         String articleId = intent == null ? null : intent.getArticleId();
@@ -2416,4 +2434,13 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         return text.matches(".*(优化|改进|润色|重写|完善|提升|修改).*(这篇|当前|这篇文章|文章).*")
                 || text.matches(".*(帮我|请|可以).*(优化|改进|润色|重写|完善|提升|修改).*");
     }
+
+    private boolean shouldEnableArticleTools(AiIntent intent) {
+        if (intent == null || intent.getIntent() == null) {
+            return false;
+        }
+        return "ARTICLE_SEARCH".equals(intent.getIntent())
+                || "ARTICLE_DETAIL_QA".equals(intent.getIntent());
+    }
+
 }

@@ -3,6 +3,7 @@ package com.hailin.blogsystem.controller;
 import com.hailin.blogsystem.entity.dto.AiChatDTO;
 import com.hailin.blogsystem.entity.dto.AiCreateSessionDTO;
 import com.hailin.blogsystem.entity.vo.*;
+import com.hailin.blogsystem.service.AiConversationSummaryService;
 import com.hailin.blogsystem.service.AiMessageService;
 import com.hailin.blogsystem.service.AiSessionService;
 import com.hailin.blogsystem.utils.Result;
@@ -20,6 +21,7 @@ public class AiController {
 
     private final AiSessionService aiSessionService;
     private final AiMessageService aiMessageService;
+    private final AiConversationSummaryService aiConversationSummaryService;
 
     @PostMapping("/conversations")  //1.新建会话
     public Result<AiSessionVO> buildNewSession(@RequestBody(required = false) AiCreateSessionDTO aiCreateSessionDTO){
@@ -64,6 +66,12 @@ public class AiController {
     public Result<Void> deleteMessage(@PathVariable Long sessionId, @PathVariable Long messageId) {
         aiMessageService.deleteMessage(sessionId, messageId);
         return Result.success();
+    }
+
+    // 会话压缩状态：前端据此显示"正在自动压缩上下文 / 已自动压缩上下文"
+    @GetMapping("/conversations/{sessionId}/summary-status")
+    public Result<AiConversationSummaryStatusVO> getSummaryStatus(@PathVariable Long sessionId) {
+        return Result.success(aiConversationSummaryService.getSummaryStatus(sessionId));
     }
 
 }

@@ -57,32 +57,6 @@ public class AiModelServiceImpl implements AiModelService {
         this.aiNavigationToolsFactory = aiNavigationToolsFactory;
     }
 
-    // 【已废弃】非流式接口，前端已全面切到流式，暂时注释，后续删除
-    // @Override
-    // public String chat(AiPrompt prompt,String requestId) {
-    //     try {
-    //         AiNavigationTools aiNavigationTools = aiNavigationToolsFactory.create(requestId);
-    //         AiEditorTools aiEditorTools = aiEditorToolFactory.create(requestId);
-    //         AiArticleActionTools aiArticleActionTools = aiArticleActionToolsFactory.create(requestId);
-    //
-    //
-    //         String content = chatClient.prompt()
-    //                 .user(prompt.getFinalPromptContext())
-    //                 .tools(aiArticleTools,aiNavigationTools,aiEditorTools,aiArticleActionTools,aiUserProfileTools)
-    //                 .call()
-    //                 .content();
-    //
-    //         if (content == null || content.isBlank()) {
-    //             return "抱歉，AI 暂时没有返回有效内容，请稍后再试。";
-    //         }
-    //
-    //         return content;
-    //
-    //     } catch (Exception e) {
-    //         log.error("AI 模型调用失败", e);
-    //         return fallbackMessage(e);
-    //     }
-    // }
 
     @Override
     public Flux<String> streamChat(AiPrompt prompt,String requestId,TokenUsageAccumulator usageAccumulator) {
@@ -97,9 +71,16 @@ public class AiModelServiceImpl implements AiModelService {
         // 在这里（请求线程）读一次 userId，通过 ToolContext 显式传给工具；重跑路径复用同一份。
         Map<String, Object> toolContext = buildToolContext();
 
+        Object[] tools = buildTools(
+                prompt,
+                aiNavigationTools,
+                aiEditorTools,
+                aiArticleActionTools
+        );
+
         return chatClient.prompt()
                 .user(prompt.getFinalPromptContext())
-                .tools(aiArticleTools,aiNavigationTools,aiEditorTools,aiArticleActionTools,aiUserProfileTools,aiLearningPlanTools)
+                .tools(tools)
                 .toolCallbacks(queryLearningPlansTool)
                 .toolContext(toolContext)
                 .options(OpenAiChatOptions.builder()
@@ -148,9 +129,17 @@ public class AiModelServiceImpl implements AiModelService {
         AiEditorTools aiEditorTools = aiEditorToolFactory.create(requestId);
         AiArticleActionTools aiArticleActionTools = aiArticleActionToolsFactory.create(requestId);
         try {
+
+            Object[] tools = buildTools(
+                    prompt,
+                    aiNavigationTools,
+                    aiEditorTools,
+                    aiArticleActionTools
+            );
+
             ChatResponse response = chatClient.prompt()
                     .user(prompt.getFinalPromptContext())
-                    .tools(aiArticleTools,aiNavigationTools,aiEditorTools,aiArticleActionTools,aiUserProfileTools,aiLearningPlanTools)
+                    .tools(tools)
                     .toolCallbacks(queryLearningPlansTool)
                     .toolContext(toolContext)
                     .call()
@@ -194,6 +183,34 @@ public class AiModelServiceImpl implements AiModelService {
 
         return "抱歉，AI 服务暂时不可用，请稍后再试。";
     }
+
+
+    private Object[] buildTools(
+            AiPrompt prompt,
+            AiNavigationTools aiNavigationTools,
+            AiEditorTools aiEditorTools,
+            AiArticleActionTools aiArticleActionTools
+    ) {
+        if (prompt != null && prompt.isArticleToolsEnabled()) {
+            return new Object[]{
+                    aiArticleTools,
+                    aiNavigationTools,
+                    aiEditorTools,
+                    aiArticleActionTools,
+                    aiUserProfileTools,
+                    aiLearningPlanTools
+            };
+        }
+
+        return new Object[]{
+                aiNavigationTools,
+                aiEditorTools,
+                aiArticleActionTools,
+                aiUserProfileTools,
+                aiLearningPlanTools
+        };
+    }
+
 
     /*
     * RAG 检索

@@ -14,6 +14,7 @@ import com.hailin.blogsystem.mapper.AiMessageMapper;
 import com.hailin.blogsystem.mapper.AiSessionMapper;
 import com.hailin.blogsystem.mapper.AiWorkflowRunMapper;
 import com.hailin.blogsystem.mapper.AiWorkflowStepLogMapper;
+import com.hailin.blogsystem.service.AiConversationSummaryService;
 import com.hailin.blogsystem.service.AiSessionService;
 import com.hailin.blogsystem.utils.UserContext;
 import lombok.RequiredArgsConstructor;
@@ -34,6 +35,7 @@ implements AiSessionService {
     private final AiMessageMapper aiMessageMapper;
     private final AiWorkflowRunMapper aiWorkflowRunMapper;
     private final AiWorkflowStepLogMapper aiWorkflowStepLogMapper;
+    private final AiConversationSummaryService aiConversationSummaryService;
     private static final String DEFAULT_TITLE = "新对话";
 
     @Override  //1.新建会话
@@ -100,6 +102,9 @@ implements AiSessionService {
         if (session == null) {
             throw new IllegalArgumentException("该会话不存在");
         }
+
+        // 删消息前先删该会话的压缩摘要，避免孤儿数据
+        aiConversationSummaryService.deleteBySession(userId, sessionId);
 
         List<AiMessages> sessionMessages = aiMessageMapper.selectList(
                 new LambdaQueryWrapper<AiMessages>()

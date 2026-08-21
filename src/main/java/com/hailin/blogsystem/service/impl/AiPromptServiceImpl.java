@@ -4,9 +4,7 @@ import com.hailin.blogsystem.config.BlogAiProperties;
 import com.hailin.blogsystem.entity.AiMessages;
 import com.hailin.blogsystem.entity.AiPrompt;
 import com.hailin.blogsystem.entity.dto.PageContextDTO;
-import com.hailin.blogsystem.service.AiConversationMemoryService;
-import com.hailin.blogsystem.service.AiPromptService;
-import com.hailin.blogsystem.service.AiUserMemoryService;
+import com.hailin.blogsystem.service.*;
 import com.hailin.blogsystem.utils.UserContext;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
@@ -22,6 +20,10 @@ public class AiPromptServiceImpl implements AiPromptService {
     private BlogAiProperties blogAiProperties;
     @Autowired
     private AiUserMemoryService aiUserMemoryService;
+    @Autowired
+    private AiEpisodicMemoryService aiEpisodicMemoryService;
+    @Autowired
+    private AiConversationSummaryService aiConversationSummaryService;
 
     @Override
     public AiPrompt buildPrompt(String userMessage, PageContextDTO pageContext, Long sessionId) {
@@ -30,11 +32,22 @@ public class AiPromptServiceImpl implements AiPromptService {
         // ① 拼对话历史（登录用户 + 有 sessionId + memory 开关开启）
         Long userId = UserContext.get();
         BlogAiProperties.Memory memoryConfig = blogAiProperties.getMemory();
-        //拿到 userId 和 memoryConfig 后，先插入长期记忆
+        //拿到 userId 和 memoryConfig 后，先插入该会话压缩，长期记忆
+        if (userId != null && sessionId != null && memoryConfig.isEnabled()) {
+            String conversationSummaryPrompt = aiConversationSummaryService.buildSummaryPrompt(userId, sessionId);
+            if (conversationSummaryPrompt != null && !conversationSummaryPrompt.isBlank()) {
+                sb.append(conversationSummaryPrompt).append("\n\n---\n\n");
+            }
+        }
         if (userId != null && memoryConfig.isEnabled()) {
             String longTermMemoryPrompt = aiUserMemoryService.buildMemoryPrompt(userId,userMessage);
             if (longTermMemoryPrompt != null && !longTermMemoryPrompt.isBlank()) {
                 sb.append(longTermMemoryPrompt).append("\n\n---\n\n");
+            }
+
+            String episodicMemoryPrompt = aiEpisodicMemoryService.buildEpisodicPrompt(userId,userMessage);
+            if(episodicMemoryPrompt != null && !episodicMemoryPrompt.isBlank()){
+                sb.append(episodicMemoryPrompt).append("\n\n---\n\n");
             }
         }
 

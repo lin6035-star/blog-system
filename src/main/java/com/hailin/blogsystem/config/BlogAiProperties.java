@@ -9,6 +9,7 @@ import java.util.List;
 @ConfigurationProperties(prefix = "blog.ai")
 public class BlogAiProperties {
     private String systemPrompt;
+    private String projectKey = "global";
     private Memory memory = new Memory();
     private Rag rag = new Rag();
 

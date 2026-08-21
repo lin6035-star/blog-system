@@ -14,4 +14,10 @@ public class AiPrompt {
     private String finalPromptContext;
     //原始用户消息
     private String userMessage;
+
+    /**
+     * 是否允许本轮调用站内文章工具。
+     * 普通技术咨询不要暴露文章搜索工具，避免模型搜不到文章后错误道歉。
+     */
+    private boolean articleToolsEnabled;
 }
