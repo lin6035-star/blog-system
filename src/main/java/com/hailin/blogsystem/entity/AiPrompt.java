@@ -20,4 +20,8 @@ public class AiPrompt {
      * 普通技术咨询不要暴露文章搜索工具，避免模型搜不到文章后错误道歉。
      */
     private boolean articleToolsEnabled;
+
+    private boolean learningDashboardToolEnabled;
+    private Long sessionId;
+
 }

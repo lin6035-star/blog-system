@@ -2,6 +2,7 @@ package com.hailin.blogsystem.config;
 
 import com.hailin.blogsystem.interceptor.JwtInterceptor;
 import com.hailin.blogsystem.interceptor.OptionalJwtInterceptor;
+import com.hailin.blogsystem.security.AiRateLimitInterceptor;
 import lombok.RequiredArgsConstructor;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.web.servlet.config.annotation.InterceptorRegistry;
@@ -16,6 +17,7 @@ public class WebMvcConfig implements WebMvcConfigurer {
 
     private final JwtInterceptor jwtInterceptor;
     private final OptionalJwtInterceptor optionalJwtInterceptor;
+    private final AiRateLimitInterceptor aiRateLimitInterceptor;
 
     @Override
     public void addInterceptors(InterceptorRegistry registry) {
@@ -52,5 +54,14 @@ public class WebMvcConfig implements WebMvcConfigurer {
                 .excludePathPatterns("/api/comments/*/replies",
                                      // "/api/ai/chat",  // 【已废弃】非流式接口
                                      "/api/ai/chat/stream");
+
+        // AI 限流：只拦会消耗 LLM / ES 的请求（chat stream / workflow 创建与推进 / rag search）
+        // 必须排在 jwt 拦截器之后，才能拿到 UserContext 的 userId
+        registry.addInterceptor(aiRateLimitInterceptor)
+                .addPathPatterns(
+                        "/api/ai/chat/stream",
+                        "/api/ai/workflows/**",
+                        "/api/ai/rag/articles/search"
+                );
     }
 }

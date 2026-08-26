@@ -6,6 +6,7 @@ import com.hailin.blogsystem.entity.AiWorkflowRun;
 import com.hailin.blogsystem.entity.AiWorkflowStepLog;
 import com.hailin.blogsystem.entity.LearningPlans;
 import com.hailin.blogsystem.entity.LearningStages;
+import com.hailin.blogsystem.ai.workflow.AiWorkflowStepEmitter;
 import com.hailin.blogsystem.entity.dto.AiWorkflowLearningPlanDTO;
 import com.hailin.blogsystem.entity.dto.AiWorkflowStatus;
 import com.hailin.blogsystem.entity.vo.AiWorkflowRunVO;
@@ -230,5 +231,58 @@ class LearningPlanWorkflowServiceTests {
 
         AiSessions cleared = aiSessionMapper.selectById(session.getId());
         assertThat(cleared.getActiveWorkflowRunId()).isNull();
+    }
+
+    //7. Agent 自动拉起：contextJson 带 agentAutoStarted 标记
+    @Test
+    void agentStartedWorkflowStoresAutoStartMarker() {
+        UserContext.set(TEST_USER);
+        AiSessions session = createTestSession();
+
+        AiWorkflowRunVO created =
+                aiWorkflowRunService.createLearningPlanWorkflow(
+                        dto(session, "我想学Redis"),
+                        AiWorkflowStepEmitter.noop(),
+                        true
+                );
+
+        assertThat(contextOf(created).get("agentAutoStarted"))
+                .isEqualTo(true);
+    }
+
+    //8. 普通创建：不带 agentAutoStarted 标记
+    @Test
+    void normalWorkflowDoesNotStoreAutoStartMarker() {
+        UserContext.set(TEST_USER);
+        AiSessions session = createTestSession();
+
+        AiWorkflowRunVO created =
+                aiWorkflowRunService.createLearningPlanWorkflow(
+                        dto(session, "我想学Redis")
+                );
+
+        assertThat(contextOf(created))
+                .doesNotContainKey("agentAutoStarted");
+    }
+
+    //9. 自动拉起 + requestId：contextJson 同时落 agentAutoStarted 和 requestId
+    @Test
+    void agentRequestIdIsStoredInWorkflowContext() {
+        UserContext.set(TEST_USER);
+        AiSessions session = createTestSession();
+
+        AiWorkflowRunVO created =
+                aiWorkflowRunService.createLearningPlanWorkflow(
+                        dto(session, "我想学Redis"),
+                        AiWorkflowStepEmitter.noop(),
+                        true,
+                        "req-learning-001"
+                );
+
+        assertThat(contextOf(created))
+                .containsEntry("agentAutoStarted", true);
+
+        assertThat(contextOf(created))
+                .containsEntry("requestId", "req-learning-001");
     }
 }

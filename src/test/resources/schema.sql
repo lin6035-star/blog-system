@@ -139,6 +139,7 @@ CREATE TABLE IF NOT EXISTS ai_workflow_runs (
     current_step VARCHAR(64),
     context_json CLOB NOT NULL,
     retry_count INT NOT NULL DEFAULT 0,
+    version INT NOT NULL DEFAULT 0,
     input_tokens INT NOT NULL DEFAULT 0,
     output_tokens INT NOT NULL DEFAULT 0,
     total_tokens INT NOT NULL DEFAULT 0,

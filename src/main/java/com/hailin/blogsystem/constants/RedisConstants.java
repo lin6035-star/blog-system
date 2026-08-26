@@ -14,6 +14,13 @@ public class RedisConstants
     public static final String COMMENT_LIST_KEY_PREFIX = "comment:list:article:";
     //RAG 索引同步失败标记：rag:index:fail:{action}:{articleId}，action = index / delete / rebuild，articleId 为空用 all
     public static final String RAG_INDEX_FAILURE_KEY_PREFIX = "rag:index:fail:";
+    public static final String AI_WORKFLOW_ACTION_LOCK_KEY_PREFIX =
+            "ai:workflow:action:";
+    public static final String AI_WORKFLOW_ACTION_IDEMPOTENCY_KEY_PREFIX =
+            "ai:workflow:idempotency:";
+    //AI 接口限流：ai:rate:{bucket}:{user|ip}:{identity}:{window}，bucket = chat / workflow / rag
+    public static final String AI_RATE_LIMIT_KEY_PREFIX =
+            "ai:rate:";
 
 
     public static final double ARTICLE_VIEW_HOT_SCORE = 1.0;

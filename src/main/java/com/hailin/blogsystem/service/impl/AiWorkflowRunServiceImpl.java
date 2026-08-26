@@ -1,6 +1,8 @@
 package com.hailin.blogsystem.service.impl;
 
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hailin.blogsystem.ai.workflow.AiWorkflowAdvanceResult;
 import com.hailin.blogsystem.ai.workflow.AiWorkflowStepEmitter;
@@ -11,6 +13,8 @@ import com.hailin.blogsystem.ai.workflow.LearningPlanWorkflowHandler;
 import com.hailin.blogsystem.ai.workflow.LearningProgressWorkflowHandler;
 import com.hailin.blogsystem.ai.workflow.WorkflowHandler;
 import com.hailin.blogsystem.ai.workflow.WorkflowHandlerRegistry;
+import com.hailin.blogsystem.ai.workflow.WorkflowActionIdempotency;
+import com.hailin.blogsystem.ai.workflow.WorkflowActionLock;
 import com.hailin.blogsystem.ai.workflow.WorkflowRunManager;
 import com.hailin.blogsystem.ai.workflow.WorkflowStatusSupport;
 import com.hailin.blogsystem.entity.AiWorkflowRun;
@@ -32,7 +36,9 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.format.DateTimeFormatter;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 
 /**
@@ -58,6 +64,8 @@ public class AiWorkflowRunServiceImpl
     private final WorkflowRunManager workflowRunManager;
     private final AiWorkflowStepLogService aiWorkflowStepLogService;
     private final WorkflowStatusSupport workflowStatusSupport;
+    private final WorkflowActionLock workflowActionLock;
+    private final WorkflowActionIdempotency workflowActionIdempotency;
 
     @Override
     @Transactional //创建文章创作 Workflow
@@ -98,13 +106,39 @@ public class AiWorkflowRunServiceImpl
     }
     @Override
     @Transactional
-    public AiWorkflowRunVO createLearningPlanWorkflow(AiWorkflowLearningPlanDTO dto, AiWorkflowStepEmitter emitter) {
+    public AiWorkflowRunVO createLearningPlanWorkflow(
+            AiWorkflowLearningPlanDTO dto,
+            AiWorkflowStepEmitter emitter
+    ) {
+        return createLearningPlanWorkflow(dto, emitter, false);
+    }
+    @Override
+    @Transactional
+    public AiWorkflowRunVO createLearningPlanWorkflow(
+            AiWorkflowLearningPlanDTO dto,
+            AiWorkflowStepEmitter emitter,
+            boolean agentAutoStarted
+    ) {
+        return createLearningPlanWorkflow(dto, emitter, agentAutoStarted, null);
+    }
+
+    @Override
+    @Transactional
+    public AiWorkflowRunVO createLearningPlanWorkflow(
+            AiWorkflowLearningPlanDTO dto,
+            AiWorkflowStepEmitter emitter,
+            boolean agentAutoStarted,
+            String requestId
+    ) {
         return createWorkflowInternal(
                 learningPlanWorkflowHandler,
                 dto == null ? null : dto.getConversationId(),
                 userId -> learningPlanWorkflowHandler.create(userId, dto, emitter),
                 "创建学习规划工作流",
-                emitter);
+                emitter,
+                agentAutoStarted,
+                requestId
+        );
     }
 
     @Override  //创建学习进度 Workflow（调整已有计划）
@@ -114,13 +148,39 @@ public class AiWorkflowRunServiceImpl
     }
     @Override
     @Transactional
-    public AiWorkflowRunVO createLearningProgressWorkflow(AiWorkflowLearningProgressDTO dto, AiWorkflowStepEmitter emitter) {
+    public AiWorkflowRunVO createLearningProgressWorkflow(
+            AiWorkflowLearningProgressDTO dto,
+            AiWorkflowStepEmitter emitter
+    ) {
+        return createLearningProgressWorkflow(dto, emitter, false);
+    }
+    @Override
+    @Transactional
+    public AiWorkflowRunVO createLearningProgressWorkflow(
+            AiWorkflowLearningProgressDTO dto,
+            AiWorkflowStepEmitter emitter,
+            boolean agentAutoStarted
+    ) {
+        return createLearningProgressWorkflow(dto, emitter, agentAutoStarted, null);
+    }
+
+    @Override
+    @Transactional
+    public AiWorkflowRunVO createLearningProgressWorkflow(
+            AiWorkflowLearningProgressDTO dto,
+            AiWorkflowStepEmitter emitter,
+            boolean agentAutoStarted,
+            String requestId
+    ) {
         return createWorkflowInternal(
                 learningProgressWorkflowHandler,
                 dto == null ? null : dto.getConversationId(),
                 userId -> learningProgressWorkflowHandler.create(userId, dto, emitter),
                 "创建学习进度工作流",
-                emitter);
+                emitter,
+                agentAutoStarted,
+                requestId
+        );
     }
 
     @Override  //创建学习难点攻坚 Workflow（拆解难点，追加任务点到对应阶段）
@@ -130,13 +190,39 @@ public class AiWorkflowRunServiceImpl
     }
     @Override
     @Transactional
-    public AiWorkflowRunVO createLearningAssistWorkflow(AiWorkflowLearningAssistDTO dto, AiWorkflowStepEmitter emitter) {
+    public AiWorkflowRunVO createLearningAssistWorkflow(
+            AiWorkflowLearningAssistDTO dto,
+            AiWorkflowStepEmitter emitter
+    ) {
+        return createLearningAssistWorkflow(dto, emitter, false);
+    }
+    @Override
+    @Transactional
+    public AiWorkflowRunVO createLearningAssistWorkflow(
+            AiWorkflowLearningAssistDTO dto,
+            AiWorkflowStepEmitter emitter,
+            boolean agentAutoStarted
+    ) {
+        return createLearningAssistWorkflow(dto, emitter, agentAutoStarted, null);
+    }
+
+    @Override
+    @Transactional
+    public AiWorkflowRunVO createLearningAssistWorkflow(
+            AiWorkflowLearningAssistDTO dto,
+            AiWorkflowStepEmitter emitter,
+            boolean agentAutoStarted,
+            String requestId
+    ) {
         return createWorkflowInternal(
                 learningAssistWorkflowHandler,
                 dto == null ? null : dto.getConversationId(),
                 userId -> learningAssistWorkflowHandler.create(userId, dto, emitter),
                 "创建学习难点攻坚工作流",
-                emitter);
+                emitter,
+                agentAutoStarted,
+                requestId
+        );
     }
 
     //五个 create 的公共骨架：登录 → 冲突检查 → handler.create → save → runInitialSteps →
@@ -146,25 +232,68 @@ public class AiWorkflowRunServiceImpl
             Long conversationId,
             java.util.function.Function<Long, AiWorkflowAdvanceResult> createAction,
             String logLabel,
-            AiWorkflowStepEmitter emitter) {
+            AiWorkflowStepEmitter emitter
+    ) {
+        return createWorkflowInternal(
+                handler,
+                conversationId,
+                createAction,
+                logLabel,
+                emitter,
+                false,
+                null
+        );
+    }
+    private AiWorkflowRunVO createWorkflowInternal(
+            WorkflowHandler handler,
+            Long conversationId,
+            java.util.function.Function<Long, AiWorkflowAdvanceResult> createAction,
+            String logLabel,
+            AiWorkflowStepEmitter emitter,
+            boolean agentAutoStarted
+    ) {
+        return createWorkflowInternal(
+                handler,
+                conversationId,
+                createAction,
+                logLabel,
+                emitter,
+                agentAutoStarted,
+                null
+        );
+    }
+    private AiWorkflowRunVO createWorkflowInternal(
+            WorkflowHandler handler,
+            Long conversationId,
+            java.util.function.Function<Long, AiWorkflowAdvanceResult> createAction,
+            String logLabel,
+            AiWorkflowStepEmitter emitter,
+            boolean agentAutoStarted,
+            String requestId
+    ) {
         Long userId = workflowRunManager.requireLogin();
         long start = System.currentTimeMillis();
 
         workflowRunManager.checkActiveWorkflowConflict(conversationId, userId);
 
-        //create 只初始化 run（不执行 LLM），save 后再跑初始步骤，这样 runStep 能正常落步骤日志
         AiWorkflowAdvanceResult result = createAction.apply(userId);
+
+        // agentAutoStarted / requestId 统一在公共创建入口写入 contextJson（必须在第一次 save 前）
+        markAgentMetadata(result.getRun(), agentAutoStarted, requestId);
+
         save(result.getRun());
 
         try {
-            result = handler.runInitialSteps(result.getRun(), emitter);
+            AiWorkflowStepEmitter safeEmitter =
+                    emitter == null ? AiWorkflowStepEmitter.noop() : emitter;
+            // 初始步骤必须在 run 入库后才能落 StepLog，也要先把真实 ID 交给 SSE emitter。
+            safeEmitter.bindWorkflowRunId(result.getRun().getId());
+            result = handler.runInitialSteps(result.getRun(), safeEmitter);
             updateById(result.getRun());
             workflowRunManager.clearErrorMessage(result.getRun().getId());
 
-            //绑定
             workflowRunManager.bindSessionActiveWorkflow(result.getRun());
 
-            //写Step Log
             recordWorkflowSuccess(
                     result.getRun(),
                     currentStep(result.getRun()),
@@ -177,7 +306,6 @@ public class AiWorkflowRunServiceImpl
         } catch (RuntimeException e) {
             workflowRunManager.markFailed(result.getRun(), e);
 
-            //失败也绑定会话：前端刷新后还能从会话恢复 FAILED 面板和重试入口
             workflowRunManager.bindSessionActiveWorkflow(result.getRun());
 
             recordWorkflowFailure(
@@ -189,6 +317,42 @@ public class AiWorkflowRunServiceImpl
             );
 
             return toVo(result.getRun());
+        }
+    }
+    private void markAgentMetadata(
+            AiWorkflowRun run,
+            boolean agentAutoStarted,
+            String requestId
+    ) {
+        // 普通创建（非自动拉起、无 requestId）零开销：直接返回，不做 contextJson 解析重写
+        if (!agentAutoStarted
+                && (requestId == null || requestId.isBlank())) {
+            return;
+        }
+
+        try {
+            Map<String, Object> context;
+
+            if (run.getContextJson() == null || run.getContextJson().isBlank()) {
+                context = new HashMap<>();
+            } else {
+                context = objectMapper.readValue(
+                        run.getContextJson(),
+                        new TypeReference<Map<String, Object>>() {}
+                );
+            }
+
+            if (agentAutoStarted) {
+                context.put("agentAutoStarted", true);
+            }
+
+            if (requestId != null && !requestId.isBlank()) {
+                context.put("requestId", requestId);
+            }
+
+            run.setContextJson(objectMapper.writeValueAsString(context));
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("无法写入 Agent Workflow 元数据", e);
         }
     }
 
@@ -208,27 +372,37 @@ public class AiWorkflowRunServiceImpl
     }
     @Override
     @Transactional
-    public AiWorkflowRunVO approve(Long id,AiWorkflowStepEmitter emitter) {
+    public AiWorkflowRunVO approve(
+            Long id,
+            AiWorkflowStepEmitter emitter
+    ) {
         Long userId = workflowRunManager.requireLogin();
-        AiWorkflowRun run = workflowRunManager.getOwnedRun(id, userId);
+
+        ClaimedWorkflow claimed =
+                claimWorkflowAction(id, userId);
+
+        AiWorkflowRun run = claimed.run();
 
         long start = System.currentTimeMillis();
         String step = currentStep(run);
 
-        try{
-            //推进状态（按 workflowType 路由到对应 Handler）
-            WorkflowHandler handler = workflowHandlerRegistry.get(run.getWorkflowType());
-            AiWorkflowAdvanceResult result = handler.approve(run, emitter);
+        try {
+            WorkflowHandler handler =
+                    workflowHandlerRegistry.get(run.getWorkflowType());
+
+            AiWorkflowAdvanceResult result =
+                    handler.approve(run, emitter);
+
             updateById(result.getRun());
             workflowRunManager.clearErrorMessage(run.getId());
 
-            //handler 内直接置 COMPLETED 的流程（如学习规划 SAVE_PLAN）不走 complete()，
-            // 这里统一收口：结束态清 session 绑定，避免刷新后误恢复已结束的 workflow
-            if (AiWorkflowStatus.COMPLETED.name().equals(result.getRun().getStatus())) {
-                workflowRunManager.clearSessionActiveWorkflow(result.getRun());
+            if (AiWorkflowStatus.COMPLETED.name()
+                    .equals(result.getRun().getStatus())) {
+                workflowRunManager.clearSessionActiveWorkflow(
+                        result.getRun()
+                );
             }
 
-            //成功，记success日志
             recordWorkflowSuccess(
                     result.getRun(),
                     currentStep(result.getRun()),
@@ -238,14 +412,11 @@ public class AiWorkflowRunServiceImpl
             );
 
             return toVo(result);
-        }catch(IllegalArgumentException e){
-            //业务拦截（如"质量检查未通过"）→ 原样抛给前端提示
+        } catch (IllegalArgumentException e) {
             throw e;
-        }catch (RuntimeException e){
-            //其他异常（LLM 挂了等）
+        } catch (RuntimeException e) {
             workflowRunManager.markFailed(run, e);
 
-            //失败 → 记 FAILED 日志（REQUIRES_NEW 独立事务）
             recordWorkflowFailure(
                     run,
                     step,
@@ -254,8 +425,11 @@ public class AiWorkflowRunServiceImpl
                     start
             );
 
-            //不抛异常，把 FAILED 状态返回给前端
             return toVo(run);
+        } finally {
+            workflowActionLock.release(
+                    claimed.lockHandle()
+            );
         }
     }
 
@@ -268,22 +442,37 @@ public class AiWorkflowRunServiceImpl
     }
     @Override
     @Transactional
-    public AiWorkflowRunVO reject(Long id, String feedback,AiWorkflowStepEmitter emitter) {
+    public AiWorkflowRunVO reject(
+            Long id,
+            String feedback,
+            AiWorkflowStepEmitter emitter
+    ) {
         Long userId = workflowRunManager.requireLogin();
-        AiWorkflowRun run = workflowRunManager.getOwnedRun(id, userId);
+
+        ClaimedWorkflow claimed =
+                claimWorkflowAction(id, userId);
+
+        AiWorkflowRun run = claimed.run();
 
         long start = System.currentTimeMillis();
         String step = currentStep(run);
 
-        try{
-            WorkflowHandler handler = workflowHandlerRegistry.get(run.getWorkflowType());
-            AiWorkflowAdvanceResult result = handler.reject(run, feedback,emitter);
+        try {
+            WorkflowHandler handler =
+                    workflowHandlerRegistry.get(run.getWorkflowType());
+
+            AiWorkflowAdvanceResult result =
+                    handler.reject(run, feedback, emitter);
+
             updateById(result.getRun());
             workflowRunManager.clearErrorMessage(run.getId());
 
-            //否定反馈导致 CANCELLED（如"算了"）→ 清 session 绑定，让下一条消息回普通聊天
-            if (AiWorkflowStatus.CANCELLED.name().equals(result.getRun().getStatus())) {
-                workflowRunManager.clearSessionActiveWorkflow(result.getRun());
+            // 否定反馈导致取消，清理会话中的 active Workflow
+            if (AiWorkflowStatus.CANCELLED.name()
+                    .equals(result.getRun().getStatus())) {
+                workflowRunManager.clearSessionActiveWorkflow(
+                        result.getRun()
+                );
             }
 
             recordWorkflowSuccess(
@@ -295,7 +484,7 @@ public class AiWorkflowRunServiceImpl
             );
 
             return toVo(result);
-        }catch (IllegalArgumentException e) {
+        } catch (IllegalArgumentException e) {
             throw e;
         } catch (RuntimeException e) {
             workflowRunManager.markFailed(run, e);
@@ -309,39 +498,64 @@ public class AiWorkflowRunServiceImpl
             );
 
             return toVo(run);
+        } finally {
+            workflowActionLock.release(
+                    claimed.lockHandle()
+            );
         }
-
     }
 
     @Override  //取消 Workflow。
     @Transactional
     public void cancel(Long id) {
         Long userId = workflowRunManager.requireLogin();
-        AiWorkflowRun run = workflowRunManager.getOwnedRun(id, userId);
 
-        long start = System.currentTimeMillis();
-        String step = currentStep(run);
+        // 保留原有终态快速返回
+        AiWorkflowRun current =
+                workflowRunManager.getOwnedRun(id, userId);
 
-        if (AiWorkflowStatus.COMPLETED.name().equals(run.getStatus())
-                || AiWorkflowStatus.CANCELLED.name().equals(run.getStatus())) {
+        if (AiWorkflowStatus.COMPLETED.name()
+                .equals(current.getStatus())
+                || AiWorkflowStatus.CANCELLED.name()
+                .equals(current.getStatus())) {
             return;
         }
 
-        run.setStatus(AiWorkflowStatus.CANCELLED.name());
-        workflowRunManager.touch(run);
-        updateById(run);
+        ClaimedWorkflow claimed =
+                claimWorkflowAction(id, userId);
 
-        workflowRunManager.clearSessionActiveWorkflow(run);
+        AiWorkflowRun run = claimed.run();
 
-        //cancel 是用户主动取消，也可以记一条成功日志，
-        // 方便以后知道 workflow 为什么结束
-        recordWorkflowSuccess(
-                run,
-                step,
-                "老板取消工作流",
-                outputStatus(run),
-                start
-        );
+        try {
+            // 拿锁后再次检查状态
+            if (AiWorkflowStatus.COMPLETED.name()
+                    .equals(run.getStatus())
+                    || AiWorkflowStatus.CANCELLED.name()
+                    .equals(run.getStatus())) {
+                return;
+            }
+
+            long start = System.currentTimeMillis();
+            String step = currentStep(run);
+
+            run.setStatus(AiWorkflowStatus.CANCELLED.name());
+            workflowRunManager.touch(run);
+            updateById(run);
+
+            workflowRunManager.clearSessionActiveWorkflow(run);
+
+            recordWorkflowSuccess(
+                    run,
+                    step,
+                    "老板取消工作流",
+                    outputStatus(run),
+                    start
+            );
+        } finally {
+            workflowActionLock.release(
+                    claimed.lockHandle()
+            );
+        }
     }
 
     @Override
@@ -359,27 +573,51 @@ public class AiWorkflowRunServiceImpl
     }
     @Override
     @Transactional
-    public AiWorkflowRunVO retry(Long id,AiWorkflowStepEmitter emitter) {
+    public AiWorkflowRunVO retry(
+            Long id,
+            AiWorkflowStepEmitter emitter
+    ) {
         Long userId = workflowRunManager.requireLogin();
-        AiWorkflowRun run = workflowRunManager.getOwnedRun(id, userId);
 
-        if (!AiWorkflowStatus.FAILED.name().equals(run.getStatus())) {
-            throw new IllegalArgumentException("只有失败的 Workflow 可以重试");
+        // 保留原有的快速状态校验
+        AiWorkflowRun current =
+                workflowRunManager.getOwnedRun(id, userId);
+
+        if (!AiWorkflowStatus.FAILED.name()
+                .equals(current.getStatus())) {
+            throw new IllegalArgumentException(
+                    "只有失败的 Workflow 可以重试"
+            );
         }
 
-        long start = System.currentTimeMillis();
-        String step = currentStep(run);
+        ClaimedWorkflow claimed =
+                claimWorkflowAction(id, userId);
 
-        // retry_count + 1
-        incrementRetryCount(run);
+        AiWorkflowRun run = claimed.run();
 
         try {
-            WorkflowHandler handler = workflowHandlerRegistry.get(run.getWorkflowType());
-            AiWorkflowAdvanceResult result = handler.retry(run,emitter);
+            // 拿锁后重新检查，防止状态已经被其他操作改变
+            if (!AiWorkflowStatus.FAILED.name()
+                    .equals(run.getStatus())) {
+                throw new IllegalArgumentException(
+                        "只有失败的 Workflow 可以重试"
+                );
+            }
+
+            long start = System.currentTimeMillis();
+
+            // 必须在 claim 成功之后递增
+            incrementRetryCount(run);
+
+            WorkflowHandler handler =
+                    workflowHandlerRegistry.get(run.getWorkflowType());
+
+            AiWorkflowAdvanceResult result =
+                    handler.retry(run, emitter);
+
             updateById(result.getRun());
             workflowRunManager.clearErrorMessage(run.getId());
 
-            // 重试成功也记一条
             recordWorkflowSuccess(
                     result.getRun(),
                     currentStep(result.getRun()),
@@ -392,9 +630,11 @@ public class AiWorkflowRunServiceImpl
         } catch (IllegalArgumentException e) {
             throw e;
         } catch (RuntimeException e) {
+            long start = System.currentTimeMillis();
+            String step = currentStep(run);
+
             workflowRunManager.markFailed(run, e);
 
-            // 重试又失败 → 再次 FAILED，还能再重试
             recordWorkflowFailure(
                     run,
                     step,
@@ -404,8 +644,49 @@ public class AiWorkflowRunServiceImpl
             );
 
             return toVo(run);
+        } finally {
+            workflowActionLock.release(
+                    claimed.lockHandle()
+            );
         }
     }
+    private ClaimedWorkflow claimWorkflowAction(Long id, Long userId) {
+        // 锁前先校验归属，避免给无权限的 Workflow 加锁
+        workflowRunManager.getOwnedRun(id, userId);
+
+        WorkflowActionLock.LockHandle lockHandle =
+                workflowActionLock.acquireOrThrow(id);
+
+        try {
+            // 拿锁后重新读取，不能继续使用锁前旧对象
+            AiWorkflowRun run = workflowRunManager.getOwnedRun(id, userId);
+
+            Integer expectedVersion =
+                    run.getVersion() == null ? 0 : run.getVersion();
+
+            int affectedRows =
+                    baseMapper.claimAction(run.getId(), expectedVersion);
+
+            if (affectedRows != 1) {
+                throw new WorkflowActionLock.WorkflowActionBusyException();
+            }
+
+            // DB 已经 +1，内存对象也必须同步，否则后面的 updateById 会写回旧版本
+            run.setVersion(expectedVersion + 1);
+
+            return new ClaimedWorkflow(run, lockHandle);
+        } catch (RuntimeException e) {
+            workflowActionLock.release(lockHandle);
+            throw e;
+        }
+    }
+
+    private record ClaimedWorkflow(
+            AiWorkflowRun run,
+            WorkflowActionLock.LockHandle lockHandle
+    ) {
+    }
+
     private void incrementRetryCount(AiWorkflowRun run) {
         Integer retryCount = run.getRetryCount();
         run.setRetryCount(retryCount == null ? 1 : retryCount + 1);
@@ -465,6 +746,128 @@ public class AiWorkflowRunServiceImpl
     }
     private AiWorkflowRunVO toVo(AiWorkflowRun run) {
         return AiWorkflowRunVO.from(run, objectMapper);
+    }
+
+    @Override
+    @Transactional
+    public AiWorkflowRunVO approve(
+            Long id,
+            String idempotencyKey,
+            AiWorkflowStepEmitter emitter
+    ) {
+        Long userId = workflowRunManager.requireLogin();
+
+        String fingerprint =
+                workflowActionIdempotency.fingerprint("APPROVE", null);
+
+        AiWorkflowRunVO cached =
+                workflowActionIdempotency.get(
+                        userId,
+                        id,
+                        "APPROVE",
+                        idempotencyKey,
+                        fingerprint
+                );
+
+        if (cached != null) {
+            return cached;
+        }
+
+        AiWorkflowRunVO result = approve(id, emitter);
+
+        workflowActionIdempotency.save(
+                userId,
+                id,
+                "APPROVE",
+                idempotencyKey,
+                fingerprint,
+                result
+        );
+
+        return result;
+    }
+
+    @Override
+    @Transactional
+    public AiWorkflowRunVO reject(
+            Long id,
+            String feedback,
+            String idempotencyKey,
+            AiWorkflowStepEmitter emitter
+    ) {
+        Long userId = workflowRunManager.requireLogin();
+
+        String fingerprint =
+                workflowActionIdempotency.fingerprint(
+                        "REJECT",
+                        feedback
+                );
+
+        AiWorkflowRunVO cached =
+                workflowActionIdempotency.get(
+                        userId,
+                        id,
+                        "REJECT",
+                        idempotencyKey,
+                        fingerprint
+                );
+
+        if (cached != null) {
+            return cached;
+        }
+
+        AiWorkflowRunVO result =
+                reject(id, feedback, emitter);
+
+        workflowActionIdempotency.save(
+                userId,
+                id,
+                "REJECT",
+                idempotencyKey,
+                fingerprint,
+                result
+        );
+
+        return result;
+    }
+
+    @Override
+    @Transactional
+    public AiWorkflowRunVO retry(
+            Long id,
+            String idempotencyKey,
+            AiWorkflowStepEmitter emitter
+    ) {
+        Long userId = workflowRunManager.requireLogin();
+
+        String fingerprint =
+                workflowActionIdempotency.fingerprint("RETRY", null);
+
+        AiWorkflowRunVO cached =
+                workflowActionIdempotency.get(
+                        userId,
+                        id,
+                        "RETRY",
+                        idempotencyKey,
+                        fingerprint
+                );
+
+        if (cached != null) {
+            return cached;
+        }
+
+        AiWorkflowRunVO result = retry(id, emitter);
+
+        workflowActionIdempotency.save(
+                userId,
+                id,
+                "RETRY",
+                idempotencyKey,
+                fingerprint,
+                result
+        );
+
+        return result;
     }
 
 }

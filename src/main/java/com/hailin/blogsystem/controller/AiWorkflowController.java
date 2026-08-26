@@ -71,18 +71,44 @@ public class AiWorkflowController {
         return Result.success(aiWorkflowRunService.retry(id));
     }
 
-    @PostMapping(value = "/{id}/approve/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public Flux<AiChatEventVO> approveStream(@PathVariable Long id) {
-        return aiWorkflowStreamService.approve(id);
+    @PostMapping(value = "/{id}/approve/stream",
+            produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public Flux<AiChatEventVO> approveStream(
+            @PathVariable Long id,
+            @RequestHeader(
+                    value = "Idempotency-Key",
+                    required = false
+            ) String idempotencyKey
+    ) {
+        return aiWorkflowStreamService.approve(id, idempotencyKey);
     }
 
-    @PostMapping(value = "/{id}/reject/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public Flux<AiChatEventVO> rejectStream(@PathVariable Long id, @RequestBody AiWorkflowRejectDTO dto) {
-        return aiWorkflowStreamService.reject(id, dto.getFeedback());
+    @PostMapping(value = "/{id}/reject/stream",
+            produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public Flux<AiChatEventVO> rejectStream(
+            @PathVariable Long id,
+            @RequestBody AiWorkflowRejectDTO dto,
+            @RequestHeader(
+                    value = "Idempotency-Key",
+                    required = false
+            ) String idempotencyKey
+    ) {
+        return aiWorkflowStreamService.reject(
+                id,
+                dto.getFeedback(),
+                idempotencyKey
+        );
     }
 
-    @PostMapping(value = "/{id}/retry/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public Flux<AiChatEventVO> retryStream(@PathVariable Long id) {
-        return aiWorkflowStreamService.retry(id);
+    @PostMapping(value = "/{id}/retry/stream",
+            produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public Flux<AiChatEventVO> retryStream(
+            @PathVariable Long id,
+            @RequestHeader(
+                    value = "Idempotency-Key",
+                    required = false
+            ) String idempotencyKey
+    ) {
+        return aiWorkflowStreamService.retry(id, idempotencyKey);
     }
 }

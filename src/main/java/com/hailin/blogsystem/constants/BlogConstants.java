@@ -42,6 +42,8 @@ public class BlogConstants {
         public static final int FORBIDDEN = 40300;      // 无权限
         public static final int NOT_FOUND = 40400;      // 资源不存在
         public static final int SERVER_ERROR = 50000;   // 服务器内部错误
+        public static final int CONFLICT = 40900;  // 资源正在处理中
+        public static final int RATE_LIMITED = 42900;   // 请求过于频繁
 
         private ErrorCode() {
 

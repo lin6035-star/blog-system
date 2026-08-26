@@ -52,4 +52,62 @@ public interface AiWorkflowRunService extends IService<AiWorkflowRun> {
     AiWorkflowRunVO reject(Long id, String feedback, AiWorkflowStepEmitter emitter);
 
     AiWorkflowRunVO retry(Long id, AiWorkflowStepEmitter emitter);
+
+    AiWorkflowRunVO approve(
+            Long id,
+            String idempotencyKey,
+            AiWorkflowStepEmitter emitter
+    );
+
+    AiWorkflowRunVO reject(
+            Long id,
+            String feedback,
+            String idempotencyKey,
+            AiWorkflowStepEmitter emitter
+    );
+
+    AiWorkflowRunVO retry(
+            Long id,
+            String idempotencyKey,
+            AiWorkflowStepEmitter emitter
+    );
+
+    AiWorkflowRunVO createLearningPlanWorkflow(
+            AiWorkflowLearningPlanDTO dto,
+            AiWorkflowStepEmitter emitter,
+            boolean agentAutoStarted
+    );
+
+    AiWorkflowRunVO createLearningProgressWorkflow(
+            AiWorkflowLearningProgressDTO dto,
+            AiWorkflowStepEmitter emitter,
+            boolean agentAutoStarted
+    );
+
+    AiWorkflowRunVO createLearningAssistWorkflow(
+            AiWorkflowLearningAssistDTO dto,
+            AiWorkflowStepEmitter emitter,
+            boolean agentAutoStarted
+    );
+
+    AiWorkflowRunVO createLearningPlanWorkflow(
+            AiWorkflowLearningPlanDTO dto,
+            AiWorkflowStepEmitter emitter,
+            boolean agentAutoStarted,
+            String requestId
+    );
+
+    AiWorkflowRunVO createLearningProgressWorkflow(
+            AiWorkflowLearningProgressDTO dto,
+            AiWorkflowStepEmitter emitter,
+            boolean agentAutoStarted,
+            String requestId
+    );
+
+    AiWorkflowRunVO createLearningAssistWorkflow(
+            AiWorkflowLearningAssistDTO dto,
+            AiWorkflowStepEmitter emitter,
+            boolean agentAutoStarted,
+            String requestId
+    );
 }

@@ -12,6 +12,8 @@ public class BlogAiProperties {
     private String projectKey = "global";
     private Memory memory = new Memory();
     private Rag rag = new Rag();
+    private Agent agent = new Agent();
+    private RateLimit rateLimit = new RateLimit();
 
     @Data
     public static class Memory{
@@ -59,4 +61,44 @@ public class BlogAiProperties {
         private int queueCapacity = 100;
         private String threadNamePrefix = "rag-sync-";
     }
+
+    @Data
+    public static class Agent{
+        private double autoStartConfidenceThreshold = 0.7;
+        private int autoStartLimitPerSession = 2;
+        private List<String> learningToolWhitelist = List.of("getLearningDashboard");
+        private Dashboard dashboard = new Dashboard();
+    }
+    @Data
+    public static class Dashboard{
+        private int titleMaxLength = 30;
+        private int taskTitleMaxLength = 20;
+        private int memoryMaxLength = 80;
+        private int memoryLimit = 3;
+        private int hintLimit = 3;
+    }
+
+    @Data
+    public static class RateLimit {
+        private boolean enabled = true;
+        private boolean failOpen = false;
+        private Limit chat = new Limit(10, 60);
+        private Limit workflow = new Limit(3, 600);
+        private Limit rag = new Limit(30, 60);
+    }
+
+    @Data
+    public static class Limit {
+        private int limit;
+        private long windowSeconds;
+
+        public Limit() {
+        }
+
+        public Limit(int limit, long windowSeconds) {
+            this.limit = limit;
+            this.windowSeconds = windowSeconds;
+        }
+    }
+
 }

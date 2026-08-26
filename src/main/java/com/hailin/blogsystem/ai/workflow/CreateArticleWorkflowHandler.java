@@ -19,6 +19,7 @@ import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 /*创建 → WAITING_REQUIREMENT_CONFIRM  (需求不明确)
@@ -82,9 +83,12 @@ public class CreateArticleWorkflowHandler extends AbstractWorkflowHandler {
         Long conversationId = dto == null ? null : dto.getConversationId();
         LocalDateTime now = LocalDateTime.now();
 
+        String topicEvidence = dto == null ? null : dto.getTopicEvidence();
+
         //create 只初始化 run（不执行 LLM），初始步骤由 runInitialSteps 在 Service save 之后执行
         //这样 WorkflowStepRunner 落步骤日志时 run 已入库（有 id），不需要再补记近似耗时日志
-        Map<String, Object> context = buildInitialContext(requirement);
+        Map<String, Object> context =
+                buildInitialContext(requirement, topicEvidence);
 
         AiWorkflowRun run = new AiWorkflowRun();
         run.setUserId(userId);
@@ -92,7 +96,7 @@ public class CreateArticleWorkflowHandler extends AbstractWorkflowHandler {
         run.setWorkflowType(AiWorkflowType.CREATE_ARTICLE.name());
         run.setWorkflowVersion(WORKFLOW_VERSION);
 
-        if (isRequirementUnclear(requirement)) {  //isRequirementUnclear(requirement)判断需求是否模糊
+        if (isRequirementUnclear(requirement, topicEvidence)) {  //isRequirementUnclear(requirement)判断需求是否模糊
             // 生成"你想写哪个主题？"提示文字
             workflowContextSupport.putConfirmation(context,
                     AiWorkflowConfirmationType.REQUIREMENT,
@@ -129,13 +133,17 @@ public class CreateArticleWorkflowHandler extends AbstractWorkflowHandler {
         Map<String, Object> requirementMap = workflowContextSupport.getMap(context, "requirement");
         String requirement = String.valueOf(requirementMap.getOrDefault("rawRequirement", ""));
 
+        String topicEvidence = String.valueOf(
+                requirementMap.getOrDefault("topicEvidence", "")
+        );
+
         run.setCurrentStep(AiWorkflowStep.REQUIREMENT_ANALYZE.name());
 
         Boolean clear = workflowStepRunner.run(
                 run.getId(),
                 AiWorkflowStep.REQUIREMENT_ANALYZE,
                 "正在分析写作需求...",
-                () -> !isRequirementUnclear(requirement),
+                () -> !isRequirementUnclear(requirement, topicEvidence),
                 safeEmitter
         );
 
@@ -167,7 +175,10 @@ public class CreateArticleWorkflowHandler extends AbstractWorkflowHandler {
                 run.getId(),
                 AiWorkflowStep.RAG_SEARCH,
                 "正在检索站内相关文章...",
-                () -> retrieveRagReferences(requirement),
+                () -> retrieveRagReferences(
+                        requirement,
+                        String.valueOf(requirementMap.getOrDefault("topic", ""))
+                ),
                 safeEmitter
         );
         context.put("ragReferences", ragReferences);
@@ -485,7 +496,10 @@ public class CreateArticleWorkflowHandler extends AbstractWorkflowHandler {
         return workflowKnowledgeSupport.retrieveMemoryContext(userId, requirement);
     }
     //此方法创建一个workflow的初始状态包，后面整个文章工作流所有中间结果都往这个context塞，最后序列化为 context_json 存到ai_workflow_runs 表里
-    private Map<String, Object> buildInitialContext(String requirement) {
+    private Map<String, Object> buildInitialContext(
+            String requirement,
+            String topicEvidence
+    ) {
         Map<String, Object> context = new HashMap<>();
         context.put("workflowVersion", WORKFLOW_VERSION);
 
@@ -494,11 +508,21 @@ public class CreateArticleWorkflowHandler extends AbstractWorkflowHandler {
         variables.put("language", "zh-CN");
         context.put("variables", variables);
 
+        String validatedTopic =
+                validateTopicEvidence(requirement, topicEvidence);
+
         Map<String, Object> requirementMap = new HashMap<>();
         requirementMap.put("rawRequirement", requirement);
-        requirementMap.put("topic", extractTopic(requirement));  //提取主题
+        requirementMap.put(
+                "topicEvidence",
+                topicEvidence == null ? "" : topicEvidence.trim()
+        );
+        requirementMap.put("topic", validatedTopic);
         requirementMap.put("type", "技术博客");
-        requirementMap.put("keywords", extractSimpleKeywords(requirement));//从文本提取关键字
+        requirementMap.put(
+                "keywords",
+                extractSimpleKeywords(validatedTopic)
+        );
         context.put("requirement", requirementMap);
 
         context.put("stepResults", new HashMap<>());
@@ -515,7 +539,19 @@ public class CreateArticleWorkflowHandler extends AbstractWorkflowHandler {
      * RAG 检索失败时兜底返回空列表，不阻断 workflow 创建。
      */
     private List<Map<String, Object>> retrieveRagReferences(String requirement) {
-        return workflowKnowledgeSupport.retrieveRagReferences(requirement, extractTopic(requirement));
+        return workflowKnowledgeSupport.retrieveRagReferences(
+                requirement,
+                extractTopic(requirement)
+        );
+    }
+    private List<Map<String, Object>> retrieveRagReferences(
+            String requirement,
+            String topic
+    ) {
+        return workflowKnowledgeSupport.retrieveRagReferences(
+                requirement,
+                topic == null ? "" : topic
+        );
     }
     private String rebuildOutline(AiWorkflowRun run, Map<String, Object> context, String feedback, AiWorkflowStepEmitter emitter) {
         Map<String, Object> requirement = workflowContextSupport.getMap(context, "requirement");
@@ -1014,11 +1050,21 @@ public class CreateArticleWorkflowHandler extends AbstractWorkflowHandler {
             return "";
         }
 
+        topic = topic
+                .replaceFirst("吗$", "")
+                .replaceAll("[。！？!?，,；;：:、]+$", "")
+                .trim();
+
         String before;
         do {
             before = topic;
             topic = topic
-                    .replaceFirst("^(我想让你|我想请你|请你|我想|你帮我|帮我|请帮我|麻烦帮我)", "")
+                    .replaceFirst(
+                            "^(我想让你|我想请你|请问可以帮我|请问能不能帮我|"
+                                    + "你能不能帮我|你可以帮我|你能帮我|能不能帮我|可以帮我|能帮我|"
+                                    + "请你|我想|你帮我|帮我|请帮我|麻烦帮我)",
+                            ""
+                    )
                     .replaceFirst("^(写|生成|创作|写点|写个|写篇|来一篇|整一篇)", "")
                     .replaceFirst("^(一篇文章|篇文章|一篇|一份|一个)", "")
                     .trim();
@@ -1032,26 +1078,109 @@ public class CreateArticleWorkflowHandler extends AbstractWorkflowHandler {
     //判断需求是否模糊（公开给 AiMessageServiceImpl 的次入口做确定性裁判）。
     //主题必须能从原文提取出实义内容：剥空 / 太短 / 纯虚词都算模糊。
     //只碰原始 requirement，不依赖 LLM 输出的 topic——LLM 判断"是不是想写文章"，规则判断"写什么"。
+    public boolean isRequirementUnclear(
+            String requirement,
+            String topicEvidence
+    ) {
+        String topic = validateTopicEvidence(
+                requirement,
+                topicEvidence
+        );
+
+        if (topic.isBlank()) {
+            return true;
+        }
+
+        String normalized = normalizeTopicEvidence(topic);
+
+        if (normalized.length() < 2) {
+            return true;
+        }
+
+        return isGenericTopic(normalized);
+    }
+    private String validateTopicEvidence(
+            String requirement,
+            String topicEvidence
+    ) {
+        if (requirement == null
+                || requirement.isBlank()
+                || topicEvidence == null
+                || topicEvidence.isBlank()) {
+            return "";
+        }
+
+        String evidence = topicEvidence
+                .trim()
+                .replaceAll(
+                        "[。！？!?，,；;：:、]+$",
+                        ""
+                )
+                .trim();
+
+        if (evidence.isBlank()) {
+            return "";
+        }
+
+        String normalizedRequirement =
+                normalizeTopicEvidence(requirement);
+
+        String normalizedEvidence =
+                normalizeTopicEvidence(evidence);
+
+        if (normalizedEvidence.isBlank()
+                || !normalizedRequirement.contains(normalizedEvidence)) {
+            return "";
+        }
+
+        if (isGenericTopic(normalizedEvidence)) {
+            return "";
+        }
+
+        return evidence;
+    }
+
+    private String normalizeTopicEvidence(String text) {
+        if (text == null) {
+            return "";
+        }
+
+        return text
+                .toLowerCase(Locale.ROOT)
+                .replaceAll(
+                        "[\\s\\p{Punct}，。！？；：、“”‘’（）【】《》、]+",
+                        ""
+                );
+    }
+
+    private boolean isGenericTopic(String normalizedTopic) {
+        return switch (normalizedTopic) {
+            case "文章",
+                    "博客",
+                    "博文",
+                    "帖子",
+                    "草稿",
+                    "大纲",
+                    "内容",
+                    "东西",
+                    "主题",
+                    "一篇",
+                    "一篇文章",
+                    "随便",
+                    "都行",
+                    "不知道",
+                    "没想好",
+                    "什么",
+                    "啥" -> true;
+            default -> false;
+        };
+    }
+    //为了兼容原有调用，保留一个旧方法
     public boolean isRequirementUnclear(String requirement) {
-        String topic = extractTopic(requirement);
-
-        if (topic == null || topic.isBlank()) {
-            return true;
-        }
-
-        String normalized = topic.replaceAll("\\s+", "");
-        if (normalized.length() < 4) {
-            return true;
-        }
-
-        return containsAny(normalized,
-                "随便",
-                "都行",
-                "不知道",
-                "没想好",
-                "东西",
-                "啥",
-                "什么");
+        return isRequirementUnclear(
+                requirement,
+                extractTopic(requirement)
+        );
     }
     private boolean containsAny(String text, String... keywords) {
         for (String keyword : keywords) {

@@ -16,6 +16,7 @@ import com.hailin.blogsystem.utils.UserContext;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.openai.OpenAiChatOptions;
+import org.springframework.ai.tool.ToolCallback;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
 
@@ -38,19 +39,17 @@ public class AiModelServiceImpl implements AiModelService {
     private final AiEditorToolFactory aiEditorToolFactory;
     private final AiArticleActionToolsFactory aiArticleActionToolsFactory;
     private final AiUserProfileTools aiUserProfileTools;
-    private final AiLearningPlanTools aiLearningPlanTools;
-    private final QueryLearningPlansTool queryLearningPlansTool;
     private final AiIntentClassifier aiIntentClassifier;
+    private final AiLearningDashboardTool aiLearningDashboardTool;
 
 
-    public AiModelServiceImpl(ChatClient.Builder chatClientBuilder, BlogAiProperties blogAiProperties, AiArticleTools aiArticleTools, AiNavigationToolsFactory aiNavigationToolsFactory, AiEditorToolFactory aiEditorToolFactory, AiArticleActionToolsFactory aiArticleActionToolsFactory, AiUserProfileTools aiUserProfileTools, AiLearningPlanTools aiLearningPlanTools, QueryLearningPlansTool queryLearningPlansTool, AiIntentClassifier aiIntentClassifier) {
+    public AiModelServiceImpl(ChatClient.Builder chatClientBuilder, BlogAiProperties blogAiProperties, AiArticleTools aiArticleTools, AiNavigationToolsFactory aiNavigationToolsFactory, AiEditorToolFactory aiEditorToolFactory, AiArticleActionToolsFactory aiArticleActionToolsFactory, AiUserProfileTools aiUserProfileTools, AiIntentClassifier aiIntentClassifier, AiLearningDashboardTool aiLearningDashboardTool) {
         this.aiArticleTools = aiArticleTools;
         this.aiEditorToolFactory = aiEditorToolFactory;
         this.aiArticleActionToolsFactory = aiArticleActionToolsFactory;
         this.aiUserProfileTools = aiUserProfileTools;
-        this.aiLearningPlanTools = aiLearningPlanTools;
-        this.queryLearningPlansTool = queryLearningPlansTool;
         this.aiIntentClassifier = aiIntentClassifier;
+        this.aiLearningDashboardTool = aiLearningDashboardTool;
         this.chatClient = chatClientBuilder
                 .defaultSystem(blogAiProperties.getSystemPrompt())
                 .build();
@@ -69,7 +68,7 @@ public class AiModelServiceImpl implements AiModelService {
 
         //工具执行在 Spring AI 内部线程池（boundedElastic），ThreadLocal 的 UserContext 拿不到。
         // 在这里（请求线程）读一次 userId，通过 ToolContext 显式传给工具；重跑路径复用同一份。
-        Map<String, Object> toolContext = buildToolContext();
+        Map<String, Object> toolContext = buildToolContext(prompt);
 
         Object[] tools = buildTools(
                 prompt,
@@ -81,7 +80,7 @@ public class AiModelServiceImpl implements AiModelService {
         return chatClient.prompt()
                 .user(prompt.getFinalPromptContext())
                 .tools(tools)
-                .toolCallbacks(queryLearningPlansTool)
+                .toolCallbacks(buildToolCallbacks(prompt))
                 .toolContext(toolContext)
                 .options(OpenAiChatOptions.builder()
                         .streamUsage(true)
@@ -108,10 +107,24 @@ public class AiModelServiceImpl implements AiModelService {
                 });
     }
 
-    //构建传给工具的 ToolContext：userId 在请求线程读取（工具执行线程读不到 ThreadLocal）
-    private Map<String, Object> buildToolContext() {
+    /**
+     * 构建传给工具的 ToolContext：userId / sessionId 在请求线程读取（工具执行线程读不到 ThreadLocal）。
+     */
+    private Map<String, Object> buildToolContext(AiPrompt prompt) {
         Map<String, Object> context = new HashMap<>();
-        context.put("userId", UserContext.get());
+
+        // 游客没有登录态，UserContext 为 null——null value 会被 Spring AI
+        // ChatClient 校验拒绝（toolContext values cannot contain null elements）。
+        // 只有非 null 才放入；工具侧取不到 userId 时自行降级。
+        Long userId = UserContext.get();
+        if (userId != null) {
+            context.put("userId", userId);
+        }
+
+        if (prompt != null && prompt.getSessionId() != null) {
+            context.put("sessionId", prompt.getSessionId());
+        }
+
         return context;
     }
 
@@ -140,7 +153,7 @@ public class AiModelServiceImpl implements AiModelService {
             ChatResponse response = chatClient.prompt()
                     .user(prompt.getFinalPromptContext())
                     .tools(tools)
-                    .toolCallbacks(queryLearningPlansTool)
+                    .toolCallbacks(buildToolCallbacks(prompt))
                     .toolContext(toolContext)
                     .call()
                     .chatResponse();
@@ -191,14 +204,17 @@ public class AiModelServiceImpl implements AiModelService {
             AiEditorTools aiEditorTools,
             AiArticleActionTools aiArticleActionTools
     ) {
+        if (prompt != null && prompt.isLearningDashboardToolEnabled()) {
+            return new Object[]{};
+        }
+
         if (prompt != null && prompt.isArticleToolsEnabled()) {
             return new Object[]{
                     aiArticleTools,
                     aiNavigationTools,
                     aiEditorTools,
                     aiArticleActionTools,
-                    aiUserProfileTools,
-                    aiLearningPlanTools
+                    aiUserProfileTools
             };
         }
 
@@ -206,9 +222,16 @@ public class AiModelServiceImpl implements AiModelService {
                 aiNavigationTools,
                 aiEditorTools,
                 aiArticleActionTools,
-                aiUserProfileTools,
-                aiLearningPlanTools
+                aiUserProfileTools
         };
+    }
+
+
+    private ToolCallback[] buildToolCallbacks(AiPrompt prompt) {
+        if (prompt != null && prompt.isLearningDashboardToolEnabled()) {
+            return new ToolCallback[]{aiLearningDashboardTool};
+        }
+        return new ToolCallback[]{};
     }
 
 

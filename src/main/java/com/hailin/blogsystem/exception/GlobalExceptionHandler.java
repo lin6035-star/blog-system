@@ -1,6 +1,7 @@
 package com.hailin.blogsystem.exception;
 
 import com.hailin.blogsystem.constants.BlogConstants;
+import com.hailin.blogsystem.security.RateLimitExceededException;
 import com.hailin.blogsystem.utils.Result;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -16,6 +17,17 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(BusinessException.class)
     public Result<Void> handleBusinessException(BusinessException e) {
+        return Result.error(e.getCode(), e.getMessage());
+    }
+
+    //限流拒绝：BusinessException 默认返回 200，限流必须显式 429 + Retry-After
+    @ExceptionHandler(RateLimitExceededException.class)
+    public Result<Void> handleRateLimitExceeded(
+            RateLimitExceededException e,
+            HttpServletResponse response
+    ) {
+        response.setStatus(HttpStatus.TOO_MANY_REQUESTS.value());
+        response.setHeader("Retry-After", String.valueOf(e.getRetryAfterSeconds()));
         return Result.error(e.getCode(), e.getMessage());
     }
 

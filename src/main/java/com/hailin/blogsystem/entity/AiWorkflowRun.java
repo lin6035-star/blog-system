@@ -64,6 +64,12 @@ public class AiWorkflowRun {
      */
     private Integer retryCount;
     /**
+     * Workflow 推进版本。
+     * 每次 approve/reject/retry 开始前先 CAS +1，
+     * 防止旧对象覆盖新状态。
+     */
+    private Integer version;
+    /**
      * 输入 token 数。
      * 第一版如果模型 SDK 没稳定返回 usage，可以先保持 0。
      */

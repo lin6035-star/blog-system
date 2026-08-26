@@ -9,6 +9,7 @@ import com.hailin.blogsystem.service.AiWorkflowRunService;
 import com.hailin.blogsystem.service.AiWorkflowStreamService;
 import com.hailin.blogsystem.utils.UserContext;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -19,9 +20,11 @@ import com.hailin.blogsystem.ai.workflow.AiWorkflowStepEmitter;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class AiWorkflowStreamServiceImpl implements AiWorkflowStreamService {
@@ -44,6 +47,56 @@ public class AiWorkflowStreamServiceImpl implements AiWorkflowStreamService {
         return streamAction(id,"RETRY", emitter -> aiWorkflowRunService.retry(id,emitter));
     }
 
+    @Override
+    public Flux<AiChatEventVO> approve(
+            Long id,
+            String idempotencyKey
+    ) {
+        return streamAction(
+                id,
+                "APPROVE",
+                emitter -> aiWorkflowRunService.approve(
+                        id,
+                        idempotencyKey,
+                        emitter
+                )
+        );
+    }
+
+    @Override
+    public Flux<AiChatEventVO> reject(
+            Long id,
+            String feedback,
+            String idempotencyKey
+    ) {
+        return streamAction(
+                id,
+                "REJECT",
+                emitter -> aiWorkflowRunService.reject(
+                        id,
+                        feedback,
+                        idempotencyKey,
+                        emitter
+                )
+        );
+    }
+
+    @Override
+    public Flux<AiChatEventVO> retry(
+            Long id,
+            String idempotencyKey
+    ) {
+        return streamAction(
+                id,
+                "RETRY",
+                emitter -> aiWorkflowRunService.retry(
+                        id,
+                        idempotencyKey,
+                        emitter
+                )
+        );
+    }
+
     private Flux<AiChatEventVO> streamAction(
             Long id,
             String action,
@@ -51,38 +104,89 @@ public class AiWorkflowStreamServiceImpl implements AiWorkflowStreamService {
     ) {
         Long userId = UserContext.get();
 
-        return Flux.create(sink -> Schedulers.boundedElastic().schedule(() -> {
-            UserContext.set(userId);
-            try {
-                AiWorkflowStepEmitter emitter = new AiWorkflowStepEmitter() {
-                    @Override
-                    public void emit(String step, String status, String message) {
-                        sink.next(workflowStepEvent(id, action, step, status, message));
+        return Flux.create(sink -> {
+            long subscribeAt = System.currentTimeMillis();
+
+            log.info(
+                    "[PERF-WORKFLOW] stream_subscribe runId={} action={}",
+                    id,
+                    action
+            );
+
+            Schedulers.boundedElastic().schedule(() -> {
+                long workerStart = System.currentTimeMillis();
+
+                log.info(
+                        "[PERF-WORKFLOW] worker_start runId={} action={} queueWaitMs={}",
+                        id,
+                        action,
+                        workerStart - subscribeAt
+                );
+
+                UserContext.set(userId);
+
+                AtomicBoolean firstContentLogged =
+                        new AtomicBoolean(false);
+
+                try {
+                    AiWorkflowStepEmitter emitter = new AiWorkflowStepEmitter() {
+                        @Override
+                        public void emit(String step, String status, String message) {
+                            sink.next(workflowStepEvent(id, action, step, status, message));
+                        }
+
+                        @Override
+                        public void emitContent(String step, String field, String delta) {
+                            if (firstContentLogged.compareAndSet(false, true)) {
+                                log.info(
+                                        "[PERF-WORKFLOW] sse_first_content runId={} action={} step={} field={} deltaChars={}",
+                                        id,
+                                        action,
+                                        step,
+                                        field,
+                                        delta == null ? 0 : delta.length()
+                                );
+                            }
+                            sink.next(workflowContentDeltaEvent(id, step, field, delta));
+                        }
+                    };
+
+                    long actionStart = System.currentTimeMillis();
+
+                    log.info(
+                            "[PERF-WORKFLOW] action_start runId={} action={}",
+                            id,
+                            action
+                    );
+
+                    AiWorkflowRunVO workflow =
+                            actionInvoker.apply(emitter);
+
+                    log.info(
+                            "[PERF-WORKFLOW] action_end runId={} action={} status={} durationMs={}",
+                            id,
+                            action,
+                            workflow.getStatus(),
+                            System.currentTimeMillis() - actionStart
+                    );
+
+                    List<AiWorkflowStepLogVO> stepLogs = aiWorkflowRunService.listStepLogs(id);
+
+                    if ("FAILED".equals(workflow.getStatus())) {
+                        sink.next(workflowErrorEvent(workflow, stepLogs));
+                    } else {
+                        sink.next(workflowStopEvent(workflow, stepLogs));
                     }
 
-                    @Override
-                    public void emitContent(String step, String field, String delta) {
-                        sink.next(workflowContentDeltaEvent(id, step, field, delta));
-                    }
-                };
-
-                AiWorkflowRunVO workflow = actionInvoker.apply(emitter);
-                List<AiWorkflowStepLogVO> stepLogs = aiWorkflowRunService.listStepLogs(id);
-
-                if ("FAILED".equals(workflow.getStatus())) {
-                    sink.next(workflowErrorEvent(workflow, stepLogs));
-                } else {
-                    sink.next(workflowStopEvent(workflow, stepLogs));
+                    sink.complete();
+                } catch (Throwable e) {
+                    sink.next(exceptionEvent(id, action, e));
+                    sink.complete();
+                } finally {
+                    UserContext.clear();
                 }
-
-                sink.complete();
-            } catch (Throwable e) {
-                sink.next(exceptionEvent(id, action, e));
-                sink.complete();
-            } finally {
-                UserContext.clear();
-            }
-        }));
+            });
+        });
     }
 
     private AiChatEventVO workflowContentDeltaEvent(Long id, String step, String field, String delta) {

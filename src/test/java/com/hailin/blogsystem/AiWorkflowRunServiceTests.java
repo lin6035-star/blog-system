@@ -1,5 +1,8 @@
 package com.hailin.blogsystem;
 
+import com.hailin.blogsystem.ai.workflow.WorkflowActionLock;
+import com.hailin.blogsystem.ai.workflow.AiWorkflowStepEmitter;
+import com.hailin.blogsystem.constants.RedisConstants;
 import com.hailin.blogsystem.entity.AiSessions;
 import com.hailin.blogsystem.entity.AiWorkflowRun;
 import com.hailin.blogsystem.entity.AiWorkflowStepLog;
@@ -20,10 +23,13 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.data.redis.core.StringRedisTemplate;
 
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -45,6 +51,9 @@ class AiWorkflowRunServiceTests {
 
     @Autowired
     private ArticlesMapper articlesMapper;
+
+    @Autowired
+    private StringRedisTemplate stringRedisTemplate;
 
     private AiSessions createTestSession() {
         AiSessions session = new AiSessions();
@@ -278,6 +287,30 @@ class AiWorkflowRunServiceTests {
 
         AiWorkflowStepLogVO opLog = findLog(logs, "创建文章工作流");
         assertThat(opLog.getOutputSummary()).contains("等待确认大纲");
+    }
+
+    @Test
+    void createWorkflowBindsPersistedRunIdToEmitterBeforeInitialSteps() {
+        UserContext.set(101L);
+
+        AiWorkflowCreateArticleDTO dto = new AiWorkflowCreateArticleDTO();
+        dto.setRequirement("帮我写一篇 Redis 缓存博客");
+
+        AtomicReference<Long> boundRunId = new AtomicReference<>();
+        AiWorkflowStepEmitter emitter = new AiWorkflowStepEmitter() {
+            @Override
+            public void emit(String step, String status, String message) {
+            }
+
+            @Override
+            public void bindWorkflowRunId(Long workflowRunId) {
+                boundRunId.set(workflowRunId);
+            }
+        };
+
+        AiWorkflowRunVO created = aiWorkflowRunService.createArticleWorkflow(dto, emitter);
+
+        assertThat(boundRunId).hasValue(Long.valueOf(created.getId()));
     }
 
     @Test
@@ -634,5 +667,164 @@ class AiWorkflowRunServiceTests {
         assertThat(saved.getRetryCount()).isEqualTo(1);
         assertThat(saved.getStatus()).isEqualTo(AiWorkflowStatus.WAITING_DRAFT_CONFIRM.name());
         assertThat(saved.getCurrentStep()).isEqualTo("CONTENT_CHECK");
+    }
+
+
+    @Test
+    void approveClaimsWorkflowVersion() {
+        UserContext.set(101L);
+
+        AiWorkflowCreateArticleDTO dto = new AiWorkflowCreateArticleDTO();
+        dto.setRequirement("帮我写一篇 Redis 缓存原理的博客");
+
+        AiWorkflowRunVO created =
+                aiWorkflowRunService.createArticleWorkflow(dto);
+
+        Long runId = Long.valueOf(created.getId());
+
+        AiWorkflowRun before = aiWorkflowRunMapper.selectById(runId);
+        assertThat(before.getVersion()).isEqualTo(0);
+
+        aiWorkflowRunService.approve(runId);
+
+        AiWorkflowRun after = aiWorkflowRunMapper.selectById(runId);
+        assertThat(after.getVersion()).isEqualTo(1);
+    }
+
+    @Test
+    void approveWithSameIdempotencyKeyReturnsCachedResult() {
+        UserContext.set(101L);
+
+        AiWorkflowCreateArticleDTO dto =
+                new AiWorkflowCreateArticleDTO();
+
+        dto.setRequirement("帮我写一篇 Redis 缓存原理的博客");
+
+        AiWorkflowRunVO created =
+                aiWorkflowRunService.createArticleWorkflow(dto);
+
+        Long runId = Long.valueOf(created.getId());
+        String idempotencyKey =
+                "approve-" + java.util.UUID.randomUUID();
+
+        AiWorkflowRunVO first =
+                aiWorkflowRunService.approve(
+                        runId,
+                        idempotencyKey,
+                        com.hailin.blogsystem.ai.workflow
+                                .AiWorkflowStepEmitter.noop()
+                );
+
+        AiWorkflowRun savedAfterFirst =
+                aiWorkflowRunMapper.selectById(runId);
+
+        AiWorkflowRunVO second =
+                aiWorkflowRunService.approve(
+                        runId,
+                        idempotencyKey,
+                        com.hailin.blogsystem.ai.workflow
+                                .AiWorkflowStepEmitter.noop()
+                );
+
+        AiWorkflowRun savedAfterSecond =
+                aiWorkflowRunMapper.selectById(runId);
+
+        assertThat(second.getStatus())
+                .isEqualTo(first.getStatus());
+
+        assertThat(second.getCurrentStep())
+                .isEqualTo(first.getCurrentStep());
+
+        assertThat(savedAfterSecond.getVersion())
+                .isEqualTo(savedAfterFirst.getVersion());
+    }
+
+    @Test
+    void cancelClaimsWorkflowVersionAndClearsSessionBinding() {
+        UserContext.set(101L);
+
+        AiSessions session = createTestSession();
+
+        AiWorkflowCreateArticleDTO dto =
+                new AiWorkflowCreateArticleDTO();
+
+        dto.setConversationId(session.getId());
+        dto.setRequirement("帮我写一篇 Redis 缓存原理的博客");
+
+        AiWorkflowRunVO created =
+                aiWorkflowRunService.createArticleWorkflow(dto);
+
+        Long runId = Long.valueOf(created.getId());
+
+        AiWorkflowRun before =
+                aiWorkflowRunMapper.selectById(runId);
+
+        assertThat(before.getVersion()).isEqualTo(0);
+
+        aiWorkflowRunService.cancel(runId);
+
+        AiWorkflowRun after =
+                aiWorkflowRunMapper.selectById(runId);
+
+        assertThat(after.getStatus())
+                .isEqualTo(AiWorkflowStatus.CANCELLED.name());
+        assertThat(after.getVersion()).isEqualTo(1);
+
+        AiSessions savedSession =
+                aiSessionMapper.selectById(session.getId());
+
+        assertThat(savedSession.getActiveWorkflowRunId())
+                .isNull();
+    }
+
+    @Test
+    void approveRejectsBusyWorkflowWithoutMarkingFailed() {
+        UserContext.set(101L);
+
+        AiWorkflowRun run = new AiWorkflowRun();
+        run.setUserId(101L);
+        run.setWorkflowType("CREATE_ARTICLE");
+        run.setWorkflowVersion("1.0");
+        run.setStatus(AiWorkflowStatus.WAITING_OUTLINE_CONFIRM.name());
+        run.setCurrentStep("GENERATE_OUTLINE");
+        run.setContextJson("{}");
+        run.setVersion(0);
+        run.setRetryCount(0);
+        run.setCreatedAt(LocalDateTime.now());
+        run.setUpdatedAt(LocalDateTime.now());
+
+        aiWorkflowRunMapper.insert(run);
+
+        String lockKey =
+                RedisConstants.AI_WORKFLOW_ACTION_LOCK_KEY_PREFIX
+                        + run.getId();
+
+        stringRedisTemplate.opsForValue().set(
+                lockKey,
+                "another-request",
+                120L,
+                TimeUnit.SECONDS
+        );
+
+        try {
+            assertThatThrownBy(
+                    () -> aiWorkflowRunService.approve(run.getId())
+            )
+                    .isInstanceOf(
+                            WorkflowActionLock.WorkflowActionBusyException.class
+                    )
+                    .hasMessage("Workflow 正在处理中，请稍后刷新");
+
+            AiWorkflowRun saved =
+                    aiWorkflowRunMapper.selectById(run.getId());
+
+            assertThat(saved.getStatus())
+                    .isEqualTo(
+                            AiWorkflowStatus.WAITING_OUTLINE_CONFIRM.name()
+                    );
+            assertThat(saved.getVersion()).isEqualTo(0);
+        } finally {
+            stringRedisTemplate.delete(lockKey);
+        }
     }
 }
