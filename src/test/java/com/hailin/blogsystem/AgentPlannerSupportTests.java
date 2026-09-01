@@ -539,6 +539,363 @@ class AgentPlannerSupportTests {
         assertThat(decision.getAction()).isEqualTo(AgentAction.CTA);
     }
 
+    @Test
+    void learningAgentIntentRoutesToAgentAction() {
+        AiIntent intent = new AiIntent();
+        intent.setIntent("LEARNING_AGENT");
+        intent.setConfidence(0.92);
+        intent.setSuggestedAction("AGENT");
+        intent.setSuggestedWorkflowType(null);
+        intent.setRisk("LOW");
+
+        AgentDecision decision = planner.decide(
+                "我今天继续学 Redis，帮我安排今天学什么",
+                intent,
+                null,
+                1L,
+                session(10L)
+        );
+
+        assertThat(decision.getAction()).isEqualTo(AgentAction.AGENT);
+        assertThat(decision.getIntent()).isEqualTo("LEARNING_AGENT");
+        assertThat(decision.getRuleHits()).contains("learning_agent_intent");
+    }
+
+    @Test
+    void learningAgentIntentIsNotPulledIntoLearningPlanWorkflow() {
+        // “帮我安排今天学习”会命中 looksLikeLearningPlanRequest 正则，
+        // 但分类器主判 LEARNING_AGENT 时，后端不得把它拉进 LEARNING_PLAN 管道。
+        AiIntent intent = new AiIntent();
+        intent.setIntent("LEARNING_AGENT");
+        intent.setConfidence(0.92);
+        intent.setSuggestedAction("WORKFLOW");
+        intent.setSuggestedWorkflowType("LEARNING_PLAN");
+        intent.setRisk("LOW");
+
+        AgentDecision decision = planner.decide(
+                "帮我安排今天学习",
+                intent,
+                null,
+                1L,
+                session(10L)
+        );
+
+        assertThat(decision.getAction()).isNotEqualTo(AgentAction.WORKFLOW);
+        assertThat(decision.getWorkflowType()).isNull();
+    }
+
+    @Test
+    void learningAgentCtaSuggestionStaysCta() {
+        AiIntent intent = new AiIntent();
+        intent.setIntent("LEARNING_AGENT");
+        intent.setConfidence(0.60);
+        intent.setSuggestedAction("CTA");
+        intent.setRisk("MEDIUM");
+        intent.setReason("学习目标不够明确");
+
+        AgentDecision decision = planner.decide(
+                "我最近学 Redis 有点乱",
+                intent,
+                null,
+                1L,
+                session(10L)
+        );
+
+        assertThat(decision.getAction()).isEqualTo(AgentAction.CTA);
+        assertThat(decision.getReason()).contains("分类器建议 CTA");
+    }
+
+    @Test
+    void learningAgentSuggestionMismatchFallsBackToChat() {
+        AiIntent intent = new AiIntent();
+        intent.setIntent("LEARNING_AGENT");
+        intent.setConfidence(0.92);
+        intent.setSuggestedAction("CHAT");
+        intent.setRisk("LOW");
+
+        AgentDecision decision = planner.decide(
+                "我今天继续学 Redis",
+                intent,
+                null,
+                1L,
+                session(10L)
+        );
+
+        assertThat(decision.getAction()).isEqualTo(AgentAction.CHAT);
+        assertThat(decision.getReason()).contains("建议不一致");
+    }
+
+    @Test
+    void articleAgentIntentRoutesToAgentAction() {
+        // V2.5：文章页 + 模糊优化诉求 → 文章 Agent Runtime
+        AiIntent intent = new AiIntent();
+        intent.setIntent("ARTICLE_AGENT");
+        intent.setConfidence(0.9);
+        intent.setSuggestedAction("AGENT");
+        intent.setSuggestedWorkflowType(null);
+        intent.setRisk("LOW");
+
+        PageContextDTO pageContext = new PageContextDTO();
+        pageContext.setPageType("article-detail");
+        pageContext.setArticleId("12");
+
+        AgentDecision decision = planner.decide(
+                "帮我看看这篇文章还能怎么改",
+                intent,
+                pageContext,
+                1L,
+                session(10L)
+        );
+
+        assertThat(decision.getAction()).isEqualTo(AgentAction.AGENT);
+        assertThat(decision.getIntent()).isEqualTo("ARTICLE_AGENT");
+        assertThat(decision.getRuleHits()).contains("article_agent_intent");
+        assertThat(decision.getRuleHits()).contains("article_context_valid");
+    }
+
+    @Test
+    void articleAgentWithoutArticleContextFallsBackToCta() {
+        // V2.5：文章 Agent 缺 articleId（非文章页说同样的话）→ 降级 CTA，不猜
+        AiIntent intent = new AiIntent();
+        intent.setIntent("ARTICLE_AGENT");
+        intent.setConfidence(0.9);
+        intent.setSuggestedAction("AGENT");
+        intent.setRisk("LOW");
+
+        AgentDecision decision = planner.decide(
+                "帮我看看这篇文章还能怎么改",
+                intent,
+                null,
+                1L,
+                session(10L)
+        );
+
+        assertThat(decision.getAction()).isEqualTo(AgentAction.CTA);
+        assertThat(decision.getRuleHits()).contains("article_context_missing");
+    }
+
+    @Test
+    void articleAgentCtaSuggestionStaysCta() {
+        AiIntent intent = new AiIntent();
+        intent.setIntent("ARTICLE_AGENT");
+        intent.setConfidence(0.6);
+        intent.setSuggestedAction("CTA");
+        intent.setRisk("MEDIUM");
+        intent.setReason("优化诉求不够明确");
+
+        PageContextDTO pageContext = new PageContextDTO();
+        pageContext.setPageType("article-detail");
+        pageContext.setArticleId("12");
+
+        AgentDecision decision = planner.decide(
+                "帮我看看这篇文章",
+                intent,
+                pageContext,
+                1L,
+                session(10L)
+        );
+
+        assertThat(decision.getAction()).isEqualTo(AgentAction.CTA);
+        assertThat(decision.getReason()).contains("分类器建议 CTA");
+    }
+
+    @Test
+    void articleAgentSuggestionMismatchFallsBackToChat() {
+        AiIntent intent = new AiIntent();
+        intent.setIntent("ARTICLE_AGENT");
+        intent.setConfidence(0.9);
+        intent.setSuggestedAction("CHAT");
+        intent.setRisk("LOW");
+
+        PageContextDTO pageContext = new PageContextDTO();
+        pageContext.setPageType("article-detail");
+        pageContext.setArticleId("12");
+
+        AgentDecision decision = planner.decide(
+                "帮我看看这篇文章",
+                intent,
+                pageContext,
+                1L,
+                session(10L)
+        );
+
+        assertThat(decision.getAction()).isEqualTo(AgentAction.CHAT);
+        assertThat(decision.getReason()).contains("建议不一致");
+    }
+
+    @Test
+    void articleAgentIntentIsNotPulledIntoOptimizeArticleWorkflow() {
+        // V2.5：分类器主判 ARTICLE_AGENT 时，不得被拉进 OPTIMIZE_ARTICLE Workflow 管道
+        AiIntent intent = new AiIntent();
+        intent.setIntent("ARTICLE_AGENT");
+        intent.setConfidence(0.9);
+        intent.setSuggestedAction("WORKFLOW");
+        intent.setSuggestedWorkflowType("OPTIMIZE_ARTICLE");
+        intent.setRisk("LOW");
+
+        PageContextDTO pageContext = new PageContextDTO();
+        pageContext.setPageType("article-detail");
+        pageContext.setArticleId("12");
+
+        AgentDecision decision = planner.decide(
+                "帮我看看这篇文章",
+                intent,
+                pageContext,
+                1L,
+                session(10L)
+        );
+
+        assertThat(decision.getAction()).isNotEqualTo(AgentAction.WORKFLOW);
+        assertThat(decision.getWorkflowType()).isNull();
+    }
+
+    @Test
+    void generalChatWithNeedsThinkingRoutesToAgentAction() {
+        // V3：GENERAL_CHAT + needsThinking=true → 通用 Agent Runtime（归一化收在 Planner 单点）
+        AiIntent intent = new AiIntent();
+        intent.setIntent("GENERAL_CHAT");
+        intent.setConfidence(0.85);
+        intent.setSuggestedAction("CHAT");
+        intent.setSuggestedWorkflowType(null);
+        intent.setRisk("LOW");
+        intent.setNeedsThinking(true);
+        intent.setNeedsThinkingReason("问题指向前文讨论的方案");
+
+        AgentDecision decision = planner.decide(
+                "你觉得我现在这套方案还有什么问题",
+                intent,
+                null,
+                1L,
+                session(10L)
+        );
+
+        assertThat(decision.getAction()).isEqualTo(AgentAction.AGENT);
+        assertThat(decision.getIntent()).isEqualTo("GENERAL_CHAT");
+        assertThat(decision.getRuleHits()).contains("general_agent_needs_thinking");
+    }
+
+    @Test
+    void generalChatWithoutNeedsThinkingStaysChat() {
+        // V3：needsThinking=false 维持现状（直达普通聊天 + 自动 RAG）
+        AiIntent intent = new AiIntent();
+        intent.setIntent("GENERAL_CHAT");
+        intent.setConfidence(0.98);
+        intent.setSuggestedAction("CHAT");
+        intent.setRisk("LOW");
+        intent.setNeedsThinking(false);
+
+        AgentDecision decision = planner.decide(
+                "什么是缓存穿透",
+                intent,
+                null,
+                1L,
+                session(10L)
+        );
+
+        assertThat(decision.getAction()).isEqualTo(AgentAction.CHAT);
+        assertThat(decision.getRuleHits()).doesNotContain("general_agent_needs_thinking");
+    }
+
+    @Test
+    void generalChatWithNeedsThinkingGuestFallsBackToChat() {
+        // V3：游客恒 false（无记忆、无归属），不进通用 Runtime
+        AiIntent intent = new AiIntent();
+        intent.setIntent("GENERAL_CHAT");
+        intent.setConfidence(0.85);
+        intent.setSuggestedAction("CHAT");
+        intent.setRisk("LOW");
+        intent.setNeedsThinking(true);
+
+        AgentDecision decision = planner.decide(
+                "结合我最近的情况给个建议",
+                intent,
+                null,
+                null,
+                null
+        );
+
+        assertThat(decision.getAction()).isEqualTo(AgentAction.CHAT);
+        assertThat(decision.getRuleHits()).contains("guest_needs_thinking_forbidden");
+    }
+
+    @Test
+    void generalChatWithNeedsThinkingSuggestionMismatchFallsBackToChat() {
+        // V3：分类器内部不一致（needsThinking=true 但建议 TOOL）→ 普通聊天
+        AiIntent intent = new AiIntent();
+        intent.setIntent("GENERAL_CHAT");
+        intent.setConfidence(0.85);
+        intent.setSuggestedAction("TOOL");
+        intent.setSuggestedWorkflowType(null);
+        intent.setRisk("LOW");
+        intent.setNeedsThinking(true);
+
+        AgentDecision decision = planner.decide(
+                "你觉得我现在这套方案还有什么问题",
+                intent,
+                null,
+                1L,
+                session(10L)
+        );
+
+        assertThat(decision.getAction()).isEqualTo(AgentAction.CHAT);
+        assertThat(decision.getReason()).contains("建议不一致");
+    }
+
+    @Test
+    void generalChatWithNeedsThinkingCtaStaysCta() {
+        // V3：分类器建议 CTA → 保持 CTA（澄清优先）
+        AiIntent intent = new AiIntent();
+        intent.setIntent("GENERAL_CHAT");
+        intent.setConfidence(0.6);
+        intent.setSuggestedAction("CTA");
+        intent.setRisk("MEDIUM");
+        intent.setNeedsThinking(true);
+
+        AgentDecision decision = planner.decide(
+                "你觉得呢",
+                intent,
+                null,
+                1L,
+                session(10L)
+        );
+
+        assertThat(decision.getAction()).isEqualTo(AgentAction.CTA);
+    }
+
+    @Test
+    void createWordingLearningPlanRequestAutoStarts() {
+        // V3.0：明确诉求「创建…学习规划」不再被正则漏匹配降级 CTA
+        AiIntent intent = workflowIntent("LEARNING_PLAN", AiWorkflowType.LEARNING_PLAN, 0.95, "LOW");
+
+        AgentDecision decision = planner.decide(
+                "创建关于Java的学习规划，两个月",
+                intent,
+                null,
+                1L,
+                session(10L)
+        );
+
+        assertThat(decision.getAction()).isEqualTo(AgentAction.WORKFLOW);
+        assertThat(decision.getWorkflowType()).isEqualTo(AiWorkflowType.LEARNING_PLAN);
+    }
+
+    @Test
+    void giveMeWordingLearningPlanRequestAutoStarts() {
+        // V3.0：「给我一个学习计划」变体（无「帮我」前缀）也命中
+        AiIntent intent = workflowIntent("LEARNING_PLAN", AiWorkflowType.LEARNING_PLAN, 0.95, "LOW");
+
+        AgentDecision decision = planner.decide(
+                "结合我最近的情况，给我一个学习计划",
+                intent,
+                null,
+                1L,
+                session(10L)
+        );
+
+        assertThat(decision.getAction()).isEqualTo(AgentAction.WORKFLOW);
+        assertThat(decision.getWorkflowType()).isEqualTo(AiWorkflowType.LEARNING_PLAN);
+    }
+
     private AiIntent workflowIntent(String intentType, AiWorkflowType workflowType, double confidence, String risk) {
         AiIntent intent = new AiIntent();
         intent.setIntent(intentType);

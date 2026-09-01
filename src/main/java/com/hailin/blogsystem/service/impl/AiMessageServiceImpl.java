@@ -5,6 +5,14 @@ import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hailin.blogsystem.ai.TokenUsageAccumulator;
+import com.hailin.blogsystem.ai.agent.AgentRunResult;
+import com.hailin.blogsystem.ai.agent.AgentRuntime;
+import com.hailin.blogsystem.ai.agent.AgentStepEmitter;
+import com.hailin.blogsystem.ai.agent.AgentWorkflowSuggestion;
+import com.hailin.blogsystem.ai.agent.AgentWriteProposal;
+import com.hailin.blogsystem.ai.agent.ArticleAgentRuntime;
+import com.hailin.blogsystem.ai.agent.GeneralAgentRuntime;
+import com.hailin.blogsystem.ai.agent.LearningAgentRuntime;
 import com.hailin.blogsystem.ai.planner.AgentPlannerSupport;
 import com.hailin.blogsystem.ai.trace.AgentDecisionTrace;
 import com.hailin.blogsystem.ai.trace.AgentDecisionTraceSink;
@@ -72,6 +80,9 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
     private final LearningPlansService learningPlansService;
     private final AgentPlannerSupport agentPlannerSupport;
     private final AgentDecisionTraceSink agentDecisionTraceSink;
+    private final LearningAgentRuntime learningAgentRuntime;
+    private final ArticleAgentRuntime articleAgentRuntime;
+    private final GeneralAgentRuntime generalAgentRuntime;
 
     private static final String ROLE_USER = "user";
     private static final String ROLE_ASSISTANT = "assistant";
@@ -343,6 +354,53 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             }
         }
 
+        /*
+         * Agent Runtime 分发（LEARNING_AGENT）。
+         * 同步执行有界只读 Loop（maxSteps=5），结果按普通消息流式返回。
+         */
+        if (routeDecision.getAction() == AgentAction.AGENT) {
+            // V2.5：按意图分发领域 Runtime（学习 / 文章），共用同一流式管道
+            if ("ARTICLE_AGENT".equals(intent == null ? null : intent.getIntent())) {
+                return streamAgentReply(
+                        articleAgentRuntime,
+                        message,
+                        pageContext,
+                        rawPageContextJson,
+                        userId,
+                        sessionId,
+                        session,
+                        requestId,
+                        "暂时无法分析文章，请稍后重试。"
+                );
+            }
+            // V3：GENERAL_CHAT + needsThinking=true（Planner 已归一化）→ 通用 Agent Runtime。
+            // 该分支直接 return，天然跳过下方普通聊天链路的自动 RAG 注入（无双份检索）。
+            if ("GENERAL_CHAT".equals(intent == null ? null : intent.getIntent())) {
+                return streamAgentReply(
+                        generalAgentRuntime,
+                        message,
+                        pageContext,
+                        rawPageContextJson,
+                        userId,
+                        sessionId,
+                        session,
+                        requestId,
+                        "暂时无法结合你的情况回答，请稍后重试。"
+                );
+            }
+            return streamAgentReply(
+                    learningAgentRuntime,
+                    message,
+                    pageContext,
+                    rawPageContextJson,
+                    userId,
+                    sessionId,
+                    session,
+                    requestId,
+                    "暂时无法整理学习建议，请稍后重试。"
+            );
+        }
+
 
         AiArticleActionCommand articleActionFromIntent = buildArticleActionFromDecision(routeDecision, intent, pageContext);
         String extraPromptContext = buildExtraPromptContextFromIntent(intent, pageContext);
@@ -515,6 +573,165 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 ;
     }
 
+    /**
+     * Agent 公共流式返回管道（V2.5 抽取，学习 / 文章域共用）。
+     *
+     * 同步执行领域 Runtime 的有界只读 Loop（maxSteps=5），拿到最终回答后
+     * 按 32 字符切块模拟流式（与模型降级路径一致，前端无感知），
+     * 消息落库与普通聊天一致。
+     * AGENT_STEP / STOP 透出（workflowSuggestion / writeAction）与 agentRunId 绑定
+     * 全部通用，领域差异只体现在 runtime 与兜底文案。
+     */
+    private Flux<AiChatEventVO> streamAgentReply(
+            AgentRuntime runtime,
+            String message,
+            PageContextDTO pageContext,
+            String rawPageContextJson,
+            Long userId,
+            Long sessionId,
+            AiSessions session,
+            String requestId,
+            String fallbackReply
+    ) {
+        // 用户消息落库（同步，立即可见）
+        AiMessages userMessage = new AiMessages();
+        userMessage.setSessionId(sessionId);
+        userMessage.setRole(ROLE_USER);
+        userMessage.setContent(message);
+        userMessage.setPageContext(rawPageContextJson);
+        userMessage.setCreatedAt(LocalDateTime.now());
+        save(userMessage);
+
+        AiChatEventVO paramEvent = AiChatEventVO.builder()
+                .eventType(AiChatEventType.PARAM.getValue())
+                .eventData(Map.of(
+                        "session", AiSessionVO.from(session),
+                        "userMessage", AiMessageVO.from(userMessage)
+                ))
+                .build();
+
+        /*
+         * V2.3：Agent Loop 在独立线程同步执行，每步通过 AgentStepEmitter 实时推
+         * AGENT_STEP 事件（前端"思考过程"面板），跑完再推正文 DATA + STOP。
+         * 与 Workflow 的 Flux.create + boundedElastic 模式一致。
+         */
+        Flux<AiChatEventVO> agentEvents = Flux.create(sink -> {
+            AgentStepEmitter emitter = (stepNo, actionType, status, stepMessage) ->
+                    emitIfOpen(sink, AiChatEventVO.builder()
+                            .eventType(AiChatEventType.AGENT_STEP.getValue())
+                            .eventData(Map.of(
+                                    "stepNo", stepNo,
+                                    "actionType", actionType,
+                                    "status", status,
+                                    "message", stepMessage
+                            ))
+                            .build());
+
+            Schedulers.boundedElastic().schedule(() -> {
+                UserContext.set(userId);
+                try {
+                    AgentRunResult result = runtime.run(
+                            userId, sessionId, message, pageContext, emitter
+                    );
+
+                    String reply = result.finalAnswer() == null
+                            ? fallbackReply
+                            : result.finalAnswer();
+
+                    // 正文按 32 字符切块流式输出
+                    for (String chunk : splitIntoChunks(reply, 32)) {
+                        emitIfOpen(sink, AiChatEventVO.builder()
+                                .eventType(AiChatEventType.DATA.getValue())
+                                .eventData(chunk)
+                                .build());
+                    }
+
+                    // 消息落库 + 记忆提取 + 压缩 + suggestion 透出（原 STOP 逻辑）
+                    AiMessages assistantMessage = saveStreamAssistantMessage(
+                            sessionId, userId, rawPageContextJson, reply
+                    );
+
+                    // V2.1/V2.3：所有 Agent run 都绑定 agentRunId（建议卡 + 思考步骤刷新恢复）
+                    AgentWorkflowSuggestion suggestion = result.pendingWorkflowSuggestion();
+                    if (result.agentRunId() != null) {
+                        assistantMessage.setAgentRunId(result.agentRunId());
+                        updateById(assistantMessage);
+                    }
+
+                    aiMemoryCandidateExtractorService.extractAfterChat(
+                            userId,
+                            sessionId,
+                            userMessage.getId(),
+                            message,
+                            reply
+                    );
+                    aiEpisodicMemoryExtractorService.extractAfterChat(
+                            userId,
+                            sessionId,
+                            userMessage.getId(),
+                            assistantMessage.getId(),
+                            message,
+                            reply
+                    );
+                    aiConversationSummaryService.compressAfterChat(userId, sessionId);
+
+                    AiSessions updatedSession = getOwnedSession(sessionId, userId);
+
+                    Map<String, Object> eventData = new HashMap<>();
+                    eventData.put("session", AiSessionVO.from(updatedSession));
+                    eventData.put("assistantMessage", AiMessageVO.from(assistantMessage));
+                    if (suggestion != null) {
+                        eventData.put("workflowSuggestion", suggestion);
+                    }
+                    // V2.4：写动作提案透出（前端渲染写动作确认卡）
+                    AgentWriteProposal writeAction = result.pendingWriteAction();
+                    if (writeAction != null) {
+                        eventData.put("writeAction", writeAction);
+                    }
+
+                    emitIfOpen(sink, AiChatEventVO.builder()
+                            .eventType(AiChatEventType.STOP.getValue())
+                            .eventData(eventData)
+                            .build());
+
+                    completeIfOpen(sink);
+                } catch (Throwable e) {
+                    log.error("Agent 流式执行异常: userId={}", userId, e);
+                    AiMessages assistantMessage = saveStreamAssistantMessage(
+                            sessionId, userId, rawPageContextJson,
+                            "抱歉，AI 助手暂时不可用，请稍后再试。"
+                    );
+                    Map<String, Object> eventData = new HashMap<>();
+                    eventData.put("session", AiSessionVO.from(getOwnedSession(sessionId, userId)));
+                    eventData.put("assistantMessage", AiMessageVO.from(assistantMessage));
+                    emitIfOpen(sink, AiChatEventVO.builder()
+                            .eventType(AiChatEventType.STOP.getValue())
+                            .eventData(eventData)
+                            .build());
+                    completeIfOpen(sink);
+                } finally {
+                    UserContext.clear();
+                }
+            });
+        });
+
+        return Flux.concat(
+                Flux.just(paramEvent),
+                agentEvents
+        ).doFinally(signalType -> aiToolActionRegistry.clear(requestId));
+    }
+
+    private List<String> splitIntoChunks(String text, int chunkSize) {
+        if (text == null || text.isEmpty()) {
+            return List.of("");
+        }
+        List<String> chunks = new ArrayList<>();
+        for (int i = 0; i < text.length(); i += chunkSize) {
+            chunks.add(text.substring(i, Math.min(text.length(), i + chunkSize)));
+        }
+        return chunks;
+    }
+
     /** 文章创作意图但没有明确主题 → 追问主题，不起 Workflow */
     private Flux<AiChatEventVO> streamAskArticleTopic(
             String message,
@@ -616,7 +833,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                                 eventData.put("step", step);
                                 eventData.put("status", status);
                                 eventData.put("message", stepMessage);
-                                sink.next(AiChatEventVO.builder()
+                                emitIfOpen(sink, AiChatEventVO.builder()
                                         .eventType(AiChatEventType.WORKFLOW_STEP.getValue())
                                         .eventData(eventData)
                                         .build());
@@ -634,7 +851,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                                     eventData.put("step", step);
                                     eventData.put("field", field);
                                     eventData.put("delta", delta);
-                                    sink.next(AiChatEventVO.builder()
+                                    emitIfOpen(sink, AiChatEventVO.builder()
                                             .eventType(AiChatEventType.WORKFLOW_CONTENT_DELTA.getValue())
                                             .eventData(eventData)
                                             .build());
@@ -660,12 +877,12 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                         eventData.put("references", List.of());
                         eventData.put("workflow", workflow);
 
-                        sink.next(AiChatEventVO.builder()
+                        emitIfOpen(sink, AiChatEventVO.builder()
                                 .eventType(AiChatEventType.STOP.getValue())
                                 .eventData(eventData)
                                 .build());
 
-                        sink.complete();
+                        completeIfOpen(sink);
                     } catch (Throwable e) {
                         emitRejectedOrError(sink, sessionId, userId, rawPageContextJson,
                                 AiWorkflowType.OPTIMIZE_ARTICLE.name(), e);
@@ -713,7 +930,9 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
     ) {
         String friendly = workflowHandlerRegistry.get(workflowType).buildRejectedMessage(e);
         if (friendly == null) {
-            sink.error(e);
+            if (!sink.isCancelled()) {
+                sink.error(e);
+            }
             return;
         }
 
@@ -732,12 +951,12 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         eventData.put("assistantMessage", AiMessageVO.from(assistantMessage));
         eventData.put("references", List.of());
 
-        sink.next(AiChatEventVO.builder()
+        emitIfOpen(sink, AiChatEventVO.builder()
                 .eventType(AiChatEventType.STOP.getValue())
                 .eventData(eventData)
                 .build());
 
-        sink.complete();
+        completeIfOpen(sink);
     }
 
     private Optional<Flux<AiChatEventVO>> routeLearningAssistWorkflow(
@@ -935,7 +1154,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                                 eventData.put("step", step);
                                 eventData.put("status", status);
                                 eventData.put("message", stepMessage);
-                                sink.next(AiChatEventVO.builder()
+                                emitIfOpen(sink, AiChatEventVO.builder()
                                         .eventType(AiChatEventType.WORKFLOW_STEP.getValue())
                                         .eventData(eventData)
                                         .build());
@@ -953,7 +1172,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                                     eventData.put("step", step);
                                     eventData.put("field", field);
                                     eventData.put("delta", delta);
-                                    sink.next(AiChatEventVO.builder()
+                                    emitIfOpen(sink, AiChatEventVO.builder()
                                             .eventType(AiChatEventType.WORKFLOW_CONTENT_DELTA.getValue())
                                             .eventData(eventData)
                                             .build());
@@ -980,12 +1199,12 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                         eventData.put("references", List.of());
                         eventData.put("workflow", workflow);
 
-                        sink.next(AiChatEventVO.builder()
+                        emitIfOpen(sink, AiChatEventVO.builder()
                                 .eventType(AiChatEventType.STOP.getValue())
                                 .eventData(eventData)
                                 .build());
 
-                        sink.complete();
+                        completeIfOpen(sink);
                     } catch (Throwable e) {
                         emitRejectedOrError(sink, sessionId, userId, rawPageContextJson,
                                 AiWorkflowType.CREATE_ARTICLE.name(), e);
@@ -1064,12 +1283,12 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                         eventData.put("references", List.of());
                         eventData.put("workflow", workflow);
 
-                        sink.next(AiChatEventVO.builder()
+                        emitIfOpen(sink, AiChatEventVO.builder()
                                 .eventType(AiChatEventType.STOP.getValue())
                                 .eventData(eventData)
                                 .build());
 
-                        sink.complete();
+                        completeIfOpen(sink);
                     } catch (Throwable e) {
                         emitRejectedOrError(sink, sessionId, userId, rawPageContextJson,
                                 AiWorkflowType.LEARNING_PLAN.name(), e);
@@ -1151,12 +1370,12 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                         eventData.put("references", List.of());
                         eventData.put("workflow", workflow);
 
-                        sink.next(AiChatEventVO.builder()
+                        emitIfOpen(sink, AiChatEventVO.builder()
                                 .eventType(AiChatEventType.STOP.getValue())
                                 .eventData(eventData)
                                 .build());
 
-                        sink.complete();
+                        completeIfOpen(sink);
                     } catch (Throwable e) {
                         emitRejectedOrError(sink, sessionId, userId, rawPageContextJson,
                                 AiWorkflowType.LEARNING_PROGRESS.name(), e);
@@ -1238,12 +1457,12 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                         eventData.put("references", List.of());
                         eventData.put("workflow", workflow);
 
-                        sink.next(AiChatEventVO.builder()
+                        emitIfOpen(sink, AiChatEventVO.builder()
                                 .eventType(AiChatEventType.STOP.getValue())
                                 .eventData(eventData)
                                 .build());
 
-                        sink.complete();
+                        completeIfOpen(sink);
                     } catch (Throwable e) {
                         emitRejectedOrError(sink, sessionId, userId, rawPageContextJson,
                                 AiWorkflowType.LEARNING_ASSIST.name(), e);
@@ -1524,6 +1743,55 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                     rawPageContextJson,
                     userMessage,
                     routeDecision
+            );
+        }
+
+        /*
+         * Agent Runtime 与 Workflow 一致：
+         * 删除回退路径已保存的 userMessage，
+         * 由 streamAgentReply 内部重新保存。
+         */
+        if (routeDecision.getAction() == AgentAction.AGENT) {
+            removeById(userMessage.getId());
+
+            // V2.5：按意图分发领域 Runtime（与主分发一致）
+            if ("ARTICLE_AGENT".equals(intent == null ? null : intent.getIntent())) {
+                return streamAgentReply(
+                        articleAgentRuntime,
+                        message,
+                        pageContext,
+                        rawPageContextJson,
+                        userId,
+                        sessionId,
+                        session,
+                        requestId,
+                        "暂时无法分析文章，请稍后重试。"
+                );
+            }
+            // V3：通用 Agent Runtime（与主分发一致）
+            if ("GENERAL_CHAT".equals(intent == null ? null : intent.getIntent())) {
+                return streamAgentReply(
+                        generalAgentRuntime,
+                        message,
+                        pageContext,
+                        rawPageContextJson,
+                        userId,
+                        sessionId,
+                        session,
+                        requestId,
+                        "暂时无法结合你的情况回答，请稍后重试。"
+                );
+            }
+            return streamAgentReply(
+                    learningAgentRuntime,
+                    message,
+                    pageContext,
+                    rawPageContextJson,
+                    userId,
+                    sessionId,
+                    session,
+                    requestId,
+                    "暂时无法整理学习建议，请稍后重试。"
             );
         }
 
@@ -1930,7 +2198,30 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             return "学习 Workflow 需要登录后使用，请先登录后再试。";
         }
 
+        if ("LEARNING_AGENT".equals(currentIntent)) {
+            return "学习建议助手需要登录后使用，请先登录后再试。";
+        }
+
+        if ("ARTICLE_AGENT".equals(currentIntent)) {
+            return "文章优化助手需要登录后使用，请先登录后再试。";
+        }
+
         return "这个功能需要登录后使用，请先登录后再试。";
+    }
+
+    /**
+     * 分类器是否已判出明确的业务 Workflow 诉求（V3.0）。
+     *
+     * 游客路径用：即使 Planner 双签未命中降级 CTA，明确诉求也先给登录提示，
+     * 而不是让游客反复补充信息。主题未明确的文章创作仍保留追问（见 buildGuestDecisionContent）。
+     */
+    private boolean isExplicitGuestBusinessIntent(AiIntent intent) {
+        if (intent == null) {
+            return false;
+        }
+        return "WORKFLOW".equals(intent.getSuggestedAction())
+                && intent.getSuggestedWorkflowType() != null
+                && !intent.getSuggestedWorkflowType().isBlank();
     }
 
     /**
@@ -2000,11 +2291,31 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         return Flux.just(paramEvent, stopEvent);
     }
 
+    private void emitIfOpen(FluxSink<AiChatEventVO> sink, AiChatEventVO event) {
+        if (!sink.isCancelled()) {
+            sink.next(event);
+        }
+    }
+
+    private void completeIfOpen(FluxSink<AiChatEventVO> sink) {
+        if (!sink.isCancelled()) {
+            sink.complete();
+        }
+    }
+
     /** 清空 session 的 activeWorkflowRunId */
     private void clearSessionActiveWorkflow(AiSessions session) {
         if (session.getActiveWorkflowRunId() == null) {
             return;
         }
+        Long activeWorkflowRunId = session.getActiveWorkflowRunId();
+        aiSessionService.lambdaUpdate()
+                .eq(AiSessions::getId, session.getId())
+                .eq(AiSessions::getUserId, session.getUserId())
+                .eq(AiSessions::getActiveWorkflowRunId, activeWorkflowRunId)
+                .set(AiSessions::getActiveWorkflowRunId, null)
+                .set(AiSessions::getUpdatedAt, LocalDateTime.now())
+                .update();
         session.setActiveWorkflowRunId(null);
     }
 
@@ -2090,13 +2401,17 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         );
 
         /*
-         * 游客不能执行 Workflow。
+         * 游客不能执行 Workflow / Agent Runtime。
          *
-         * 文章创作、文章优化、学习规划、学习调整、难点攻坚，
+         * 文章创作、文章优化、学习规划、学习调整、难点攻坚、学习建议 Agent，
          * 都统一返回登录提示。
+         * V3.0：分类器已判出明确业务诉求（WORKFLOW 建议）但 Planner 因双签规则
+         * 未命中降级 CTA 时，也走登录提示——游客不该被"信息不足"追问（登录才是硬边界）。
          */
         if (guestDecision.getAction() == AgentAction.WORKFLOW
-                || guestDecision.getAction() == AgentAction.TOOL) {
+                || guestDecision.getAction() == AgentAction.TOOL
+                || guestDecision.getAction() == AgentAction.AGENT
+                || isExplicitGuestBusinessIntent(intent)) {
 
             AiMessageVO assistantMessage = new AiMessageVO();
             assistantMessage.setId(

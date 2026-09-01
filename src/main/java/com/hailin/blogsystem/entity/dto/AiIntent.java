@@ -28,4 +28,7 @@ public class AiIntent {
     private String suggestedWorkflowType;// LEARNING_PLAN / LEARNING_PROGRESS / LEARNING_ASSIST
     private String risk;// LOW / MEDIUM / HIGH
     private String reason; // 一句话解释
+
+    private Boolean needsThinking;  // V3 通用思考模式：仅 GENERAL_CHAT 有意义，是否依赖记忆/前文/站内上下文需先查再答；默认 false
+    private String needsThinkingReason;  // 判定依据一句话，仅抽样排查用，不进 UI、不影响路由
 }

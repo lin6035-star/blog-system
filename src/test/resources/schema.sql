@@ -122,6 +122,7 @@ CREATE TABLE IF NOT EXISTS ai_messages (
     id BIGINT PRIMARY KEY,
     session_id BIGINT NOT NULL,
     workflow_run_id BIGINT,
+    agent_run_id BIGINT,
     role VARCHAR(20) NOT NULL,
     content CLOB NOT NULL,
     page_context CLOB,
@@ -247,6 +248,7 @@ CREATE TABLE IF NOT EXISTS learning_plans (
     goal VARCHAR(500),
     status VARCHAR(32) NOT NULL DEFAULT 'ACTIVE',
     source_workflow_run_id BIGINT,
+    version INT NOT NULL DEFAULT 0,
     created_at TIMESTAMP NOT NULL,
     updated_at TIMESTAMP NOT NULL
 );
@@ -258,6 +260,7 @@ CREATE TABLE IF NOT EXISTS learning_stages (
     order_num INT NOT NULL DEFAULT 0,
     title VARCHAR(200) NOT NULL,
     tasks CLOB,
+    version INT NOT NULL DEFAULT 0,
     created_at TIMESTAMP NOT NULL,
     updated_at TIMESTAMP NOT NULL
 );
@@ -290,6 +293,40 @@ CREATE INDEX IF NOT EXISTS idx_episodic_user_type
 CREATE INDEX IF NOT EXISTS idx_episodic_importance
     ON ai_episodic_memories (user_id, project_key, importance);
 
+
+CREATE TABLE IF NOT EXISTS ai_agent_runs (
+    id BIGINT PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    session_id BIGINT,
+    goal VARCHAR(500) NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    current_step INT NOT NULL DEFAULT 0,
+    max_steps INT NOT NULL DEFAULT 5,
+    used_steps INT NOT NULL DEFAULT 0,
+    context_json CLOB,
+    final_answer CLOB,
+    error_message VARCHAR(1000),
+    created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_run_user ON ai_agent_runs (user_id);
+CREATE INDEX IF NOT EXISTS idx_agent_run_session ON ai_agent_runs (session_id);
+
+CREATE TABLE IF NOT EXISTS ai_agent_steps (
+    id BIGINT PRIMARY KEY,
+    agent_run_id BIGINT NOT NULL,
+    step_no INT NOT NULL,
+    action_type VARCHAR(64) NOT NULL,
+    input_json CLOB,
+    output_json CLOB,
+    status VARCHAR(32) NOT NULL,
+    duration_ms BIGINT,
+    error_message VARCHAR(1000),
+    created_at TIMESTAMP NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_step_run ON ai_agent_steps (agent_run_id);
 
 CREATE TABLE IF NOT EXISTS ai_conversation_summaries (
                                                          id BIGINT PRIMARY KEY,

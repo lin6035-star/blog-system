@@ -100,7 +100,10 @@ public class LearningPlansServiceImpl extends ServiceImpl<LearningPlanMapper, Le
             throw new RuntimeException("任务序列化失败", e);
         }
         stage.setUpdatedAt(LocalDateTime.now());
-        learningStageMapper.updateById(stage);
+        //V2.4 乐观锁：updateById 返回 0 = version CAS 失败（并发勾选/追加），必须报出来
+        if (learningStageMapper.updateById(stage) == 0) {
+            throw new IllegalArgumentException("计划正在被修改，请稍后重试");
+        }
 
         refreshPlanStatus(planId);//检查学习规划是否都已完成
     }
@@ -364,7 +367,10 @@ public class LearningPlansServiceImpl extends ServiceImpl<LearningPlanMapper, Le
             throw new RuntimeException("任务序列化失败", e);
         }
         stage.setUpdatedAt(LocalDateTime.now());
-        learningStageMapper.updateById(stage);
+        //V2.4 乐观锁：CAS 失败（并发勾选/追加）必须报出来，不能静默丢更新
+        if (learningStageMapper.updateById(stage) == 0) {
+            throw new IllegalArgumentException("计划正在被修改，请稍后重试");
+        }
 
         refreshPlanStatus(planId);//检查学习规划是否都已完成
     }
@@ -411,6 +417,8 @@ public class LearningPlansServiceImpl extends ServiceImpl<LearningPlanMapper, Le
         if (!nextStatus.equals(plan.getStatus())) {
             plan.setStatus(nextStatus);
             plan.setUpdatedAt(LocalDateTime.now());
+            //V2.4 乐观锁：CAS 失败静默忽略——状态聚合是幂等操作，失败说明另一线程已刷新过，
+            //下次任务变更会再触发 refreshPlanStatus，不存在丢更新
             updateById(plan);
         }
 

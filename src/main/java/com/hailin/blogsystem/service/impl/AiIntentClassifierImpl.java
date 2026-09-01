@@ -37,7 +37,8 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                     "AI意图识别结果: intent={}, confidence={}, "
                             + "suggestedAction={}, suggestedWorkflowType={}, "
                             + "risk={}, reason={}, planRef={}, stageRef={}, "
-                            + "actionType={}, articleId={}, authorId={}, userId={}",
+                            + "actionType={}, articleId={}, authorId={}, userId={}, "
+                            + "needsThinking={}, needsThinkingReason={}",
                     aiIntent.getIntent(),
                     aiIntent.getConfidence(),
                     aiIntent.getSuggestedAction(),
@@ -49,7 +50,9 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                     aiIntent.getActionType(),
                     aiIntent.getArticleId(),
                     aiIntent.getAuthorId(),
-                    aiIntent.getUserId()
+                    aiIntent.getUserId(),
+                    aiIntent.getNeedsThinking(),
+                    aiIntent.getNeedsThinkingReason()
             );
 
             return aiIntent;
@@ -77,7 +80,9 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 - LEARNING_PLAN_QUERY
                                 - LEARNING_PROGRESS
                                 - LEARNING_ASSIST
-                
+                                - LEARNING_AGENT
+                                - ARTICLE_AGENT
+
                                 当用户只是问普通技术问题、闲聊、解释概念时，输出 GENERAL_CHAT。
                 
                                 当 pageType 是 profile 或 public-profile，且用户询问这个人/自己/我的主页、主要信息、发过什么文章、点赞收藏评论情况时，输出 USER_PROFILE_INSIGHT，并填写 userId（从页面上下文中获取）。
@@ -160,8 +165,41 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 禁止猜测、联想或编造主题。
                                 “文章”“博客”“博文”“草稿”“大纲”“内容”不能作为有效主题。
 
+                                当用户要求“继续学什么 / 下一步学什么 / 今天学什么 /
+                                帮我安排今天的学习 / 学习有点乱帮我理一下思路”时：
+                                - intent=LEARNING_AGENT
+                                - suggestedAction=AGENT
+                                - suggestedWorkflowType=null
+
+                                当用户明确要求勾选 / 取消勾选学习计划中的任务、
+                                标记任务完成 / 取消完成时（V2.4 受控写动作）：
+                                - intent=LEARNING_AGENT
+                                - suggestedAction=AGENT
+                                - suggestedWorkflowType=null
+                                Agent 会先查询计划定位任务，产出写动作提案，用户确认后才执行。
+
+                                这些是 Agent Runtime 学习建议 / 受控写提案请求，
+                                不是制定计划，也不是调整计划。
+                                Agent 只查询学习进度、记忆、站内知识后给出建议或提案，
+                                不会直接创建或修改任何数据（写动作必须用户确认）。
+
+                                边界例子（务必区分）：
+                                - “我想学 Redis，帮我制定学习计划” -> LEARNING_PLAN
+                                - “帮我调整第二阶段” -> LEARNING_PROGRESS
+                                - “Redis 跳表我不懂，帮我拆小一点” -> LEARNING_ASSIST
+                                - “我今天继续学 Redis，帮我安排今天学什么” -> LEARNING_AGENT
+                                - “我下一步学什么” -> LEARNING_AGENT
+                                - “我最近学 Redis 有点乱，帮我理一下” -> LEARNING_AGENT
+                                - “帮我把 Redis 计划的缓存击穿任务勾掉 / 标记完成” -> LEARNING_AGENT（受控写提案）
+                                - “把那个任务取消勾选” -> LEARNING_AGENT（受控写提案）
+                                - “我有几个学习规划” -> LEARNING_PLAN_QUERY（查询已有计划，不是 Agent）
+                                - “Redis 是什么” -> GENERAL_CHAT
+
+                                对 LEARNING_AGENT：learningPlanRef 只能摘录用户原话中的计划名称或关键词，
+                                不允许猜测、编造计划名或 ID。
+
                                 Agent 建议字段规则：
-                                - suggestedAction：只能是 CHAT / TOOL / WORKFLOW / CTA
+                                - suggestedAction：只能是 CHAT / TOOL / WORKFLOW / CTA / AGENT
                                 - suggestedWorkflowType：只能是 CREATE_ARTICLE / OPTIMIZE_ARTICLE / LEARNING_PLAN / LEARNING_PROGRESS / LEARNING_ASSIST，没有对应 Workflow 时填 null
                                 - risk：只能是 LOW / MEDIUM / HIGH
                                 - reason：一句简短的分类理由，不要写长篇解释
@@ -191,8 +229,34 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                   并请求拆解、解释或增加辅助任务：
                                   WORKFLOW，suggestedWorkflowType=LEARNING_ASSIST
 
+                                - 继续学习安排、下一步学什么、理一下学习思路：
+                                  AGENT（intent=LEARNING_AGENT）
+
+                                - 文章页对当前文章的模糊优化诉求（无明确指令）：
+                                  AGENT（intent=ARTICLE_AGENT）
+
                                 - 需求模糊、可能需要用户进一步说明：
                                   CTA
+
+                                needsThinking 字段规则（V3 通用思考模式，只对 GENERAL_CHAT 生效）：
+                                - needsThinking 含义：这句话是否需要结合用户记忆、前文状态或站内上下文，先查再答
+                                - 只对 GENERAL_CHAT 有意义：其他 intent 一律输出 false
+                                - 默认 false：只有明确的上下文依赖信号才判 true，吃不准就 false
+                                - 判定标准是语义，不是关键词：判断这句话是否指向前文、
+                                  是否依赖用户记忆/历史状态、是否存在信息缺口
+                                - 判 true 的例子：
+                                  - "你觉得我现在这套方案还有什么问题"（依赖前文方案）
+                                  - "结合我现在的情况，给个建议"（依赖用户记忆/状态）
+                                  - "刚才那个方向还能继续吗"（指向前文）
+                                  - "帮我总结一下我最近的学习进展"（依赖记忆与历史）
+                                - 判 false 的例子：
+                                  - "什么是缓存穿透"（纯概念问答，不依赖上下文）
+                                  - "你好"（寒暄）
+                                  - 明确指令或已有专属 intent 的诉求（如"帮我优化这篇文章"、学习类指令）
+                                - needsThinkingReason：判定依据的一句话，仅用于后端抽样排查，
+                                  不进入任何用户可见界面，不影响路由结果
+                                - 两个字段都必须输出，needsThinking 不能省略，
+                                  needsThinkingReason 没有依据时输出 null
 
                                 risk 规则：
                                 - 用户意图清晰，且自动进入学习流程的错误代价较低：LOW
@@ -272,24 +336,51 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 如果缺少 articleId，输出 GENERAL_CHAT。
                                 不要在意图识别阶段生成优化方案。
                                 是否真正启动 Workflow，由后端 Planner 决定。
-                                
+
+                                当 pageType 是 article-detail，
+                                且用户对当前文章表达模糊的优化诉求（没有明确改哪里、怎么改）时：
+
+                                - intent=ARTICLE_AGENT
+                                - suggestedAction=AGENT
+                                - suggestedWorkflowType=null
+                                - articleId 从页面上下文中获取
+
+                                模糊诉求例子：
+                                - "帮我看看这篇文章" / "这篇文章写得怎么样"
+                                - "这篇文章还能怎么改" / "感觉写得不太好，帮我分析一下"
+                                - "帮我看看这篇文章有什么问题"（没有具体指令）
+
+                                明确优化指令（不判 ARTICLE_AGENT，判 OPTIMIZE_ARTICLE_WORKFLOW）：
+                                - "把第二段删掉" / "帮我把标题改短" / "把开头重写得更吸引人"
+                                - "帮我优化这篇文章"（明确要求优化）
+
+                                如果缺少 articleId，输出 GENERAL_CHAT。
+                                Agent 只查询文章、记忆、站内知识后给出优化建议或建议启动优化流程，
+                                不会直接修改文章（写动作必须用户确认）。
+
                                 当用户说自己在做博客项目、文章项目、Agent 项目，并咨询技术方案、架构选型、实现方式时，输出 GENERAL_CHAT。
                                  不要因为问题中出现“博客”“文章”“RAG”就输出 ARTICLE_SEARCH。
                                  只有用户明确要求“找文章 / 搜博客 / 推荐站内文章 / 有没有相关文章”时，才输出 ARTICLE_SEARCH。
 
                                 输出示例：
 
-                                普通聊天：
-                                {"intent":"GENERAL_CHAT","confidence":0.98,"learningPlanRef":null,"learningStageRef":null,"actionType":null,"articleId":null,"userId":null,"content":null,"target":null,"param":null,"topic":null,"topicEvidence":null,"categoryName":null,"requirements":null,"suggestedAction":"CHAT","suggestedWorkflowType":null,"risk":"LOW","reason":"普通知识问答"}
+                                普通聊天（直达）：
+                                {"intent":"GENERAL_CHAT","confidence":0.98,"learningPlanRef":null,"learningStageRef":null,"actionType":null,"articleId":null,"userId":null,"content":null,"target":null,"param":null,"topic":null,"topicEvidence":null,"categoryName":null,"requirements":null,"suggestedAction":"CHAT","suggestedWorkflowType":null,"risk":"LOW","reason":"普通知识问答","needsThinking":false,"needsThinkingReason":null}
+
+                                普通聊天（需思考，进通用 Agent）：
+                                {"intent":"GENERAL_CHAT","confidence":0.85,"learningPlanRef":null,"learningStageRef":null,"actionType":null,"articleId":null,"userId":null,"content":null,"target":null,"param":null,"topic":null,"topicEvidence":null,"categoryName":null,"requirements":null,"suggestedAction":"CHAT","suggestedWorkflowType":null,"risk":"LOW","reason":"依赖前文方案状态","needsThinking":true,"needsThinkingReason":"问题指向前文讨论的方案，需结合记忆与上下文先查再答"}
 
                                 文章创作：
-                                {"intent":"CREATE_ARTICLE_WORKFLOW","confidence":0.95,"learningPlanRef":null,"learningStageRef":null,"actionType":null,"articleId":null,"userId":null,"content":null,"target":null,"param":null,"topic":"Redis缓存","topicEvidence":"Redis 缓存","categoryName":null,"requirements":null,"suggestedAction":"WORKFLOW","suggestedWorkflowType":"CREATE_ARTICLE","risk":"LOW","reason":"用户明确要求创建文章"}
+                                {"intent":"CREATE_ARTICLE_WORKFLOW","confidence":0.95,"learningPlanRef":null,"learningStageRef":null,"actionType":null,"articleId":null,"userId":null,"content":null,"target":null,"param":null,"topic":"Redis缓存","topicEvidence":"Redis 缓存","categoryName":null,"requirements":null,"suggestedAction":"WORKFLOW","suggestedWorkflowType":"CREATE_ARTICLE","risk":"LOW","reason":"用户明确要求创建文章","needsThinking":false,"needsThinkingReason":null}
 
                                 文章优化：
-                                {"intent":"OPTIMIZE_ARTICLE_WORKFLOW","confidence":0.95,"learningPlanRef":null,"learningStageRef":null,"actionType":null,"articleId":"12","userId":null,"content":null,"target":null,"param":null,"topic":null,"topicEvidence":null,"categoryName":null,"requirements":null,"suggestedAction":"WORKFLOW","suggestedWorkflowType":"OPTIMIZE_ARTICLE","risk":"MEDIUM","reason":"用户明确要求优化当前文章"}
+                                {"intent":"OPTIMIZE_ARTICLE_WORKFLOW","confidence":0.95,"learningPlanRef":null,"learningStageRef":null,"actionType":null,"articleId":"12","userId":null,"content":null,"target":null,"param":null,"topic":null,"topicEvidence":null,"categoryName":null,"requirements":null,"suggestedAction":"WORKFLOW","suggestedWorkflowType":"OPTIMIZE_ARTICLE","risk":"MEDIUM","reason":"用户明确要求优化当前文章","needsThinking":false,"needsThinkingReason":null}
+
+                                文章页模糊优化（Agent 建议）：
+                                {"intent":"ARTICLE_AGENT","confidence":0.9,"learningPlanRef":null,"learningStageRef":null,"actionType":null,"articleId":"12","userId":null,"content":null,"target":null,"param":null,"topic":null,"topicEvidence":null,"categoryName":null,"requirements":null,"suggestedAction":"AGENT","suggestedWorkflowType":null,"risk":"LOW","reason":"用户对当前文章表达模糊优化诉求","needsThinking":false,"needsThinkingReason":null}
 
                                 文章查询：
-                                {"intent":"ARTICLE_SEARCH","confidence":0.96,"learningPlanRef":null,"learningStageRef":null,"actionType":null,"articleId":null,"userId":null,"content":null,"target":null,"param":null,"topic":null,"topicEvidence":null,"categoryName":null,"requirements":null,"suggestedAction":"CHAT","suggestedWorkflowType":null,"risk":"LOW","reason":"用户明确查询站内文章"}
+                                {"intent":"ARTICLE_SEARCH","confidence":0.96,"learningPlanRef":null,"learningStageRef":null,"actionType":null,"articleId":null,"userId":null,"content":null,"target":null,"param":null,"topic":null,"topicEvidence":null,"categoryName":null,"requirements":null,"suggestedAction":"CHAT","suggestedWorkflowType":null,"risk":"LOW","reason":"用户明确查询站内文章","needsThinking":false,"needsThinkingReason":null}
 
                                 topicEvidence 字段必须输出。
                                 没有明确主题时必须输出 null。
@@ -352,6 +443,8 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
         intent.setSuggestedWorkflowType(null);
         intent.setRisk("LOW");
         intent.setReason("分类器调用失败，降级为普通聊天");
+        intent.setNeedsThinking(false);
+        intent.setNeedsThinkingReason("分类器调用失败，降级为普通聊天");
         return intent;
     }
 

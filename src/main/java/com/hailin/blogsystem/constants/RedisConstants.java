@@ -18,6 +18,9 @@ public class RedisConstants
             "ai:workflow:action:";
     public static final String AI_WORKFLOW_ACTION_IDEMPOTENCY_KEY_PREFIX =
             "ai:workflow:idempotency:";
+    //Agent Run 建议确认/取消的并发锁：ai:agent:action:{agentRunId}
+    public static final String AI_AGENT_RUN_ACTION_LOCK_KEY_PREFIX =
+            "ai:agent:action:";
     //AI 接口限流：ai:rate:{bucket}:{user|ip}:{identity}:{window}，bucket = chat / workflow / rag
     public static final String AI_RATE_LIMIT_KEY_PREFIX =
             "ai:rate:";

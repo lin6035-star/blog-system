@@ -15,6 +15,7 @@ public class AiMessages {
 
     private Long sessionId;  //会话ID
     private String workflowRunId;
+    private Long agentRunId;  //关联的 Agent Run ID（V2.1 建议卡快照恢复用）
     private String role;  //角色
     private String content;  //消息内容
     private String pageContext;  //页面上下文

@@ -107,12 +107,19 @@ public class AiRateLimitInterceptor implements HandlerInterceptor {
             return BUCKET_RAG;
         }
 
-        // Workflow：只拦"创建 + 推进"（POST），GET 状态查询和 cancel 不拦
+        // Workflow：只拦"创建"（POST），GET 状态查询不拦。
+        // 确认类操作（approve/reject/retry/cancel）是流程内正常交互，
+        // 次数天然受 Workflow 步骤数限制，不占用创建入口配额，否则
+        // 一个流程连续确认几次就被 429 误伤。
+        // 注意：流式确认端点是 /{id}/approve/stream，用包含判断覆盖两种形态。
         if (uri.startsWith("/api/ai/workflows/")) {
             if ("GET".equalsIgnoreCase(method)) {
                 return null;
             }
-            if (uri.endsWith("/cancel")) {
+            if (uri.contains("/cancel")
+                    || uri.contains("/approve")
+                    || uri.contains("/reject")
+                    || uri.contains("/retry")) {
                 return null;
             }
             return BUCKET_WORKFLOW;

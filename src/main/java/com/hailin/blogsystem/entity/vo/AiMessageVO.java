@@ -10,6 +10,7 @@ public class AiMessageVO {
     private String id;
     private String sessionId;
     private String workflowRunId;
+    private String agentRunId;  //关联的 Agent Run ID（V2.1 建议卡快照恢复用）
     private String role;  //user or assistant
     private String content;
     private String pageContext;
@@ -22,6 +23,9 @@ public class AiMessageVO {
         aiMessageVO.setSessionId(String.valueOf(aiMessages.getSessionId()));
         if (aiMessages.getWorkflowRunId() != null) {
             aiMessageVO.setWorkflowRunId(String.valueOf(aiMessages.getWorkflowRunId()));
+        }
+        if (aiMessages.getAgentRunId() != null) {
+            aiMessageVO.setAgentRunId(String.valueOf(aiMessages.getAgentRunId()));
         }
         aiMessageVO.setRole(aiMessages.getRole());
         aiMessageVO.setContent(aiMessages.getContent());

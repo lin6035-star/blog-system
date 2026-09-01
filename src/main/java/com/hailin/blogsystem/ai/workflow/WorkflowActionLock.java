@@ -37,11 +37,19 @@ public class WorkflowActionLock {
     }
 
     public LockHandle acquireOrThrow(Long runId) {
+        return acquireOrThrow(RedisConstants.AI_WORKFLOW_ACTION_LOCK_KEY_PREFIX, runId);
+    }
+
+    /**
+     * 带自定义 key 前缀的锁（Agent Run 建议确认复用同一套 SETNX + Lua 释放逻辑，
+     * 用独立前缀避免与 Workflow 锁共享 key 空间）。
+     */
+    public LockHandle acquireOrThrow(String keyPrefix, Long runId) {
         if (runId == null) {
-            throw new IllegalArgumentException("Workflow ID不能为空");
+            throw new IllegalArgumentException("ID不能为空");
         }
 
-        String key = RedisConstants.AI_WORKFLOW_ACTION_LOCK_KEY_PREFIX + runId;
+        String key = keyPrefix + runId;
         String token = UUID.randomUUID().toString();
 
         try {

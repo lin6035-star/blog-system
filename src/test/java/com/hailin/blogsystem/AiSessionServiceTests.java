@@ -13,11 +13,13 @@ import com.hailin.blogsystem.mapper.AiSessionMapper;
 import com.hailin.blogsystem.mapper.AiWorkflowRunMapper;
 import com.hailin.blogsystem.mapper.AiWorkflowStepLogMapper;
 import com.hailin.blogsystem.service.AiSessionService;
+import com.hailin.blogsystem.service.impl.AiMessageServiceImpl;
 import com.hailin.blogsystem.utils.UserContext;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.time.LocalDateTime;
 
@@ -42,6 +44,9 @@ class AiSessionServiceTests {
 
     @Autowired
     private AiWorkflowStepLogMapper aiWorkflowStepLogMapper;
+
+    @Autowired
+    private AiMessageServiceImpl aiMessageService;
 
     @AfterEach
     void clearUserContext() {
@@ -157,5 +162,22 @@ class AiSessionServiceTests {
         assertThat(aiWorkflowStepLogMapper.selectList(new LambdaQueryWrapper<AiWorkflowStepLog>()
                 .eq(AiWorkflowStepLog::getWorkflowRunId, run.getId()))).isEmpty();
         assertThat(aiSessionMapper.selectById(session.getId())).isNull();
+    }
+
+    @Test
+    void aiMessageServiceClearsActiveWorkflowBindingFromDatabase() {
+        AiSessions session = createSession();
+        session.setActiveWorkflowRunId(999001L);
+        aiSessionMapper.updateById(session);
+
+        ReflectionTestUtils.invokeMethod(
+                aiMessageService,
+                "clearSessionActiveWorkflow",
+                session
+        );
+
+        AiSessions savedSession = aiSessionMapper.selectById(session.getId());
+        assertThat(savedSession.getActiveWorkflowRunId()).isNull();
+        assertThat(session.getActiveWorkflowRunId()).isNull();
     }
 }

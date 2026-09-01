@@ -12,9 +12,9 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.FluxSink;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
-import com.hailin.blogsystem.ai.workflow.AiWorkflowStepEmitter;
 
 
 import java.util.HashMap;
@@ -106,6 +106,11 @@ public class AiWorkflowStreamServiceImpl implements AiWorkflowStreamService {
 
         return Flux.create(sink -> {
             long subscribeAt = System.currentTimeMillis();
+            sink.onCancel(() -> log.info(
+                    "[PERF-WORKFLOW] stream_cancelled runId={} action={}",
+                    id,
+                    action
+            ));
 
             log.info(
                     "[PERF-WORKFLOW] stream_subscribe runId={} action={}",
@@ -132,11 +137,14 @@ public class AiWorkflowStreamServiceImpl implements AiWorkflowStreamService {
                     AiWorkflowStepEmitter emitter = new AiWorkflowStepEmitter() {
                         @Override
                         public void emit(String step, String status, String message) {
-                            sink.next(workflowStepEvent(id, action, step, status, message));
+                            safeNext(sink, workflowStepEvent(id, action, step, status, message));
                         }
 
                         @Override
                         public void emitContent(String step, String field, String delta) {
+                            if (sink.isCancelled()) {
+                                return;
+                            }
                             if (firstContentLogged.compareAndSet(false, true)) {
                                 log.info(
                                         "[PERF-WORKFLOW] sse_first_content runId={} action={} step={} field={} deltaChars={}",
@@ -147,7 +155,7 @@ public class AiWorkflowStreamServiceImpl implements AiWorkflowStreamService {
                                         delta == null ? 0 : delta.length()
                                 );
                             }
-                            sink.next(workflowContentDeltaEvent(id, step, field, delta));
+                            safeNext(sink, workflowContentDeltaEvent(id, step, field, delta));
                         }
                     };
 
@@ -173,20 +181,40 @@ public class AiWorkflowStreamServiceImpl implements AiWorkflowStreamService {
                     List<AiWorkflowStepLogVO> stepLogs = aiWorkflowRunService.listStepLogs(id);
 
                     if ("FAILED".equals(workflow.getStatus())) {
-                        sink.next(workflowErrorEvent(workflow, stepLogs));
+                        safeNext(sink, workflowErrorEvent(workflow, stepLogs));
                     } else {
-                        sink.next(workflowStopEvent(workflow, stepLogs));
+                        safeNext(sink, workflowStopEvent(workflow, stepLogs));
                     }
 
-                    sink.complete();
+                    safeComplete(sink);
                 } catch (Throwable e) {
-                    sink.next(exceptionEvent(id, action, e));
-                    sink.complete();
+                    if (!sink.isCancelled()) {
+                        safeNext(sink, exceptionEvent(id, action, e));
+                        safeComplete(sink);
+                    } else {
+                        log.info(
+                                "Workflow SSE 客户端已断开，忽略异常事件发送: runId={}, action={}",
+                                id,
+                                action
+                        );
+                    }
                 } finally {
                     UserContext.clear();
                 }
             });
         });
+    }
+
+    private void safeNext(FluxSink<AiChatEventVO> sink, AiChatEventVO event) {
+        if (!sink.isCancelled()) {
+            sink.next(event);
+        }
+    }
+
+    private void safeComplete(FluxSink<AiChatEventVO> sink) {
+        if (!sink.isCancelled()) {
+            sink.complete();
+        }
     }
 
     private AiChatEventVO workflowContentDeltaEvent(Long id, String step, String field, String delta) {

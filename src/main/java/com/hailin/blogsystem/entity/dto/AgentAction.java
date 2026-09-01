@@ -4,5 +4,6 @@ public enum AgentAction {
     CHAT,
     TOOL,
     WORKFLOW,
-    CTA
+    CTA,
+    AGENT
 }

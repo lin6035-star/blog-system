@@ -91,7 +91,13 @@ public class AiModelServiceImpl implements AiModelService {
                 .map(response -> {
                     //工具调用是多轮请求，每轮一个 usage，跨轮累计
                     usage.add(response.getMetadata().getUsage());
-                    return response.getResult() == null ? "" : response.getResult().getOutput().getText();
+                    // 工具调用轮 result 可能没有文本（getText() 为 null），
+                    // Reactor map 不允许 null 值，必须归一为 ""（后续 filter 会去掉）。
+                    String text = response.getResult() == null
+                            || response.getResult().getOutput() == null
+                            || response.getResult().getOutput().getText() == null
+                            ? "" : response.getResult().getOutput().getText();
+                    return text;
                 })
                 .filter(text -> text != null && !text.isEmpty())
                 .onErrorResume(e -> {

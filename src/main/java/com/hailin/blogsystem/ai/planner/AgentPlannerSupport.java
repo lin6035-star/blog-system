@@ -81,6 +81,28 @@ public class AgentPlannerSupport {
             AiSessions session
     ) {
         /*
+         * Agent Runtime 路由（LEARNING_AGENT）。
+         *
+         * 独立于学习 Workflow 管道：isLearningDomain 不包含 LEARNING_AGENT，
+         * 因此即使后端正则（如“帮我+学习”）命中，也不会被拉进
+         * LEARNING_PLAN / LEARNING_PROGRESS / LEARNING_ASSIST。
+         * Agent 只读 Loop 误入无害，漏检掉普通聊天也安全。
+         */
+        if (isLearningAgentIntent(intent)) {
+            return decideLearningAgent(message, intent);
+        }
+
+        /*
+         * 文章 Agent 路由（V2.5，ARTICLE_AGENT）。
+         *
+         * 与 LEARNING_AGENT 同理独立于 Workflow 管道：isLearningDomain 不包含它，
+         * ARTICLE_AGENT 也不会被 resolveArticleWorkflowType 误判成 OPTIMIZE_ARTICLE。
+         */
+        if (isArticleAgentIntent(intent)) {
+            return decideArticleAgent(intent, pageContext);
+        }
+
+        /*
          * 兼容现有学习线。
          *
          * 当前学习查询仍有一部分历史规则兜底，
@@ -171,6 +193,18 @@ public class AgentPlannerSupport {
                     articleWorkflowType,
                     pageContext
             );
+        }
+
+        /*
+         * 通用思考模式（V3，GENERAL_CHAT + needsThinking）。
+         *
+         * 归一化收在 Planner 单点：needsThinking 只作用于 GENERAL_CHAT，
+         * 且必须分类器语义判定为 true（LLM 判错也不影响其他意图）。
+         * 游客恒 false（无记忆、无归属，不进通用 Runtime）。
+         * AiMessageServiceImpl 只消费 AgentDecision，不重复判断。
+         */
+        if (isGeneralAgentCandidate(intent)) {
+            return decideGeneralAgent(intent, userId);
         }
 
         /*
@@ -265,6 +299,154 @@ public class AgentPlannerSupport {
                 .retrievalMode(RETRIEVAL_NONE)
                 .ruleHits(ruleHits)
                 .reason("LLM 建议 + 后端规则双签命中，自动拉起 Workflow")
+                .build();
+    }
+
+    /**
+     * LEARNING_AGENT 的后端裁决。
+     *
+     * 入口规则不做正则兜底（漏检掉普通聊天安全，误检只读无害），
+     * 只认分类器主判 + 建议一致：
+     * - 分类器建议 CTA → 保持 CTA（澄清优先）
+     * - 分类器建议 AGENT → 进入 Agent Runtime
+     * - 其余（分类器内部不一致）→ 普通聊天
+     */
+    private AgentDecision decideLearningAgent(String message, AiIntent intent) {
+        List<String> ruleHits = new ArrayList<>();
+
+        if (isCtaSuggestion(intent)) {
+            return cta(
+                    intent.getIntent(),
+                    ruleHits,
+                    "分类器建议 CTA，等待用户进一步澄清"
+            );
+        }
+
+        if (!"AGENT".equals(intent.getSuggestedAction())) {
+            return AgentDecision.builder()
+                    .action(AgentAction.CHAT)
+                    .intent(intent.getIntent())
+                    .retrievalMode(RETRIEVAL_NONE)
+                    .ruleHits(ruleHits)
+                    .reason("分类器意图 LEARNING_AGENT 但建议不一致，走普通聊天")
+                    .build();
+        }
+
+        ruleHits.add("learning_agent_intent");
+        ruleHits.add("learning_agent_suggestion_valid");
+
+        return AgentDecision.builder()
+                .action(AgentAction.AGENT)
+                .intent(intent.getIntent())
+                .retrievalMode(RETRIEVAL_NONE)
+                .ruleHits(ruleHits)
+                .reason("分类器主判 LEARNING_AGENT，进入 Agent Runtime")
+                .build();
+    }
+
+    /**
+     * ARTICLE_AGENT 的后端裁决（V2.5）。
+     *
+     * 与 LEARNING_AGENT 同构，多一道文章上下文校验：
+     * - 分类器建议 CTA → 保持 CTA（澄清优先）
+     * - 分类器建议 AGENT + 有文章上下文 → 进入文章 Agent Runtime
+     * - 分类器建议 AGENT 但缺 articleId → CTA（用户大概率真想优化文章，引导补充信息）
+     * - 其余（分类器内部不一致）→ 普通聊天
+     */
+    private AgentDecision decideArticleAgent(AiIntent intent, PageContextDTO pageContext) {
+        List<String> ruleHits = new ArrayList<>();
+
+        if (isCtaSuggestion(intent)) {
+            return cta(
+                    intent.getIntent(),
+                    ruleHits,
+                    "分类器建议 CTA，等待用户进一步澄清"
+            );
+        }
+
+        if (!"AGENT".equals(intent.getSuggestedAction())) {
+            return AgentDecision.builder()
+                    .action(AgentAction.CHAT)
+                    .intent(intent.getIntent())
+                    .retrievalMode(RETRIEVAL_NONE)
+                    .ruleHits(ruleHits)
+                    .reason("分类器意图 ARTICLE_AGENT 但建议不一致，走普通聊天")
+                    .build();
+        }
+
+        if (!hasArticleId(pageContext, intent)) {
+            ruleHits.add("article_context_missing");
+            return cta(
+                    intent.getIntent(),
+                    ruleHits,
+                    "文章 Agent 缺少当前文章上下文，降级 CTA 等待澄清"
+            );
+        }
+
+        ruleHits.add("article_agent_intent");
+        ruleHits.add("article_agent_suggestion_valid");
+        ruleHits.add("article_context_valid");
+
+        return AgentDecision.builder()
+                .action(AgentAction.AGENT)
+                .intent(intent.getIntent())
+                .retrievalMode(RETRIEVAL_NONE)
+                .ruleHits(ruleHits)
+                .reason("分类器主判 ARTICLE_AGENT，进入文章 Agent Runtime")
+                .build();
+    }
+
+    /**
+     * GENERAL_CHAT + needsThinking 的后端裁决（V3 通用思考模式）。
+     *
+     * 归一化唯一入口：needsThinking 只在这里被消费，
+     * AiMessageServiceImpl 不感知该字段（只按 AgentDecision.action 分发）。
+     * - 分类器建议 CTA → 保持 CTA（澄清优先）
+     * - 分类器建议不一致 → 普通聊天
+     * - 游客（userId == null）→ 恒 false，不进通用 Runtime（无记忆、无归属）
+     * - 分类器 needsThinking=true + 已登录 → 进入通用 Agent Runtime
+     */
+    private AgentDecision decideGeneralAgent(AiIntent intent, Long userId) {
+        List<String> ruleHits = new ArrayList<>();
+
+        if (isCtaSuggestion(intent)) {
+            return cta(
+                    intent.getIntent(),
+                    ruleHits,
+                    "分类器建议 CTA，等待用户进一步澄清"
+            );
+        }
+
+        if (!"CHAT".equals(intent.getSuggestedAction())) {
+            return AgentDecision.builder()
+                    .action(AgentAction.CHAT)
+                    .intent(intent.getIntent())
+                    .retrievalMode(RETRIEVAL_NONE)
+                    .ruleHits(ruleHits)
+                    .reason("分类器意图 GENERAL_CHAT 但建议不一致，走普通聊天")
+                    .build();
+        }
+
+        if (userId == null) {
+            ruleHits.add("guest_needs_thinking_forbidden");
+            return AgentDecision.builder()
+                    .action(AgentAction.CHAT)
+                    .intent(intent.getIntent())
+                    .retrievalMode(RETRIEVAL_NONE)
+                    .ruleHits(ruleHits)
+                    .reason("游客不进入通用 Agent Runtime，走普通聊天")
+                    .build();
+        }
+
+        ruleHits.add("general_agent_needs_thinking");
+        ruleHits.add("general_agent_user_valid");
+
+        return AgentDecision.builder()
+                .action(AgentAction.AGENT)
+                .intent(intent.getIntent())
+                .retrievalMode(RETRIEVAL_NONE)
+                .ruleHits(ruleHits)
+                .reason("GENERAL_CHAT 且需要结合记忆/上下文先查再答，进入通用 Agent Runtime")
                 .build();
     }
 
@@ -365,6 +547,42 @@ public class AgentPlannerSupport {
         } catch (Exception e) {
             return false;
         }
+    }
+
+    /**
+     * 判断是否进入 Agent Runtime（LEARNING_AGENT）。
+     *
+     * 只认分类器主判，不做正则兜底。
+     * 注意：LEARNING_AGENT 故意不放进 isLearningDomain，
+     * 从而与学习 Workflow 管道隔离（见 decide() 注释）。
+     */
+    private boolean isLearningAgentIntent(AiIntent intent) {
+        return intent != null
+                && "LEARNING_AGENT".equals(intent.getIntent());
+    }
+
+    /**
+     * 判断是否进入文章 Agent Runtime（ARTICLE_AGENT，V2.5）。
+     *
+     * 只认分类器主判，不做正则兜底。
+     * 注意：ARTICLE_AGENT 故意不放进任何 Workflow 管道，
+     * 与 LEARNING_AGENT 同理隔离（见 decide() 注释）。
+     */
+    private boolean isArticleAgentIntent(AiIntent intent) {
+        return intent != null
+                && "ARTICLE_AGENT".equals(intent.getIntent());
+    }
+
+    /**
+     * 是否进入通用 Agent Runtime（GENERAL_CHAT + needsThinking，V3）。
+     *
+     * 只认分类器主判，不做正则兜底（与 LEARNING_AGENT / ARTICLE_AGENT 同模式）。
+     * needsThinking 为 null 视为 false（后端裁判，不信任 LLM 缺失值）。
+     */
+    private boolean isGeneralAgentCandidate(AiIntent intent) {
+        return intent != null
+                && "GENERAL_CHAT".equals(intent.getIntent())
+                && Boolean.TRUE.equals(intent.getNeedsThinking());
     }
 
     /**
@@ -868,12 +1086,16 @@ public class AgentPlannerSupport {
 
     // 入口兜底：学习意图本身（想/要/帮我 + 学/入门/进阶 + 目标对象）才起规划 Workflow。
     // 纯名词命中（例如“学习规划”）容易误伤查询句，所以这里保持旧路由的收敛规则。
+    // V3.0：补「创建/制定/给我…学习计划」变体——这类明确诉求不因正则漏匹配被降级 CTA。
+    // 查询句已由 looksLikeLearningPlanQueryRequest 优先排除，不会误伤。
     private boolean looksLikeLearningPlanRequest(String message) {
         if (message == null || message.isBlank()) {
             return false;
         }
         String text = message.trim();
-        return text.matches(".*(想|要|帮我|打算).{0,10}?(学|学习|入门|进阶|掌握).{1,30}.*");
+        return text.matches(".*(想|要|帮我|打算).{0,10}?(学|学习|入门|进阶|掌握).{1,30}.*")
+                || text.matches(".*(创建|制定|规划一下|安排一下|给我|来一个|做一个|搞一个).{0,15}(学习|学).{0,15}(计划|规划|路线).*")
+                || text.matches(".*(学习|学).{0,15}(计划|规划|路线).{0,15}(创建|制定|规划一下|安排一下|给我|来一个|做一个|搞一个).*");
     }
 
     // 查询排除：询问/查看已有计划（查词/询问词 + 计划词，两种语序）→ 走 dashboard 读工具，不进 Workflow。

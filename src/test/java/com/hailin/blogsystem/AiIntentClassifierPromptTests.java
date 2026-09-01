@@ -31,6 +31,9 @@ class AiIntentClassifierPromptTests {
         assertThat(prompt).contains("OPTIMIZE_ARTICLE");
         assertThat(prompt).contains("ARTICLE_SEARCH");
         assertThat(prompt).contains("ARTICLE_DETAIL_QA");
+        // V2.5：文章侧 Agent 意图 + 模糊优化诉求规则
+        assertThat(prompt).contains("ARTICLE_AGENT");
+        assertThat(prompt).contains("模糊的优化诉求");
     }
 
     @Test
@@ -74,5 +77,21 @@ class AiIntentClassifierPromptTests {
         assertThat(prompt).contains("CTA");
 
         assertThat(prompt).contains("这些字段只是给后端 Planner 的建议");
+    }
+
+    @Test
+    void promptDefinesNeedsThinkingSemanticRule() throws Exception {
+        Method method = AiIntentClassifierImpl.class.getDeclaredMethod("buildSystemPrompt");
+        method.setAccessible(true);
+        String prompt = (String) method.invoke(classifier);
+
+        // V3 通用思考模式：needsThinking 只对 GENERAL_CHAT 生效、默认 false、语义判定非词表
+        assertThat(prompt).contains("needsThinking");
+        assertThat(prompt).contains("needsThinkingReason");
+        assertThat(prompt).contains("只对 GENERAL_CHAT 有意义");
+        assertThat(prompt).contains("默认 false");
+        assertThat(prompt).contains("判定标准是语义，不是关键词");
+        assertThat(prompt).contains("依赖用户记忆/历史状态");
+        assertThat(prompt).contains("不影响路由结果");
     }
 }
