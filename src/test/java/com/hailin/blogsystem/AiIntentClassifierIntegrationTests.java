@@ -30,4 +30,29 @@ class AiIntentClassifierIntegrationTests {
         assertThat(intent.getLearningStageRef()).contains("阶段二");
         assertThat(intent.getConfidence()).isGreaterThanOrEqualTo(0.55);
     }
+
+    @Test
+    void classifiesStateDependentChatAsNeedsThinking() {
+        // V3.0：状态依赖句（记忆/上下文信号明确）→ GENERAL_CHAT + needsThinking=true
+        AiIntent intent = aiIntentClassifier.classify(
+                "结合我最近的情况，给个建议",
+                null
+        );
+
+        assertThat(intent.getIntent()).isEqualTo("GENERAL_CHAT");
+        assertThat(intent.getNeedsThinking()).isTrue();
+        assertThat(intent.getNeedsThinkingReason()).isNotBlank();
+    }
+
+    @Test
+    void classifiesPureConceptChatAsNoThinking() {
+        // V3.0：纯概念问答 → GENERAL_CHAT + needsThinking=false（默认 false 语义）
+        AiIntent intent = aiIntentClassifier.classify(
+                "什么是缓存穿透",
+                null
+        );
+
+        assertThat(intent.getIntent()).isEqualTo("GENERAL_CHAT");
+        assertThat(intent.getNeedsThinking()).isFalse();
+    }
 }
