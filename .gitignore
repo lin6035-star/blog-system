@@ -31,3 +31,7 @@ build/
 
 ### VS Code ###
 .vscode/
+
+### Agent 运行产物 ###
+output/
+perf-workflow.log
