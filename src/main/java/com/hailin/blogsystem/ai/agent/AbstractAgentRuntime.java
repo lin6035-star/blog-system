@@ -127,6 +127,14 @@ public abstract class AbstractAgentRuntime {
      * 领域扩展终态（如学习域 SUGGEST_WRITE）。
      * 返回非 null 表示已作为终态处理；默认 null 继续走通用终态。
      */
+    /**
+     * 扩展终态动作豁免普通执行：领域钩子拒绝（返回 null）后循环跳过 execute，
+     * 直接进入下一轮决策（拒绝路径已自行推进 step 计数与观察）。
+     */
+    protected boolean isTerminalExtension(AgentStepDecision decision) {
+        return false;
+    }
+
     protected AgentRunResult handleExtraTerminalAction(
             AiAgentRun run,
             AgentStepDecision decision,
@@ -209,6 +217,11 @@ public abstract class AbstractAgentRuntime {
                         run, decision, effectiveGoal, observations, emitter, pageContext);
                 if (extra != null) {
                     return extra;
+                }
+                // 扩展终态动作被领域拒绝（零观察 / 重复预检）→ 跳过本轮普通执行，
+                // 观察已带拒绝原因推进，循环由 LLM 下一轮决策收尾
+                if (isTerminalExtension(decision)) {
+                    continue;
                 }
 
                 // 终态：FINAL_ANSWER

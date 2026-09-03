@@ -146,7 +146,7 @@ public class LlmAgentStepDecider implements AgentStepDecider {
             return """
                     你刚才的输出不是合法的 JSON 或包含了非法动作。请重新输出。
                     只能输出一个 JSON 对象：{"actionType":"...","input":{...}}。
-                    actionType 只能是：QUERY_LEARNING_DASHBOARD / QUERY_MEMORY / SEARCH_RAG / ASK_USER / FINAL_ANSWER / SUGGEST_WORKFLOW。
+                    actionType 只能是：QUERY_LEARNING_DASHBOARD / QUERY_MEMORY / SEARCH_RAG / ASK_USER / FINAL_ANSWER / SUGGEST_WORKFLOW / SUGGEST_WRITE。
                     禁止输出 markdown、代码块或任何解释文字。
                     """;
         }
@@ -169,11 +169,14 @@ public class LlmAgentStepDecider implements AgentStepDecider {
                   input.reason = 建议原因（中文）
                   input.initialMessage = 用户原始诉求（可选）
                   input.risk = 风险等级 LOW / MEDIUM / HIGH（可选）
-                - SUGGEST_WRITE：用户要求修改学习计划里的任务状态（勾选完成 / 取消勾选）时，产出写动作提案（终态，后端裁判 + 用户确认后才会执行，你不能直接改任何数据）。
-                  input.taskTitle = 任务标题（从观察中摘录，必须真实存在）
-                  input.stageTitle = 任务所在阶段标题（从观察中摘录）
+                - SUGGEST_WRITE：用户要求修改学习计划任务 / 追加新任务时，产出写动作提案（终态，后端裁判 + 用户确认后才会执行，你不能直接改任何数据）。注意双层 actionType：外层固定 SUGGEST_WRITE，内层 input.actionType 才是写动作类型，二选一：
+                  - input.actionType = UPDATE_TASK_DONE：勾选完成 / 取消勾选已有任务。
+                    input.taskTitle = 已有任务标题（从观察中摘录，必须真实存在）
+                    input.done = true（勾选完成）/ false（取消勾选）
+                  - input.actionType = ADD_LEARNING_TASK：向某阶段追加用户点名的新任务（一次一个）。
+                    input.taskTitle = 用户要求添加的新任务标题（来自用户原话，不在观察中；不加不猜）
+                  input.stageTitle = 目标阶段标题（从观察中摘录）
                   input.planRef = 计划名称关键词（可选，用于定位计划）
-                  input.done = true（勾选完成）/ false（取消勾选）
 
                 决策规则：
                 - 已有观察足够回答目标时，直接 FINAL_ANSWER
@@ -182,7 +185,9 @@ public class LlmAgentStepDecider implements AgentStepDecider {
                 - 需要站内文章知识支撑时，SEARCH_RAG
                 - 存在多个计划且无法确定目标时，ASK_USER 让用户选择，不要猜
                 - 观察显示用户需要调整计划 / 制定计划 / 攻坚阶段时，用 SUGGEST_WORKFLOW 建议对应流程（只能建议 LEARNING_PLAN / LEARNING_PROGRESS / LEARNING_ASSIST，不能建议文章类 Workflow）
-                - 用户明确要求勾选 / 取消勾选某个任务时，用 SUGGEST_WRITE 提案（taskTitle 必须来自观察，不能编造）
+                - 用户明确要求勾选 / 取消勾选某个已有任务时，用 SUGGEST_WRITE 提案（input.actionType=UPDATE_TASK_DONE，taskTitle 必须来自观察，不能编造）
+                - 用户明确给出任务名要求添加到某计划/阶段（如「给 XX 计划加一个 XX 任务」）时，用 SUGGEST_WRITE 提案（input.actionType=ADD_LEARNING_TASK，taskTitle=用户给的新任务名；这与「帮我把阶段拆细」的 LEARNING_ASSIST 拆解诉求不同——拆解是 Workflow 建议，不是写动作）
+                - 写动作提案必须带内层 input.actionType（外层固定 SUGGEST_WRITE，两个 actionType 含义不同，别混淆）
                 - 禁止在没有任何查询观察时使用 SUGGEST_WORKFLOW / SUGGEST_WRITE（后端会拒绝）
                 - 每步只能输出一个动作
 

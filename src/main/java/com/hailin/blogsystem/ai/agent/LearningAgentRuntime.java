@@ -2,11 +2,14 @@ package com.hailin.blogsystem.ai.agent;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hailin.blogsystem.entity.AiAgentRun;
+import com.hailin.blogsystem.entity.LearningPlans;
 import com.hailin.blogsystem.entity.dto.AiAgentRunStatus;
 import com.hailin.blogsystem.entity.dto.AgentStepActionType;
 import com.hailin.blogsystem.entity.dto.PageContextDTO;
+import com.hailin.blogsystem.entity.vo.LearningPlansDetailVO;
 import com.hailin.blogsystem.mapper.AiAgentRunMapper;
 import com.hailin.blogsystem.mapper.AiAgentStepMapper;
+import com.hailin.blogsystem.service.LearningPlansService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
@@ -48,6 +51,7 @@ public class LearningAgentRuntime extends AbstractAgentRuntime implements AgentR
     );
 
     private final AgentStepDecider decider;
+    private final LearningPlansService learningPlansService;
 
     public LearningAgentRuntime(
             @org.springframework.beans.factory.annotation.Qualifier("llmAgentStepDecider")
@@ -55,10 +59,12 @@ public class LearningAgentRuntime extends AbstractAgentRuntime implements AgentR
             LearningAgentActionExecutor executor,
             AiAgentRunMapper runMapper,
             AiAgentStepMapper stepMapper,
-            ObjectMapper objectMapper
+            ObjectMapper objectMapper,
+            LearningPlansService learningPlansService
     ) {
         super(executor, runMapper, stepMapper, objectMapper);
         this.decider = decider;
+        this.learningPlansService = learningPlansService;
     }
 
     // ==================== 领域钩子 ====================
@@ -66,6 +72,12 @@ public class LearningAgentRuntime extends AbstractAgentRuntime implements AgentR
     @Override
     protected AgentStepDecider decider() {
         return decider;
+    }
+
+    /** SUGGEST_WRITE 是扩展终态：领域拒绝（零观察 / 重复预检）后循环跳过普通执行 */
+    @Override
+    protected boolean isTerminalExtension(AgentStepDecision decision) {
+        return decision != null && decision.actionType() == AgentStepActionType.SUGGEST_WRITE;
     }
 
     @Override
@@ -143,9 +155,12 @@ public class LearningAgentRuntime extends AbstractAgentRuntime implements AgentR
     }
 
     /**
-     * SUGGEST_WRITE 终态处理（V2.4）。
+     * SUGGEST_WRITE 终态处理（V2.4 / V3.1）。
      *
-     * 校验提案（taskTitle 必填；planRef/stageTitle 可选由后端定位；done 缺省 true），
+     * 双层 actionType：外层动作 SUGGEST_WRITE（已消费），内层 input.actionType 是写动作类型，
+     * 缺省回落 UPDATE_TASK_DONE（保旧模型行为）。ADD_LEARNING_TASK 的 taskTitle 是用户点名的新任务
+     * （不在观察里），done 无意义忽略。
+     * 校验提案（taskTitle 必填；planRef/stageTitle 可选由后端定位；UPDATE 模式 done 缺省 true），
      * run 转 WAITING_WRITE_CONFIRM，提案存 context_json。
      * 不执行任何写操作——执行由 confirmWrite 在用户确认后完成。
      */
@@ -161,30 +176,61 @@ public class LearningAgentRuntime extends AbstractAgentRuntime implements AgentR
             emitter.emit(run.getUsedSteps() + 1, "SUGGEST_WRITE", "FAILED", "提案缺少任务标题");
             return markFailed(run, "Agent 写动作提案无效（缺少 taskTitle）");
         }
-        boolean done = !"false".equalsIgnoreCase(text(input, "done"));
+        String actionType = text(input, "actionType");
+        boolean addTask = AgentWriteProposal.TYPE_ADD_LEARNING_TASK.equals(actionType);
+        // V3.1 补充：ADD 提案前预检目标阶段是否已存在同名任务——已存在则不弹确认卡，
+        // FAILED step + observation 让 LLM 直接告知用户（原来要等 confirm 才报「已存在」，体验断裂）
+        if (addTask) {
+            String planRef = text(input, "planRef");
+            String stageTitle = text(input, "stageTitle");
+            if (stageTitle != null && !stageTitle.isBlank()
+                    && targetStageAlreadyHasTask(run.getUserId(), planRef, stageTitle, taskTitle)) {
+                int nextStepNo = run.getUsedSteps() + 1;
+                String rejectReason = "目标阶段已存在同名任务「" + taskTitle + "」，追加提案被拒绝";
+                emitter.emit(nextStepNo, "SUGGEST_WRITE", "FAILED", rejectReason);
+                recordRejectedStep(run, decision, nextStepNo, rejectReason);
+                observations.add("系统提示：目标阶段「" + stageTitle + "」已存在同名任务「" + taskTitle
+                        + "」，后端拒绝了追加提案。请直接告知用户该任务已存在（不要生成追加提案，"
+                        + "如用户确实要加可建议换成其他任务名或先查看现有任务）。");
+                run.setCurrentStep(nextStepNo);
+                run.setUsedSteps(nextStepNo);
+                run.setContextJson(toJson(clipContext(observations)));
+                run.setUpdatedAt(LocalDateTime.now());
+                runMapper.updateById(run);
+                return null; // 循环继续，由 LLM 收尾告知用户
+            }
+        }
+        boolean done = !addTask && !"false".equalsIgnoreCase(text(input, "done"));
 
         AgentWriteProposal proposal = new AgentWriteProposal(
-                "UPDATE_TASK_DONE",
+                addTask ? AgentWriteProposal.TYPE_ADD_LEARNING_TASK : AgentWriteProposal.TYPE_UPDATE_TASK_DONE,
                 text(input, "planRef"),
                 text(input, "stageTitle"),
                 taskTitle,
                 done
         );
 
-        emitter.emit(run.getUsedSteps() + 1, "SUGGEST_WRITE", "SUCCESS",
-                done ? "提案勾选任务「" + taskTitle + "」为完成" : "提案取消任务「" + taskTitle + "」的完成状态");
+        String actionLabel = addTask
+                ? "提案追加任务「" + taskTitle + "」到目标阶段"
+                : done ? "提案勾选任务「" + taskTitle + "」为完成" : "提案取消任务「" + taskTitle + "」的完成状态";
+        String finalAnswer = addTask
+                ? "已为你准备好追加任务「" + taskTitle + "」的提案，确认后执行。"
+                : done
+                ? "已为你准备好「" + taskTitle + "」任务勾选提案，确认后执行。"
+                : "已为你准备好「" + taskTitle + "」任务取消勾选提案，确认后执行。";
+
+        emitter.emit(run.getUsedSteps() + 1, "SUGGEST_WRITE", "SUCCESS", actionLabel);
         recordTerminalStep(run, decision, run.getUsedSteps() + 1);
         run.setStatus(AiAgentRunStatus.WAITING_WRITE_CONFIRM.name());
-        run.setFinalAnswer(done
-                ? "已为你准备好「" + taskTitle + "」任务勾选提案，确认后执行。"
-                : "已为你准备好「" + taskTitle + "」任务取消勾选提案，确认后执行。");
+        run.setFinalAnswer(finalAnswer);
         run.setContextJson(toJson(Map.of(
                 "observations", clipContext(observations),
                 "pendingWriteAction", proposal
         )));
         run.setUpdatedAt(LocalDateTime.now());
         runMapper.updateById(run);
-        log.info("Agent Run 写动作提案: runId={}, taskTitle={}, done={}", run.getId(), taskTitle, done);
+        log.info("Agent Run 写动作提案: runId={}, actionType={}, taskTitle={}, done={}",
+                run.getId(), proposal.actionType(), taskTitle, done);
         return AgentRunResult.of(
                 run.getId(),
                 AiAgentRunStatus.WAITING_WRITE_CONFIRM,
@@ -193,5 +239,50 @@ public class LearningAgentRuntime extends AbstractAgentRuntime implements AgentR
                 null,
                 proposal
         );
+    }
+
+    /**
+     * ADD 预检：目标阶段是否已存在同名任务（与 confirm 层重复预检同语义，前置到提案前）。
+     * 定位不了（多计划未点名 / 阶段匹配失败 / 读取异常）返回 false——不阻塞提案，
+     * confirm 层仍有裁判兜底。
+     */
+    private boolean targetStageAlreadyHasTask(Long userId, String planRef, String stageTitle, String taskTitle) {
+        try {
+            List<LearningPlans> actives = learningPlansService.listByUser(userId).stream()
+                    .filter(plan -> LearningPlans.STATUS_ACTIVE.equals(plan.getStatus()))
+                    .toList();
+            if (actives.isEmpty()) {
+                return false;
+            }
+            LearningPlans plan;
+            if (planRef != null && !planRef.isBlank()) {
+                List<LearningPlans> matched = learningPlansService.matchActivePlansByMessage(userId, planRef);
+                if (matched.size() != 1) {
+                    return false;
+                }
+                plan = matched.get(0);
+            } else if (actives.size() == 1) {
+                plan = actives.get(0);
+            } else {
+                return false;
+            }
+            LearningPlansDetailVO detail = learningPlansService.getDetail(plan.getId(), userId);
+            if (detail == null || detail.getStages() == null) {
+                return false;
+            }
+            List<LearningPlansDetailVO.StageProgress> stageMatches = detail.getStages().stream()
+                    .filter(stage -> stageTitle.trim().equalsIgnoreCase(
+                            stage.getTitle() == null ? "" : stage.getTitle().trim()))
+                    .toList();
+            if (stageMatches.size() != 1 || stageMatches.get(0).getTasks() == null) {
+                return false;
+            }
+            return stageMatches.get(0).getTasks().stream()
+                    .anyMatch(task -> taskTitle.trim().equalsIgnoreCase(
+                            task.getTitle() == null ? "" : task.getTitle().trim()));
+        } catch (Exception e) {
+            log.warn("ADD 重复预检失败，交给 confirm 裁判: userId={}, planRef={}", userId, planRef, e);
+            return false;
+        }
     }
 }

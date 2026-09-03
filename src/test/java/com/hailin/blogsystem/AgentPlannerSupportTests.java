@@ -585,6 +585,29 @@ class AgentPlannerSupportTests {
     }
 
     @Test
+    void learningAgentAddTaskIntentIsNotPulledIntoLearningAssistWorkflow() {
+        // V3.1：用户给出明确任务名（受控写素材）→ 分类器主判 LEARNING_AGENT；
+        // LLM 若误建议 LEARNING_ASSIST workflow，后端不得放行（该诉求走 SUGGEST_WRITE 受控写动作）
+        AiIntent intent = new AiIntent();
+        intent.setIntent("LEARNING_AGENT");
+        intent.setConfidence(0.92);
+        intent.setSuggestedAction("WORKFLOW");
+        intent.setSuggestedWorkflowType("LEARNING_ASSIST");
+        intent.setRisk("LOW");
+
+        AgentDecision decision = planner.decide(
+                "给 Redis 计划第二阶段加一个缓存雪崩防护任务",
+                intent,
+                null,
+                1L,
+                session(10L)
+        );
+
+        assertThat(decision.getAction()).isNotEqualTo(AgentAction.WORKFLOW);
+        assertThat(decision.getWorkflowType()).isNull();
+    }
+
+    @Test
     void learningAgentCtaSuggestionStaysCta() {
         AiIntent intent = new AiIntent();
         intent.setIntent("LEARNING_AGENT");

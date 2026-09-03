@@ -17,9 +17,9 @@ class AiIntentClassifierPromptTests {
 
     @Test
     void promptDefinesSemanticLearningWorkflowIntents() throws Exception {
-        Method method = AiIntentClassifierImpl.class.getDeclaredMethod("buildSystemPrompt");
+        Method method = AiIntentClassifierImpl.class.getDeclaredMethod("buildSystemPrompt", boolean.class);
         method.setAccessible(true);
-        String prompt = (String) method.invoke(classifier);
+        String prompt = (String) method.invoke(classifier, false);
 
         assertThat(prompt).contains("LEARNING_PROGRESS");
         assertThat(prompt).contains("LEARNING_ASSIST");
@@ -39,10 +39,10 @@ class AiIntentClassifierPromptTests {
     @Test
     void promptDefinesFullDomainWorkflowRouting() throws Exception {
         Method method = AiIntentClassifierImpl.class
-                .getDeclaredMethod("buildSystemPrompt");
+                .getDeclaredMethod("buildSystemPrompt", boolean.class);
         method.setAccessible(true);
 
-        String prompt = (String) method.invoke(classifier);
+        String prompt = (String) method.invoke(classifier, false);
 
         assertThat(prompt)
                 .contains("CREATE_ARTICLE")
@@ -62,9 +62,9 @@ class AiIntentClassifierPromptTests {
 
     @Test
     void promptDefinesAgentSuggestionFields() throws Exception {
-        Method method = AiIntentClassifierImpl.class.getDeclaredMethod("buildSystemPrompt");
+        Method method = AiIntentClassifierImpl.class.getDeclaredMethod("buildSystemPrompt", boolean.class);
         method.setAccessible(true);
-        String prompt = (String) method.invoke(classifier);
+        String prompt = (String) method.invoke(classifier, false);
 
         assertThat(prompt).contains("suggestedAction");
         assertThat(prompt).contains("suggestedWorkflowType");
@@ -81,9 +81,9 @@ class AiIntentClassifierPromptTests {
 
     @Test
     void promptDefinesNeedsThinkingSemanticRule() throws Exception {
-        Method method = AiIntentClassifierImpl.class.getDeclaredMethod("buildSystemPrompt");
+        Method method = AiIntentClassifierImpl.class.getDeclaredMethod("buildSystemPrompt", boolean.class);
         method.setAccessible(true);
-        String prompt = (String) method.invoke(classifier);
+        String prompt = (String) method.invoke(classifier, false);
 
         // V3 通用思考模式：needsThinking 只对 GENERAL_CHAT 生效、默认 false、语义判定非词表
         assertThat(prompt).contains("needsThinking");

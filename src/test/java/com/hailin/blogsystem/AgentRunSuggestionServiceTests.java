@@ -8,16 +8,21 @@ import com.hailin.blogsystem.ai.workflow.WorkflowActionLock;
 import com.hailin.blogsystem.ai.workflow.WorkflowRunManager;
 import com.hailin.blogsystem.constants.BlogConstants;
 import com.hailin.blogsystem.entity.AiAgentRun;
+import com.hailin.blogsystem.entity.LearningPlans;
+import com.hailin.blogsystem.entity.dto.AiWorkflowLearningAssistDTO;
 import com.hailin.blogsystem.entity.dto.AiWorkflowLearningPlanDTO;
 import com.hailin.blogsystem.entity.vo.AiWorkflowRunVO;
 import com.hailin.blogsystem.exception.BusinessException;
 import com.hailin.blogsystem.mapper.AiAgentRunMapper;
 import com.hailin.blogsystem.service.AiWorkflowRunService;
+import com.hailin.blogsystem.service.LearningPlansService;
 import com.hailin.blogsystem.utils.UserContext;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -49,6 +54,7 @@ class AgentRunSuggestionServiceTests {
     private WorkflowActionIdempotency idempotency;
     private AiWorkflowRunService aiWorkflowRunService;
     private WorkflowRunManager workflowRunManager;
+    private LearningPlansService learningPlansService;
     private AgentRunSuggestionService service;
 
     @BeforeEach
@@ -60,6 +66,7 @@ class AgentRunSuggestionServiceTests {
         idempotency = mock(WorkflowActionIdempotency.class);
         aiWorkflowRunService = mock(AiWorkflowRunService.class);
         workflowRunManager = mock(WorkflowRunManager.class);
+        learningPlansService = mock(LearningPlansService.class);
 
         service = new AgentRunSuggestionService(
                 runMapper,
@@ -69,7 +76,7 @@ class AgentRunSuggestionServiceTests {
                 idempotency,
                 aiWorkflowRunService,
                 workflowRunManager,
-                mock(com.hailin.blogsystem.service.LearningPlansService.class)
+                learningPlansService
         );
         UserContext.set(100L);
     }
@@ -106,6 +113,64 @@ class AgentRunSuggestionServiceTests {
         assertThat(patch.getStatus()).isEqualTo("COMPLETED");
         assertThat(patch.getContextJson()).contains("workflowRunId");
         assertThat(patch.getContextJson()).contains("wf-1");
+    }
+
+    @Test
+    void confirmAssistSuggestionWithMessageNamedPlanSetsPlanId() {
+        // 回归：建议桥 confirm 时用户原句点名了计划（多 ACTIVE 场景）→ planId 直给，
+        // 不能无视点名全塞候选让用户再选一遍
+        String context = "{\"pendingWorkflowSuggestion\":{"
+                + "\"workflowType\":\"LEARNING_ASSIST\","
+                + "\"reason\":\"需要辅助拆解\","
+                + "\"initialMessage\":\"C++ 计划的第三阶段太难了，帮我拆解一下\","
+                + "\"risk\":\"MEDIUM\"}}";
+        when(runMapper.selectById(1L)).thenReturn(
+                run(1L, 100L, "WAITING_WORKFLOW_CONFIRM", context));
+        when(runMapper.update(any(AiAgentRun.class), any())).thenReturn(1);
+        when(learningPlansService.listByUser(100L)).thenReturn(List.of(
+                activePlan(1L, "C++ 学习计划"), activePlan(2L, "Redis 学习计划")));
+        when(learningPlansService.matchActivePlansByMessage(100L, "C++ 计划的第三阶段太难了，帮我拆解一下"))
+                .thenReturn(List.of(activePlan(1L, "C++ 学习计划")));
+        AiWorkflowRunVO vo = new AiWorkflowRunVO();
+        vo.setId("wf-assist");
+        when(aiWorkflowRunService.createLearningAssistWorkflow(any(AiWorkflowLearningAssistDTO.class)))
+                .thenReturn(vo);
+
+        AiWorkflowRunVO result = service.confirm(1L, null);
+
+        assertThat(result.getId()).isEqualTo("wf-assist");
+        ArgumentCaptor<AiWorkflowLearningAssistDTO> dtoCaptor =
+                ArgumentCaptor.forClass(AiWorkflowLearningAssistDTO.class);
+        verify(aiWorkflowRunService).createLearningAssistWorkflow(dtoCaptor.capture());
+        AiWorkflowLearningAssistDTO dto = dtoCaptor.getValue();
+        assertThat(dto.getPlanId()).isEqualTo(1L);
+        assertThat(dto.getRequest()).isEqualTo("C++ 计划的第三阶段太难了，帮我拆解一下");
+    }
+
+    @Test
+    void confirmAssistSuggestionWithAmbiguousMessageFallsBackToCandidates() {
+        // 消息没点名/点名歧义 → 保持原兜底：候选列表让用户选（不能退化成无 planId 直接失败）
+        String context = "{\"pendingWorkflowSuggestion\":{"
+                + "\"workflowType\":\"LEARNING_ASSIST\","
+                + "\"reason\":\"需要辅助拆解\","
+                + "\"initialMessage\":\"我感觉学习有点难，帮我拆解一下\","
+                + "\"risk\":\"MEDIUM\"}}";
+        when(runMapper.selectById(1L)).thenReturn(
+                run(1L, 100L, "WAITING_WORKFLOW_CONFIRM", context));
+        when(runMapper.update(any(AiAgentRun.class), any())).thenReturn(1);
+        when(learningPlansService.listByUser(100L)).thenReturn(List.of(
+                activePlan(1L, "C++ 学习计划"), activePlan(2L, "Redis 学习计划")));
+        when(aiWorkflowRunService.createLearningAssistWorkflow(any(AiWorkflowLearningAssistDTO.class)))
+                .thenReturn(new AiWorkflowRunVO());
+
+        service.confirm(1L, null);
+
+        ArgumentCaptor<AiWorkflowLearningAssistDTO> dtoCaptor =
+                ArgumentCaptor.forClass(AiWorkflowLearningAssistDTO.class);
+        verify(aiWorkflowRunService).createLearningAssistWorkflow(dtoCaptor.capture());
+        AiWorkflowLearningAssistDTO dto = dtoCaptor.getValue();
+        assertThat(dto.getPlanId()).isNull();
+        assertThat(dto.getCandidates()).hasSize(2);
     }
 
     @Test
@@ -287,5 +352,13 @@ class AgentRunSuggestionServiceTests {
         run.setStatus(status);
         run.setContextJson(contextJson);
         return run;
+    }
+
+    private LearningPlans activePlan(Long id, String title) {
+        LearningPlans plan = new LearningPlans();
+        plan.setId(id);
+        plan.setTitle(title);
+        plan.setStatus(LearningPlans.STATUS_ACTIVE);
+        return plan;
     }
 }

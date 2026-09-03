@@ -14,4 +14,10 @@ public record AgentWriteProposal(
         String taskTitle,
         boolean done
 ) {
+
+    /** 写动作类型（V2.4）：勾选 / 取消勾选已有任务（done 生效） */
+    public static final String TYPE_UPDATE_TASK_DONE = "UPDATE_TASK_DONE";
+
+    /** 写动作类型（V3.1）：向计划指定阶段追加用户点名的新任务（done 忽略） */
+    public static final String TYPE_ADD_LEARNING_TASK = "ADD_LEARNING_TASK";
 }

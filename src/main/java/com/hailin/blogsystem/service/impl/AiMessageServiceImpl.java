@@ -1251,17 +1251,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 Schedulers.boundedElastic().schedule(() -> {
                     UserContext.set(userId);
                     try {
-                        AiWorkflowStepEmitter emitter = new AiWorkflowStepEmitter() {
-                            @Override
-                            public void emit(String step, String status, String stepMessage) {
-                                // 初次创建时 step 事件可以先不推给前端
-                            }
-
-                            @Override
-                            public void emitContent(String step, String field, String delta) {
-                                // 计划 JSON 不流式推前端，确认面板从 workflow 数据渲染
-                            }
-                        };
+                        AiWorkflowStepEmitter emitter = buildLearningWorkflowEmitter(AiWorkflowType.LEARNING_PLAN, sink);
 
                         // ServiceImpl 的 create 内部会绑定 session 的 activeWorkflowRunId
                         // agentAutoStarted=true：这是 Planner 自动拉起的入口，run context 落标记供每会话上限统计
@@ -1301,6 +1291,48 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         return Flux.concat(Flux.just(paramEvent), workflowEvents);
     }
 
+    /**
+     * 学习类 Workflow 初始链路步骤事件（V3.1 修复：原为空实现——初始链路 30s~2min 期间前端
+     * 只转圈无卡片，确认卡最后才整体弹出。与文章类 emitter 对齐：实时推 WORKFLOW_STEP，
+     * 前端 applyInitialWorkflowStepCard 会用步骤事件先建「执行中」临时卡）。
+     * runId 由 create 落库后 bind（AiWorkflowRunServiceImpl 统一处理）。
+     */
+    private AiWorkflowStepEmitter buildLearningWorkflowEmitter(
+            AiWorkflowType workflowType,
+            reactor.core.publisher.FluxSink<AiChatEventVO> sink
+    ) {
+        AtomicReference<Long> workflowRunId = new AtomicReference<>();
+        return new AiWorkflowStepEmitter() {
+            @Override
+            public void bindWorkflowRunId(Long runId) {
+                workflowRunId.set(runId);
+            }
+
+            @Override
+            public void emit(String step, String status, String stepMessage) {
+                Long runId = workflowRunId.get();
+                if (runId == null) {
+                    return;
+                }
+                Map<String, Object> eventData = new HashMap<>();
+                eventData.put("workflowRunId", String.valueOf(runId));
+                eventData.put("workflowType", workflowType.name());
+                eventData.put("step", step);
+                eventData.put("status", status);
+                eventData.put("message", stepMessage);
+                emitIfOpen(sink, AiChatEventVO.builder()
+                        .eventType(AiChatEventType.WORKFLOW_STEP.getValue())
+                        .eventData(eventData)
+                        .build());
+            }
+
+            @Override
+            public void emitContent(String step, String field, String delta) {
+                // 学习计划 JSON 不流式推前端，确认面板从 workflow 数据渲染
+            }
+        };
+    }
+
     //学习进度 Workflow 创建入口：planId 用入口查到的 ACTIVE 计划，request 只用原始 message（不信任 intent 结构化字段）
     private Flux<AiChatEventVO> streamLearningProgressWorkflowFromIntent(
             String message,
@@ -1338,17 +1370,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 Schedulers.boundedElastic().schedule(() -> {
                     UserContext.set(userId);
                     try {
-                        AiWorkflowStepEmitter emitter = new AiWorkflowStepEmitter() {
-                            @Override
-                            public void emit(String step, String status, String stepMessage) {
-                                // 初次创建时 step 事件可以先不推给前端
-                            }
-
-                            @Override
-                            public void emitContent(String step, String field, String delta) {
-                                // 计划 JSON 不流式推前端，确认面板从 workflow 数据渲染
-                            }
-                        };
+                        AiWorkflowStepEmitter emitter = buildLearningWorkflowEmitter(AiWorkflowType.LEARNING_PROGRESS, sink);
 
                         // ServiceImpl 的 create 内部会绑定 session 的 activeWorkflowRunId
                         // agentAutoStarted=true：这是 Planner 自动拉起的入口，run context 落标记供每会话上限统计
@@ -1425,17 +1447,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 Schedulers.boundedElastic().schedule(() -> {
                     UserContext.set(userId);
                     try {
-                        AiWorkflowStepEmitter emitter = new AiWorkflowStepEmitter() {
-                            @Override
-                            public void emit(String step, String status, String stepMessage) {
-                                // 初次创建时 step 事件可以先不推给前端
-                            }
-
-                            @Override
-                            public void emitContent(String step, String field, String delta) {
-                                // 拆解 JSON 不流式推前端，确认面板从 workflow 数据渲染
-                            }
-                        };
+                        AiWorkflowStepEmitter emitter = buildLearningWorkflowEmitter(AiWorkflowType.LEARNING_ASSIST, sink);
 
                         // ServiceImpl 的 create 内部会绑定 session 的 activeWorkflowRunId
                         // agentAutoStarted=true：这是 Planner 自动拉起的入口，run context 落标记供每会话上限统计

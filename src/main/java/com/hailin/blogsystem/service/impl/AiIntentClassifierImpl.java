@@ -19,51 +19,90 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
 
     @Override  //判断分类，用户想要干什么，如果是要生成文章，单独拆一个实现类专门实现
     public AiIntent classify(String message, PageContextDTO pageContextDTO){
-        try{
-            String json = chatClientBuilder.build()
+        // 首次调用；JSON 解析失败（模型把规则/注释文字混进输出）→ repair prompt 重试一次，
+        // 仍失败才降级普通聊天（原来一次失败直接降级——点名单任务等诉求会静默退化成无能力聊天）
+        String json = callClassifier(message, pageContextDTO, false);
+        AiIntent aiIntent = json == null ? null : tryParse(json);
+        if (aiIntent == null && json != null) {
+            String repaired = callClassifier(message, pageContextDTO, true);
+            if (repaired != null) {
+                aiIntent = tryParse(repaired);
+                if (aiIntent != null) {
+                    log.warn("AI意图识别 repair 成功：首次输出混入非 JSON 文字，已恢复");
+                }
+            }
+        }
+        if (aiIntent == null) {
+            log.warn("AI意图识别失败，降级为普通聊天");
+            return generalChat();
+        }
+        if (aiIntent.getIntent() == null || aiIntent.getIntent().isBlank()){
+            return generalChat();
+        }
+        log.info(
+                "AI意图识别结果: intent={}, confidence={}, "
+                        + "suggestedAction={}, suggestedWorkflowType={}, "
+                        + "risk={}, reason={}, planRef={}, stageRef={}, "
+                        + "actionType={}, articleId={}, authorId={}, userId={}, "
+                        + "needsThinking={}, needsThinkingReason={}",
+                aiIntent.getIntent(),
+                aiIntent.getConfidence(),
+                aiIntent.getSuggestedAction(),
+                aiIntent.getSuggestedWorkflowType(),
+                aiIntent.getRisk(),
+                aiIntent.getReason(),
+                aiIntent.getLearningPlanRef(),
+                aiIntent.getLearningStageRef(),
+                aiIntent.getActionType(),
+                aiIntent.getArticleId(),
+                aiIntent.getAuthorId(),
+                aiIntent.getUserId(),
+                aiIntent.getNeedsThinking(),
+                aiIntent.getNeedsThinkingReason()
+        );
+
+        return aiIntent;
+    }
+
+    private String callClassifier(String message, PageContextDTO pageContextDTO, boolean repair) {
+        try {
+            return chatClientBuilder.build()
                     .prompt()
-                    .system(buildSystemPrompt())
+                    .system(buildSystemPrompt(repair))
                     .user(buildUserPrompt(message, pageContextDTO))
                     .call()
                     .content();
-
-            String cleanJson = cleanJson(json);
-            AiIntent aiIntent = objectMapper.readValue(cleanJson,AiIntent.class);
-
-            if(aiIntent.getIntent() == null || aiIntent.getIntent().isBlank()){
-                return generalChat();
-            }
-            log.info(
-                    "AI意图识别结果: intent={}, confidence={}, "
-                            + "suggestedAction={}, suggestedWorkflowType={}, "
-                            + "risk={}, reason={}, planRef={}, stageRef={}, "
-                            + "actionType={}, articleId={}, authorId={}, userId={}, "
-                            + "needsThinking={}, needsThinkingReason={}",
-                    aiIntent.getIntent(),
-                    aiIntent.getConfidence(),
-                    aiIntent.getSuggestedAction(),
-                    aiIntent.getSuggestedWorkflowType(),
-                    aiIntent.getRisk(),
-                    aiIntent.getReason(),
-                    aiIntent.getLearningPlanRef(),
-                    aiIntent.getLearningStageRef(),
-                    aiIntent.getActionType(),
-                    aiIntent.getArticleId(),
-                    aiIntent.getAuthorId(),
-                    aiIntent.getUserId(),
-                    aiIntent.getNeedsThinking(),
-                    aiIntent.getNeedsThinkingReason()
-            );
-
-            return aiIntent;
-        }
-        catch (Exception e){
-            log.warn("AI意图识别失败，降级为普通聊天", e);
-            return generalChat();
+        } catch (Exception e) {
+            log.warn("AI意图识别调用失败", e);
+            return null;
         }
     }
 
-    private String buildSystemPrompt(){
+    private AiIntent tryParse(String json) {
+        try {
+            return objectMapper.readValue(cleanJson(json), AiIntent.class);
+        } catch (Exception e) {
+            log.warn("意图 JSON 解析失败，准备重试: {}", snippet(json));
+            return null;
+        }
+    }
+
+    private String snippet(String text) {
+        if (text == null) {
+            return "";
+        }
+        return text.length() > 200 ? text.substring(0, 200) + "..." : text;
+    }
+
+    private String buildSystemPrompt(boolean repair){
+        if (repair) {
+            return """
+                    你是意图识别器。你上一次的输出不是合法 JSON——混入了注释、规则文字或额外文本。
+                    现在重新输出：只能输出一个 JSON 对象，直接以 { 开始、以 } 结束。
+                    禁止输出任何解释、注释、规则说明、markdown 代码块标记。
+                    字段与第一次要求完全一致，拿不准的字段输出 null。
+                    """;
+        }
         return """
                 你是意图识别器，只能输出 JSON，不能回答用户。
                 
@@ -192,6 +231,8 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 - “我最近学 Redis 有点乱，帮我理一下” -> LEARNING_AGENT
                                 - “帮我把 Redis 计划的缓存击穿任务勾掉 / 标记完成” -> LEARNING_AGENT（受控写提案）
                                 - “把那个任务取消勾选” -> LEARNING_AGENT（受控写提案）
+                                - “给 Redis 计划第二阶段加一个'缓存雪崩防护'任务” -> LEARNING_AGENT（受控写追加，任务名用户已给）
+                                - “第二阶段太难，帮我加几个练习任务” -> LEARNING_ASSIST（任务名要 AI 生成）
                                 - “我有几个学习规划” -> LEARNING_PLAN_QUERY（查询已有计划，不是 Agent）
                                 - “Redis 是什么” -> GENERAL_CHAT
 
@@ -225,9 +266,13 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 - 明确调整已有学习计划或进度：
                                   WORKFLOW，suggestedWorkflowType=LEARNING_PROGRESS
 
-                                - 明确表达学习计划、阶段或任务中的困难，
-                                  并请求拆解、解释或增加辅助任务：
+                                - 明确表达学习计划、阶段或任务中的困难，请求拆解、解释，
+                                  或请求帮忙加练习任务但未给具体任务名（任务内容由 AI 生成）：
                                   WORKFLOW，suggestedWorkflowType=LEARNING_ASSIST
+
+                                - 用户点名具体任务要求加入某计划/阶段
+                                  （任务名来自用户原话，如"给 Redis 计划第二阶段加一个'缓存雪崩防护'任务"）：
+                                  AGENT（intent=LEARNING_AGENT，受控写追加，不是 WORKFLOW）
 
                                 - 继续学习安排、下一步学什么、理一下学习思路：
                                   AGENT（intent=LEARNING_AGENT）
@@ -296,15 +341,21 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 - suggestedWorkflowType=LEARNING_PROGRESS
 
                                 当用户表达某个学习计划、阶段或任务难度过高、
-                                卡住、理解困难，并希望解释、拆解或增加辅助任务时：
+                                卡住、理解困难，并希望解释、拆解，
+                                或请求帮忙加辅助任务但未给出具体任务名（任务内容由 AI 生成）时：
                                 - intent=LEARNING_ASSIST
                                 - suggestedAction=WORKFLOW
                                 - suggestedWorkflowType=LEARNING_ASSIST
+                                （用户已点名具体任务要求直接加入计划 → 不是 LEARNING_ASSIST，
+                                走 LEARNING_AGENT 受控写追加）
 
                                 例如：
                                 "我感觉微服务计划中的阶段二挺难的"
                                 "第二阶段有点啃不动，帮我拆小一点"
                                 "Redis 计划里的缓存击穿看不懂"
+                                "第二阶段太难，帮我加几个练习任务"（任务名由 AI 生成）
+                                （对照："给 Redis 计划第二阶段加一个'缓存雪崩防护'任务"——
+                                任务名用户已给 → LEARNING_AGENT 受控写追加，不是 LEARNING_ASSIST）
 
                                 对 LEARNING_PROGRESS / LEARNING_ASSIST：
                                 - learningPlanRef 只能摘录用户原话中的计划名称或关键词
@@ -404,6 +455,8 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 如果用户不在编辑器页面却要求保存或发布，仍然输出 EDITOR_ACTION，让后端/前端提示用户先进入编辑器。
                                 
                                 只输出纯 JSON，禁止 markdown、代码块或任何额外文本。
+                                规则、示例、注释这些说明性文字一律禁止出现在输出里。
+                                输出必须直接以 { 开始，不能有任何前缀文字。
                """;
     }
 

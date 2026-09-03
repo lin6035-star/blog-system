@@ -8,10 +8,13 @@ import com.hailin.blogsystem.ai.agent.LearningAgentActionExecutor;
 import com.hailin.blogsystem.ai.agent.LearningAgentRuntime;
 import com.hailin.blogsystem.entity.AiAgentRun;
 import com.hailin.blogsystem.entity.AiAgentStep;
+import com.hailin.blogsystem.entity.LearningPlans;
 import com.hailin.blogsystem.entity.dto.AiAgentRunStatus;
 import com.hailin.blogsystem.entity.dto.AgentStepActionType;
+import com.hailin.blogsystem.entity.vo.LearningPlansDetailVO;
 import com.hailin.blogsystem.mapper.AiAgentRunMapper;
 import com.hailin.blogsystem.mapper.AiAgentStepMapper;
+import com.hailin.blogsystem.service.LearningPlansService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -38,6 +41,7 @@ class LearningAgentRuntimeTests {
     private LearningAgentActionExecutor executor;
     private AiAgentRunMapper runMapper;
     private AiAgentStepMapper stepMapper;
+    private LearningPlansService learningPlansService;
     private LearningAgentRuntime runtime;
 
     @BeforeEach
@@ -46,6 +50,7 @@ class LearningAgentRuntimeTests {
         executor = mock(LearningAgentActionExecutor.class);
         runMapper = mock(AiAgentRunMapper.class);
         stepMapper = mock(AiAgentStepMapper.class);
+        learningPlansService = mock(LearningPlansService.class);
 
         // MyBatis-Plus ASSIGN_ID 在 mock 下不生效，insert 时手动赋 id
         when(runMapper.insert(any(AiAgentRun.class))).thenAnswer(inv -> {
@@ -55,7 +60,7 @@ class LearningAgentRuntimeTests {
         });
 
         runtime = new LearningAgentRuntime(
-                decider, executor, runMapper, stepMapper, new ObjectMapper()
+                decider, executor, runMapper, stepMapper, new ObjectMapper(), learningPlansService
         );
     }
 
@@ -289,6 +294,93 @@ class LearningAgentRuntimeTests {
         assertThat(saved.getStatus()).isEqualTo("WAITING_WRITE_CONFIRM");
         assertThat(saved.getContextJson()).contains("pendingWriteAction");
         assertThat(saved.getContextJson()).contains("缓存击穿");
+    }
+
+    @Test
+    void addTaskProposalWithObservationMarksWaitingWriteConfirm() {
+        // V3.1：内层 actionType=ADD_LEARNING_TASK（外层仍是 SUGGEST_WRITE，双层同名字段分层语义）
+        when(decider.decide(any(), any(), anyInt(), anyInt()))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_LEARNING_DASHBOARD))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
+                        .withInput(Map.of(
+                                "actionType", "ADD_LEARNING_TASK",
+                                "planRef", "Redis 学习计划",
+                                "stageTitle", "第二阶段",
+                                "taskTitle", "缓存雪崩防护")));
+        when(executor.execute(any(), any(), any()))
+                .thenReturn("学习计划总览：共 1 个计划。\n目标计划《Redis 学习计划》\n- 阶段《第二阶段》：缓存穿透；");
+
+        AgentRunResult result = runtime.run(100L, 200L, "给 Redis 计划第二阶段加一个缓存雪崩防护任务");
+
+        assertThat(result.status()).isEqualTo(AiAgentRunStatus.WAITING_WRITE_CONFIRM);
+        assertThat(result.pendingWriteAction()).isNotNull();
+        assertThat(result.pendingWriteAction().actionType()).isEqualTo("ADD_LEARNING_TASK");
+        assertThat(result.pendingWriteAction().taskTitle()).isEqualTo("缓存雪崩防护");
+
+        AiAgentRun saved = captureRun();
+        assertThat(saved.getContextJson()).contains("ADD_LEARNING_TASK");
+    }
+
+    @Test
+    void addTaskProposalRejectedWhenDuplicateTaskExists() {
+        // V3.1 补充：目标阶段已存在同名任务 → 提案前预检拒绝（FAILED step）→ LLM 直接告知，
+        // 不弹确认卡（原来 confirm 才报「已存在」，用户确认了个寂寞）
+        when(decider.decide(any(), any(), anyInt(), anyInt()))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_LEARNING_DASHBOARD))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
+                        .withInput(Map.of(
+                                "actionType", "ADD_LEARNING_TASK",
+                                "planRef", "Redis 学习计划",
+                                "stageTitle", "阶段二",
+                                "taskTitle", "缓存雪崩防护")))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
+                        .withInput(Map.of("answer", "这个任务已经在你的阶段二里了，不用重复添加。")));
+        when(executor.execute(any(), any(), any()))
+                .thenReturn("学习计划总览：共 1 个计划。\n- 阶段《阶段二》：缓存穿透；缓存雪崩防护；");
+        when(learningPlansService.listByUser(100L)).thenReturn(List.of(activePlan(1L, "Redis 学习计划")));
+        when(learningPlansService.matchActivePlansByMessage(100L, "Redis 学习计划"))
+                .thenReturn(List.of(activePlan(1L, "Redis 学习计划")));
+        when(learningPlansService.getDetail(1L, 100L)).thenReturn(
+                detailWithStages(stageWithTasks(11L, "阶段二", "缓存雪崩防护")));
+
+        AgentRunResult result = runtime.run(100L, 200L, "给 Redis 计划第二阶段加一个缓存雪崩防护任务");
+
+        assertThat(result.status()).isEqualTo(AiAgentRunStatus.COMPLETED);
+        assertThat(result.finalAnswer()).contains("已经在你的阶段二里");
+        assertThat(result.pendingWriteAction()).isNull();
+        // 提案被拒：SUGGEST_WRITE step 记 FAILED（第 2 步），observation 进上下文让 LLM 收尾
+        List<AiAgentStep> steps = captureSteps();
+        assertThat(steps).hasSize(3);
+        assertThat(steps.get(1).getActionType()).isEqualTo("SUGGEST_WRITE");
+        assertThat(steps.get(1).getStatus()).isEqualTo("FAILED");
+        assertThat(steps.get(1).getErrorMessage()).contains("已存在同名任务");
+    }
+
+    private LearningPlans activePlan(Long id, String title) {
+        LearningPlans plan = new LearningPlans();
+        plan.setId(id);
+        plan.setTitle(title);
+        plan.setStatus(LearningPlans.STATUS_ACTIVE);
+        return plan;
+    }
+
+    private LearningPlansDetailVO detailWithStages(LearningPlansDetailVO.StageProgress... stages) {
+        LearningPlansDetailVO vo = new LearningPlansDetailVO();
+        vo.setStages(List.of(stages));
+        return vo;
+    }
+
+    private LearningPlansDetailVO.StageProgress stageWithTasks(Long id, String title, String... taskTitles) {
+        LearningPlansDetailVO.StageProgress stage = new LearningPlansDetailVO.StageProgress();
+        stage.setId(id);
+        stage.setTitle(title);
+        stage.setTasks(java.util.Arrays.stream(taskTitles).map(t -> {
+            LearningPlansDetailVO.TaskItem item = new LearningPlansDetailVO.TaskItem();
+            item.setTitle(t);
+            item.setDone(false);
+            return item;
+        }).toList());
+        return stage;
     }
 
     @Test

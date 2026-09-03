@@ -34,7 +34,7 @@ spring:
       read-timeout: 60s
       chat:
         options:
-          model: ${AI_CHAT_MODEL:qwen3.5-plus-2026-02-15}
+          model: ${AI_CHAT_MODEL:qwen3.5-plus}
       embedding:
         options:
           model: text-embedding-v3

@@ -211,14 +211,14 @@ public class AgentRunSuggestionService {
                 AiWorkflowLearningProgressDTO dto = new AiWorkflowLearningProgressDTO();
                 dto.setConversationId(run.getSessionId());
                 dto.setRequest(suggestion.initialMessage());
-                applyPlanTarget(dto, run.getUserId());
+                applyPlanTarget(dto, run.getUserId(), suggestion.initialMessage());
                 yield aiWorkflowRunService.createLearningProgressWorkflow(dto);
             }
             case "LEARNING_ASSIST" -> {
                 AiWorkflowLearningAssistDTO dto = new AiWorkflowLearningAssistDTO();
                 dto.setConversationId(run.getSessionId());
                 dto.setRequest(suggestion.initialMessage());
-                applyPlanTarget(dto, run.getUserId());
+                applyPlanTarget(dto, run.getUserId(), suggestion.initialMessage());
                 yield aiWorkflowRunService.createLearningAssistWorkflow(dto);
             }
             case "OPTIMIZE_ARTICLE" -> {
@@ -255,8 +255,8 @@ public class AgentRunSuggestionService {
      * 计划定位（与 chat 入口 routeLearningProgressWorkflow 一致）：
      * 唯一 ACTIVE → planId 直接进；多个 ACTIVE → candidates 让用户选；无 ACTIVE → 留给 Handler 拒绝。
      */
-    private void applyPlanTarget(AiWorkflowLearningProgressDTO dto, Long userId) {
-        PlanTarget target = resolvePlanTarget(userId);
+    private void applyPlanTarget(AiWorkflowLearningProgressDTO dto, Long userId, String message) {
+        PlanTarget target = resolvePlanTarget(userId, message);
         if (target.planId() != null) {
             dto.setPlanId(target.planId());
         }
@@ -267,8 +267,8 @@ public class AgentRunSuggestionService {
         }
     }
 
-    private void applyPlanTarget(AiWorkflowLearningAssistDTO dto, Long userId) {
-        PlanTarget target = resolvePlanTarget(userId);
+    private void applyPlanTarget(AiWorkflowLearningAssistDTO dto, Long userId, String message) {
+        PlanTarget target = resolvePlanTarget(userId, message);
         if (target.planId() != null) {
             dto.setPlanId(target.planId());
         }
@@ -279,7 +279,15 @@ public class AgentRunSuggestionService {
         }
     }
 
-    private PlanTarget resolvePlanTarget(Long userId) {
+    private PlanTarget resolvePlanTarget(Long userId, String message) {
+        // 修复：消息点名（建议 initialMessage = 用户原句）唯一命中 → 直进，与 chat 入口一致——
+        // 原来只按 userId 判断（多 ACTIVE 全塞候选），用户原句点名完全被无视，多计划用户必被要求再选一遍
+        if (message != null && !message.isBlank()) {
+            List<LearningPlans> mentioned = learningPlansService.matchActivePlansByMessage(userId, message);
+            if (mentioned.size() == 1) {
+                return new PlanTarget(mentioned.get(0).getId(), List.of());
+            }
+        }
         List<LearningPlans> actives = learningPlansService.listByUser(userId).stream()
                 .filter(plan -> LearningPlans.STATUS_ACTIVE.equals(plan.getStatus()))
                 .toList();

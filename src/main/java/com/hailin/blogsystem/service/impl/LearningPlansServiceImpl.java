@@ -33,6 +33,10 @@ public class LearningPlansServiceImpl extends ServiceImpl<LearningPlanMapper, Le
     //提取字母数字段和汉字段（"RocketMQ学习计划" → rocketmq / 学习计划）
     private static final Pattern TOKEN_PATTERN = Pattern.compile("[a-z0-9]+|[\\u4e00-\\u9fa5]+");
 
+    /** 阶段序号形态：「第X阶段 / X阶段 / 阶段X」（X = 中文数字或阿拉伯数字） */
+    private static final Pattern STAGE_ORDINAL_PATTERN = Pattern.compile(
+            "第?([一二三四五六七八九十\\d]+)阶段|阶段([一二三四五六七八九十\\d]+)");
+
     private final LearningStageMapper learningStageMapper;
     private final ObjectMapper objectMapper;
 
@@ -290,7 +294,22 @@ public class LearningPlansServiceImpl extends ServiceImpl<LearningPlanMapper, Le
         if (plan == null || !plan.getUserId().equals(userId)) {
             throw new IllegalArgumentException("学习计划不存在或无权访问");
         }
-        List<String> tokens = tokenize(message);
+        // 序号直解优先：用户说「阶段三/第3阶段」且阶段标题是主题名（无「阶段N」字样）时，
+        // 语义 = 按顺序第 N 个 → 直接查 order_num。标题分词是主题词路径，序号语义必须走 order_num
+        // （否则数字 token 会误撞任务标题里的语义数字，如「3 主 3 从」→ 定位错到含 3 的阶段）
+        Integer ordinal = extractStageOrdinal(message);
+        if (ordinal != null && ordinal >= 1) {
+            List<LearningStages> byOrdinal = learningStageMapper.selectList(
+                    new LambdaQueryWrapper<LearningStages>()
+                            .eq(LearningStages::getPlanId, planId)
+                            .eq(LearningStages::getOrderNum, ordinal));
+            if (!byOrdinal.isEmpty()) {
+                return byOrdinal;
+            }
+        }
+        // 阶段序号归一后再分词：用户说「第三阶段」标题写「阶段三」——2-gram 对词序敏感，
+        // 原样分词只有通用「阶段」能命中，多阶段全同分 → 定位不了被迫列候选
+        List<String> tokens = tokenize(normalizeStageOrdinals(message));
         List<LearningStages> stages = learningStageMapper.selectList(new LambdaQueryWrapper<LearningStages>()
                 .eq(LearningStages::getPlanId, planId)
                 .orderByAsc(LearningStages::getOrderNum));
@@ -301,7 +320,7 @@ public class LearningPlansServiceImpl extends ServiceImpl<LearningPlanMapper, Le
         int bestScore = 0;
         List<LearningStages> bestStages = new ArrayList<>();
         for (LearningStages stage : stages) {
-            int stageScore = score(stageText(stage), tokens);
+            int stageScore = score(normalizeStageOrdinals(stageText(stage)), tokens);
             if (stageScore > bestScore) {
                 bestScore = stageScore;
                 bestStages.clear();
@@ -320,6 +339,80 @@ public class LearningPlansServiceImpl extends ServiceImpl<LearningPlanMapper, Le
             sb.append(" ").append(task.getTitle());
         }
         return sb.toString();
+    }
+
+    //消息里的阶段序号（「第三阶段 / 阶段三 / 第3阶段 / 阶段3」）→ order_num；无序号 → null
+    private Integer extractStageOrdinal(String message) {
+        if (message == null) {
+            return null;
+        }
+        Matcher matcher = STAGE_ORDINAL_PATTERN.matcher(message);
+        if (!matcher.find()) {
+            return null;
+        }
+        String num = matcher.group(1) != null ? matcher.group(1) : matcher.group(2);
+        if (num.matches("\\d+")) {
+            return Integer.parseInt(num);
+        }
+        // 中文序号：一~九 / 十~十九 / 几十 / 几十几
+        int index = num.indexOf('十');
+        if (index >= 0) {
+            int tens = index == 0 ? 1 : digitVal(num.charAt(0));
+            int unit = index < num.length() - 1 ? digitVal(num.charAt(index + 1)) : 0;
+            return tens * 10 + unit;
+        }
+        return digitVal(num.charAt(0));
+    }
+
+    private int digitVal(char chinese) {
+        return "零一二三四五六七八九".indexOf(chinese); //「一」→ 1 …「九」→ 9；未命中 → -1
+    }
+
+    //「第X阶段 / X阶段 / 阶段X」双向归一为「阶段（中文序号）」：
+    // 标题与消息同形后 2-gram 才能互相命中（「第三阶段」vs「阶段三」词序不同）。
+    // 归一到中文而非阿拉伯：阿拉伯「阶段3」的数字 token 是通用 contains 匹配，
+    // 会误撞任务标题里的语义数字（如「搭建 3 主 3 从集群」→ 阶段定位错到含 3 的阶段）；
+    // 中文「阶段三」的 2-gram「段三」几乎不可能出现在任务标题里
+    private String normalizeStageOrdinals(String text) {
+        if (text == null || text.isBlank()) {
+            return text == null ? "" : text;
+        }
+        Matcher matcher = STAGE_ORDINAL_PATTERN.matcher(text);
+        StringBuilder sb = new StringBuilder();
+        while (matcher.find()) {
+            String num = matcher.group(1) != null ? matcher.group(1) : matcher.group(2);
+            matcher.appendReplacement(sb, "阶段" + toChineseOrdinal(num));
+        }
+        matcher.appendTail(sb);
+        return sb.toString();
+    }
+
+    //序号归一为中文（一~九十九；已是中文/解析不了保原文）
+    private String toChineseOrdinal(String num) {
+        if (num.matches("[一二三四五六七八九十]+")) {
+            return num;
+        }
+        if (!num.matches("\\d+") || num.length() > 2) {
+            return num;
+        }
+        int value = Integer.parseInt(num);
+        if (value < 1 || value > 99) {
+            return num;
+        }
+        String[] units = {"", "一", "二", "三", "四", "五", "六", "七", "八", "九"};
+        if (value <= 9) {
+            return units[value];
+        }
+        if (value == 10) {
+            return "十";
+        }
+        if (value < 20) {
+            return "十" + units[value - 10];
+        }
+        if (value % 10 == 0) {
+            return units[value / 10] + "十";
+        }
+        return units[value / 10] + "十" + units[value % 10];
     }
 
     //追加任务点（攻坚 APPEND_TASKS 用）：过滤空/重复标题（与已有任务 + 输入内去重，

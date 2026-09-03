@@ -178,6 +178,51 @@ class LearningPlanMatchServiceTests {
         assertThat(matched.get(0).getTitle()).isEqualTo("基础阶段");
     }
 
+    //8.5 阶段点名：词序归一——用户说「第三阶段」，标题写「阶段三」→ 唯一命中（修复轮：
+    // 2-gram 对词序敏感，原样分词只有通用「阶段」能命中 → 多阶段全同分 → 被迫列候选）
+    @Test
+    void stageMatchHitsWithOrdinalWordOrderDifference() {
+        LearningPlans plan = createPlan("C++ 学习计划", LearningPlans.STATUS_ACTIVE);
+        createStage(plan.getId(), 1, "阶段一：基础", "[{\"title\":\"变量与类型\",\"done\":false}]");
+        createStage(plan.getId(), 2, "阶段三：进阶", "[{\"title\":\"模板与泛型\",\"done\":false}]");
+
+        List<LearningStages> matched = learningPlansService.matchStagesByMessage(
+                plan.getId(), TEST_USER, "C++ 计划的第三阶段太难了，帮我拆解一下");
+
+        assertThat(matched).hasSize(1);
+        assertThat(matched.get(0).getTitle()).isEqualTo("阶段三：进阶");
+    }
+
+    //8.6 阶段点名：反方向——标题写「第三阶段」，用户说「阶段3」→ 唯一命中
+    @Test
+    void stageMatchHitsWithStage3MessageAndThirdStageTitle() {
+        LearningPlans plan = createPlan("C++ 学习计划", LearningPlans.STATUS_ACTIVE);
+        createStage(plan.getId(), 1, "第一阶段：基础", "[{\"title\":\"变量与类型\",\"done\":false}]");
+        createStage(plan.getId(), 2, "第三阶段：进阶", "[{\"title\":\"模板与泛型\",\"done\":false}]");
+
+        List<LearningStages> matched = learningPlansService.matchStagesByMessage(
+                plan.getId(), TEST_USER, "阶段3的任务看不懂");
+
+        assertThat(matched).hasSize(1);
+        assertThat(matched.get(0).getTitle()).isEqualTo("第三阶段：进阶");
+    }
+
+    //8.7 阶段点名：真实形态——标题是主题名（无「阶段N」字样），用户说「阶段三」= 按顺序第 3 个
+    // （用户实测 bug：曾按标题分词找不到序号 → 数字 3 撞上任务标题「3 主 3 从」错落到含 3 的阶段）
+    @Test
+    void stageMatchResolvesOrdinalToOrderNumWhenTitlesAreTopicNames() {
+        LearningPlans plan = createPlan("Redis 学习计划", LearningPlans.STATUS_ACTIVE);
+        createStage(plan.getId(), 1, "基础环境与核心数据结构重温", "[{\"title\":\"Redis 入门\",\"done\":false}]");
+        createStage(plan.getId(), 2, "缓存工程化与三大问题专项治理", "[{\"title\":\"搭建 3 主 3 从集群\",\"done\":false}]");
+        createStage(plan.getId(), 3, "持久化机制与数据可靠性保障", "[{\"title\":\"对比 RDB 和 AOF\",\"done\":false}]");
+
+        List<LearningStages> matched = learningPlansService.matchStagesByMessage(
+                plan.getId(), TEST_USER, "Redis计划中的阶段三感觉好难,能帮我拆解一下吗");
+
+        assertThat(matched).hasSize(1);
+        assertThat(matched.get(0).getTitle()).isEqualTo("持久化机制与数据可靠性保障");
+    }
+
     //9. 阶段点名：消息词段在多个阶段同分 → 并列歧义（列候选追问）
     @Test
     void stageMatchTieReturnsAllTopStages() {

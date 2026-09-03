@@ -43,8 +43,6 @@ import java.util.Map;
 @Slf4j
 public class AgentWriteActionService {
 
-    private static final String ACTION_UPDATE_TASK_DONE = "UPDATE_TASK_DONE";
-
     private final AiAgentRunMapper runMapper;
     private final LearningStageMapper learningStageMapper;
     private final ObjectMapper objectMapper;
@@ -132,42 +130,97 @@ public class AgentWriteActionService {
         log.info("写动作确认 CAS 成功: agentRunId={}", agentRunId);
 
         AgentWriteProposal proposal = parseWriteAction(run.getContextJson());
-        if (proposal == null || !ACTION_UPDATE_TASK_DONE.equals(proposal.actionType())) {
+        if (proposal == null || proposal.actionType() == null || proposal.actionType().isBlank()) {
             throw new BusinessException(
                     BlogConstants.ErrorCode.SERVER_ERROR,
                     "提案数据异常，无法执行"
             );
         }
 
-        // 标题匹配（后端裁判）：计划 → 阶段 → 任务，匹配不到/重名拒绝，不猜
-        WriteTarget target = resolveTarget(proposal, userId);
-        log.info("写动作目标解析成功: agentRunId={}, planId={}, stageId={}, taskIndex={}",
-                agentRunId, target.planId(), target.stageId(), target.taskIndex());
+        // 按写动作类型分支（双层 actionType：外层 SUGGEST_WRITE 已消费，此处是内层写动作类型）
+        return switch (proposal.actionType()) {
+            case AgentWriteProposal.TYPE_UPDATE_TASK_DONE -> executeUpdateTaskDone(run, proposal, userId);
+            case AgentWriteProposal.TYPE_ADD_LEARNING_TASK -> executeAddLearningTask(run, proposal, userId);
+            default -> throw new BusinessException(
+                    BlogConstants.ErrorCode.SERVER_ERROR,
+                    "提案数据异常，无法执行");
+        };
+    }
+
+    /**
+     * UPDATE_TASK_DONE（V2.4）：定位 计划→阶段→任务（任务必须已存在且唯一）→ updateTaskDone + 快照留痕。
+     */
+    private String executeUpdateTaskDone(AiAgentRun run, AgentWriteProposal proposal, Long userId) {
+        PlanStageTarget target = resolvePlanAndStage(proposal, userId);
+        int taskIndex = resolveTaskIndex(target.stage(), proposal);
+        log.info("写动作目标解析成功: runId={}, planId={}, stageId={}, taskIndex={}",
+                run.getId(), target.plan().getId(), target.stage().getId(), taskIndex);
 
         // before 快照
-        String beforeTasks = readStageTasks(target.stageId());
+        String beforeTasks = readStageTasks(target.stage().getId());
         learningPlansService.updateTaskDone(
-                target.planId(), target.stageId(), target.taskIndex(), proposal.done(), userId);
+                target.plan().getId(), target.stage().getId(), taskIndex, proposal.done(), userId);
         // after 快照
-        String afterTasks = readStageTasks(target.stageId());
+        String afterTasks = readStageTasks(target.stage().getId());
 
         String resultMessage = proposal.done()
                 ? "已勾选任务「" + proposal.taskTitle() + "」为完成。"
                 : "已取消任务「" + proposal.taskTitle() + "」的完成状态。";
 
-        // 结果留痕（context_json：解析结果 + before/after 快照，可解释可回滚）
-        markExecuted(run, proposal, target, beforeTasks, afterTasks);
-        log.info("写动作执行完成: agentRunId={}, {}", agentRunId, resultMessage);
+        markExecuted(run, proposal, target.plan().getId(), target.stage().getId(), taskIndex,
+                beforeTasks, afterTasks);
+        log.info("写动作执行完成: runId={}, {}", run.getId(), resultMessage);
         return resultMessage;
     }
 
     /**
-     * 后端确定性匹配（不信任 LLM 索引）：
+     * ADD_LEARNING_TASK（V3.1）：定位 计划→阶段（taskTitle 是新任务，不做存在校验）→
+     * 重复预检 → appendTasks + 快照留痕。不批量、不重命名、不删除。
+     */
+    private String executeAddLearningTask(AiAgentRun run, AgentWriteProposal proposal, Long userId) {
+        if (proposal.taskTitle() == null || proposal.taskTitle().isBlank()
+                || proposal.stageTitle() == null || proposal.stageTitle().isBlank()) {
+            throw new BusinessException(
+                    BlogConstants.ErrorCode.BAD_REQUEST,
+                    "提案缺少任务标题或阶段标题");
+        }
+        PlanStageTarget target = resolvePlanAndStage(proposal, userId);
+        log.info("写动作目标解析成功: runId={}, planId={}, stageId={}",
+                run.getId(), target.plan().getId(), target.stage().getId());
+
+        // 重复预检：同名任务已存在 → 明确拒绝，不依赖 appendTasks 的静默去重 return（void 无感知）
+        if (target.stage().getTasks() != null) {
+            boolean duplicate = target.stage().getTasks().stream()
+                    .anyMatch(t -> proposal.taskTitle().trim().equalsIgnoreCase(
+                            t.getTitle() == null ? "" : t.getTitle().trim()));
+            if (duplicate) {
+                throw new BusinessException(
+                        BlogConstants.ErrorCode.CONFLICT,
+                        "任务「" + proposal.taskTitle() + "」已在阶段「" + proposal.stageTitle() + "」中");
+            }
+        }
+
+        String beforeTasks = readStageTasks(target.stage().getId());
+        learningPlansService.appendTasks(target.plan().getId(), target.stage().getId(),
+                List.of(proposal.taskTitle()), userId);
+        String afterTasks = readStageTasks(target.stage().getId());
+
+        String resultMessage = "已向 计划「" + target.plan().getTitle() + "」· 阶段「"
+                + proposal.stageTitle() + "」追加任务「" + proposal.taskTitle() + "」。";
+
+        markExecuted(run, proposal, target.plan().getId(), target.stage().getId(), null,
+                beforeTasks, afterTasks);
+        log.info("写动作执行完成: runId={}, {}", run.getId(), resultMessage);
+        return resultMessage;
+    }
+
+    /**
+     * 后端确定性匹配（不信任 LLM 索引）第一步：计划 → 阶段。
      * planRef 点名唯一 → 用；未点名单 ACTIVE → 用；多 ACTIVE → 拒绝（让用户说清楚）
      * stageTitle 唯一 → 用；重名 → 拒绝；无 → 拒绝
-     * taskTitle（目标阶段内）唯一 → 用；重名 → 拒绝；无 → 拒绝
+     * 返回 plan + stage（detail VO 含任务列表，供 UPDATE 的任务定位 / ADD 的重复预检复用，避免二次查询）
      */
-    private WriteTarget resolveTarget(AgentWriteProposal proposal, Long userId) {
+    private PlanStageTarget resolvePlanAndStage(AgentWriteProposal proposal, Long userId) {
         // 1. 计划
         List<LearningPlans> plans = learningPlansService.listByUser(userId);
         List<LearningPlans> activePlans = plans.stream()
@@ -208,9 +261,14 @@ public class AgentWriteActionService {
                             ? "没有找到阶段「" + proposal.stageTitle() + "」"
                             : "阶段「" + proposal.stageTitle() + "」有多个同名项，请说明具体位置");
         }
-        LearningPlansDetailVO.StageProgress stage = stageMatches.get(0);
+        return new PlanStageTarget(plan, stageMatches.get(0));
+    }
 
-        // 3. 任务标题（目标阶段内）
+    /**
+     * UPDATE_TASK_DONE 专属第三步：任务标题（目标阶段内）必须已存在且唯一 → taskIndex。
+     * ADD_LEARNING_TASK 不走这里——它的 taskTitle 是新任务，本来就该不存在（Codex 评审修正）。
+     */
+    private int resolveTaskIndex(LearningPlansDetailVO.StageProgress stage, AgentWriteProposal proposal) {
         if (stage.getTasks() == null || stage.getTasks().isEmpty()) {
             throw new BusinessException(BlogConstants.ErrorCode.NOT_FOUND,
                     "阶段「" + proposal.stageTitle() + "」暂无任务");
@@ -230,8 +288,7 @@ public class AgentWriteActionService {
                             ? "没有找到任务「" + proposal.taskTitle() + "」"
                             : "任务「" + proposal.taskTitle() + "」有多个同名项，请说明具体是哪个");
         }
-
-        return new WriteTarget(plan.getId(), stage.getId(), taskIndex);
+        return taskIndex;
     }
 
     /** 读阶段 tasks 原始 JSON（before/after 快照用） */
@@ -240,14 +297,17 @@ public class AgentWriteActionService {
         return stage == null ? null : stage.getTasks();
     }
 
-    private void markExecuted(AiAgentRun run, AgentWriteProposal proposal, WriteTarget target,
-                              String beforeTasks, String afterTasks) {
+    private void markExecuted(AiAgentRun run, AgentWriteProposal proposal, Long planId, Long stageId,
+                              Integer taskIndex, String beforeTasks, String afterTasks) {
         try {
             Map<String, Object> context = parseContext(run.getContextJson());
             Map<String, Object> executed = new HashMap<>();
-            executed.put("planId", target.planId());
-            executed.put("stageId", target.stageId());
-            executed.put("taskIndex", target.taskIndex());
+            executed.put("actionType", proposal.actionType());
+            executed.put("planId", planId);
+            executed.put("stageId", stageId);
+            if (taskIndex != null) {
+                executed.put("taskIndex", taskIndex);
+            }
             executed.put("stageTitle", proposal.stageTitle());
             executed.put("taskTitle", proposal.taskTitle());
             executed.put("done", proposal.done());
@@ -342,6 +402,7 @@ public class AgentWriteActionService {
         }
     }
 
-    private record WriteTarget(Long planId, Long stageId, int taskIndex) {
+    /** 计划 + 阶段定位结果（含 stage 任务列表，供后续任务定位 / 重复预检复用） */
+    private record PlanStageTarget(LearningPlans plan, LearningPlansDetailVO.StageProgress stage) {
     }
 }
