@@ -1,0 +1,74 @@
+[
+  {
+    "name": "点名计划阶段求拆解进入 LEARNING_ASSIST",
+    "category": "baseline",
+    "message": "我感觉微服务计划中的阶段二挺难的，帮我拆成几个更小的任务",
+    "expectedIntent": "LEARNING_ASSIST",
+    "expectedPlanRefContains": "微服务",
+    "expectedStageRefContains": "阶段二",
+    "expectedConfidenceMin": 0.55
+  },
+  {
+    "name": "状态依赖句 GENERAL_CHAT 需思考",
+    "category": "thinking",
+    "message": "结合我最近的情况，给个建议",
+    "expectedIntent": "GENERAL_CHAT",
+    "expectedNeedsThinking": true,
+    "expectedNeedsThinkingReasonNonBlank": true
+  },
+  {
+    "name": "纯概念问答不思考",
+    "category": "thinking",
+    "message": "什么是缓存穿透",
+    "expectedIntent": "GENERAL_CHAT",
+    "expectedNeedsThinking": false
+  },
+  {
+    "name": "分界：点名任务名走 LEARNING_AGENT 而非拆解 Workflow",
+    "category": "boundary",
+    "message": "给 Redis 计划第二阶段加一个缓存雪崩防护任务",
+    "expectedIntent": "LEARNING_AGENT"
+  },
+  {
+    "name": "回归：点名计划压缩保留 planRef 摘录",
+    "category": "regression",
+    "message": "把 C++ 计划的第二阶段压缩一下",
+    "expectedIntent": "LEARNING_PROGRESS",
+    "expectedPlanRefNonBlank": true
+  },
+  {
+    "name": "回归：点名计划拆解保留 planRef 摘录",
+    "category": "regression",
+    "message": "C++ 计划的第三阶段太难了，你能帮我拆解一下吗",
+    "expectedIntent": "LEARNING_ASSIST",
+    "expectedPlanRefNonBlank": true
+  },
+  {
+    "name": "分界：点名计划阶段任务名走受控写",
+    "category": "boundary",
+    "message": "C++ 计划的阶段1，帮我加一下这个小任务：练习引用与指针在函数传参中的区别",
+    "expectedIntent": "LEARNING_AGENT",
+    "expectedSuggestedAction": "AGENT"
+  },
+  {
+    "name": "回归：多行消息加任务不降级普通聊天",
+    "category": "regression",
+    "message": "C++计划的阶段1,帮我加一下这个小任务\n练习引用与指针在函数传参中的区别",
+    "expectedIntent": "LEARNING_AGENT",
+    "expectedSuggestedAction": "AGENT"
+  },
+  {
+    "name": "分界：点名任务改名走 LEARNING_AGENT 受控写",
+    "category": "boundary",
+    "message": "把 Redis 计划的缓存击穿任务改名为缓存击穿防护",
+    "expectedIntent": "LEARNING_AGENT",
+    "expectedSuggestedAction": "AGENT"
+  },
+  {
+    "name": "回归：整体调整诉求不漂移到受控写",
+    "category": "regression",
+    "message": "帮我调整第二阶段",
+    "expectedIntent": "LEARNING_PROGRESS",
+    "expectedSuggestedAction": "WORKFLOW"
+  }
+]

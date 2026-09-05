@@ -13,6 +13,7 @@ import com.hailin.blogsystem.entity.dto.AiWorkflowType;
 import com.hailin.blogsystem.entity.dto.PageContextDTO;
 import com.hailin.blogsystem.mapper.AiWorkflowRunMapper;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
 import java.io.InputStream;
@@ -32,7 +33,9 @@ import static org.mockito.Mockito.when;
  * 这里不调用真实 LLM，只验证：
  * LLM 建议 + 后端规则 + 成本护栏
  * 是否产生预期的最终 AgentDecision。
+ * @Tag("eval")：纳入评测门离线样例集（-Dgroups=eval）
  */
+@Tag("eval")
 class AgentPlannerEvaluationTests {
 
     private final ObjectMapper objectMapper = new ObjectMapper();

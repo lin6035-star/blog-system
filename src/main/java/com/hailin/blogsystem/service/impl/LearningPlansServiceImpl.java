@@ -112,6 +112,43 @@ public class LearningPlansServiceImpl extends ServiceImpl<LearningPlanMapper, Le
         refreshPlanStatus(planId);//检查学习规划是否都已完成
     }
 
+    //任务重命名（V3.3）：校验计划归属 → 改 tasks JSON 第 index 项的 title（done 保留）→ 写回。
+    //newTitle 非空校验由调用方（AgentWriteActionService）负责，本方法与 updateTaskDone 同风格信任参数。
+    @Override
+    @Transactional
+    public void renameTask(Long planId, Long stageId, int taskIndex, String newTitle, Long userId) {
+        LearningPlans plan = getById(planId);
+        if (plan == null || !plan.getUserId().equals(userId)) {
+            throw new IllegalArgumentException("学习计划不存在或无权访问");
+        }
+
+        LearningStages stage = learningStageMapper.selectOne(new LambdaQueryWrapper<LearningStages>()
+                .eq(LearningStages::getId, stageId)
+                .eq(LearningStages::getPlanId, planId));
+        if (stage == null) {
+            throw new IllegalArgumentException("学习阶段不存在");
+        }
+
+        List<Map<String, Object>> tasks = parseTaskMaps(stage.getTasks());
+        if (taskIndex < 0 || taskIndex >= tasks.size()) {
+            throw new IllegalArgumentException("任务不存在");
+        }
+        tasks.get(taskIndex).put("title", newTitle);
+
+        try {
+            stage.setTasks(objectMapper.writeValueAsString(tasks));
+        } catch (JsonProcessingException e) {
+            throw new RuntimeException("任务序列化失败", e);
+        }
+        stage.setUpdatedAt(LocalDateTime.now());
+        //V3.3 乐观锁：updateById 返回 0 = version CAS 失败（并发勾选/追加/改名），必须报出来
+        if (learningStageMapper.updateById(stage) == 0) {
+            throw new IllegalArgumentException("计划正在被修改，请稍后重试");
+        }
+
+        refreshPlanStatus(planId);//检查学习规划是否都已完成
+    }
+
     //JSON 字符串 → List<Map>；解析失败兜底空列表
     private List<Map<String, Object>> parseTaskMaps(String tasksJson) {
         if (tasksJson == null || tasksJson.isBlank()) {

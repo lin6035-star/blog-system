@@ -28,6 +28,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * LEARNING_PROGRESS（第四个 Workflow）链路测试。
@@ -281,6 +282,40 @@ class LearningProgressWorkflowServiceTests {
         LearningPlansDetailVO afterUndone = learningPlansService.getDetail(plan.getId(), TEST_USER);
         assertThat(afterUndone.getDoneTasks()).isEqualTo(1);
         assertThat(afterUndone.getStages().get(0).getTasks().get(0).isDone()).isFalse();
+    }
+
+    //6.5 任务重命名（V3.3）：renameTask 改 title → done 保留、聚合进度不变（纯规则，无 LLM）
+    @Test
+    void renameTaskRenamesTitleAndKeepsDone() {
+        UserContext.set(TEST_USER);
+        LearningPlans plan = createActivePlan("Java 学习计划");
+
+        LearningStages stage = learningStageMapper.selectList(
+                new LambdaQueryWrapper<LearningStages>().eq(LearningStages::getPlanId, plan.getId())).get(0);
+
+        //重命名第一个任务（原 done=true）
+        learningPlansService.renameTask(plan.getId(), stage.getId(), 0, "Java 语法与类型系统", TEST_USER);
+
+        LearningPlansDetailVO detail = learningPlansService.getDetail(plan.getId(), TEST_USER);
+        assertThat(detail.getTotalTasks()).isEqualTo(2);   //聚合不变
+        assertThat(detail.getDoneTasks()).isEqualTo(1);    //done 保留
+        assertThat(detail.getStages().get(0).getTasks().get(0).getTitle()).isEqualTo("Java 语法与类型系统");
+        assertThat(detail.getStages().get(0).getTasks().get(0).isDone()).isTrue();
+        assertThat(detail.getStages().get(0).getTasks().get(1).getTitle()).isEqualTo("集合框架");  //其他任务不动
+    }
+
+    //6.6 任务重命名：跨用户拒绝（归属校验）
+    @Test
+    void renameTaskRejectsOtherUsersPlan() {
+        UserContext.set(TEST_USER);
+        LearningPlans plan = createActivePlan("Java 学习计划");
+        LearningStages stage = learningStageMapper.selectList(
+                new LambdaQueryWrapper<LearningStages>().eq(LearningStages::getPlanId, plan.getId())).get(0);
+
+        assertThatThrownBy(() -> learningPlansService.renameTask(
+                plan.getId(), stage.getId(), 0, "越权改名", 999L))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("学习计划不存在或无权访问");
     }
 
     //7. 入口点名多计划歧义 → 选计划停确认（纯规则，无 LLM）

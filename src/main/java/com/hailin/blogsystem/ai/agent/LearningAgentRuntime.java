@@ -177,10 +177,31 @@ public class LearningAgentRuntime extends AbstractAgentRuntime implements AgentR
             return markFailed(run, "Agent 写动作提案无效（缺少 taskTitle）");
         }
         String actionType = text(input, "actionType");
-        boolean addTask = AgentWriteProposal.TYPE_ADD_LEARNING_TASK.equals(actionType);
+        // V3.3 归一化四分：blank/null → UPDATE（保旧模型）；UPDATE_TASK_DONE → UPDATE；
+        // ADD_LEARNING_TASK → ADD；UPDATE_LEARNING_TASK → RENAME；
+        // 其他非空 actionType（模型幻觉出 DELETE/MOVE 等）→ FAILED，绝不吞成勾选提案（误勾选坑）
+        String writeType;
+        if (actionType == null || actionType.isBlank()
+                || AgentWriteProposal.TYPE_UPDATE_TASK_DONE.equals(actionType)) {
+            writeType = "UPDATE";
+        } else if (AgentWriteProposal.TYPE_ADD_LEARNING_TASK.equals(actionType)) {
+            writeType = "ADD";
+        } else if (AgentWriteProposal.TYPE_UPDATE_LEARNING_TASK.equals(actionType)) {
+            writeType = "RENAME";
+        } else {
+            emitter.emit(run.getUsedSteps() + 1, "SUGGEST_WRITE", "FAILED", "不支持的写动作类型");
+            return markFailed(run, "Agent 写动作提案无效（不支持的 actionType：" + actionType + "）");
+        }
+
+        // RENAME 专属必填：显式改名但缺新名 → FAILED 绝不回落 UPDATE（回落 + done 缺省 true = 误勾选）
+        String newTitle = text(input, "newTitle");
+        if ("RENAME".equals(writeType) && (newTitle == null || newTitle.isBlank())) {
+            emitter.emit(run.getUsedSteps() + 1, "SUGGEST_WRITE", "FAILED", "提案缺少新任务名");
+            return markFailed(run, "Agent 写动作提案无效（缺少 newTitle）");
+        }
         // V3.1 补充：ADD 提案前预检目标阶段是否已存在同名任务——已存在则不弹确认卡，
         // FAILED step + observation 让 LLM 直接告知用户（原来要等 confirm 才报「已存在」，体验断裂）
-        if (addTask) {
+        if ("ADD".equals(writeType)) {
             String planRef = text(input, "planRef");
             String stageTitle = text(input, "stageTitle");
             if (stageTitle != null && !stageTitle.isBlank()
@@ -200,24 +221,60 @@ public class LearningAgentRuntime extends AbstractAgentRuntime implements AgentR
                 return null; // 循环继续，由 LLM 收尾告知用户
             }
         }
-        boolean done = !addTask && !"false".equalsIgnoreCase(text(input, "done"));
+        // V3.3：RENAME 提案前预检——同名改名（排除自身逻辑必漏，显式拒）+ 新名撞已有任务（排除原任务自身）
+        if ("RENAME".equals(writeType)) {
+            String planRef = text(input, "planRef");
+            String stageTitle = text(input, "stageTitle");
+            String rejectReason = null;
+            if (newTitle.trim().equalsIgnoreCase(taskTitle.trim())) {
+                rejectReason = "新任务名与原任务名相同，改名提案被拒绝";
+            } else if (stageTitle != null && !stageTitle.isBlank()
+                    && renameNewTitleAlreadyExists(run.getUserId(), planRef, stageTitle, taskTitle, newTitle)) {
+                rejectReason = "目标阶段已存在同名任务「" + newTitle + "」，改名提案被拒绝";
+            }
+            if (rejectReason != null) {
+                int nextStepNo = run.getUsedSteps() + 1;
+                emitter.emit(nextStepNo, "SUGGEST_WRITE", "FAILED", rejectReason);
+                recordRejectedStep(run, decision, nextStepNo, rejectReason);
+                observations.add("系统提示：" + rejectReason
+                        + "。请直接告知用户（不要生成改名提案，如用户确实要改可建议换成其他任务名）。");
+                run.setCurrentStep(nextStepNo);
+                run.setUsedSteps(nextStepNo);
+                run.setContextJson(toJson(clipContext(observations)));
+                run.setUpdatedAt(LocalDateTime.now());
+                runMapper.updateById(run);
+                return null; // 循环继续，由 LLM 收尾告知用户
+            }
+        }
+        boolean done = "UPDATE".equals(writeType) && !"false".equalsIgnoreCase(text(input, "done"));
 
         AgentWriteProposal proposal = new AgentWriteProposal(
-                addTask ? AgentWriteProposal.TYPE_ADD_LEARNING_TASK : AgentWriteProposal.TYPE_UPDATE_TASK_DONE,
+                "ADD".equals(writeType) ? AgentWriteProposal.TYPE_ADD_LEARNING_TASK
+                        : "RENAME".equals(writeType) ? AgentWriteProposal.TYPE_UPDATE_LEARNING_TASK
+                        : AgentWriteProposal.TYPE_UPDATE_TASK_DONE,
                 text(input, "planRef"),
                 text(input, "stageTitle"),
                 taskTitle,
-                done
+                done,
+                "RENAME".equals(writeType) ? newTitle : null
         );
 
-        String actionLabel = addTask
-                ? "提案追加任务「" + taskTitle + "」到目标阶段"
-                : done ? "提案勾选任务「" + taskTitle + "」为完成" : "提案取消任务「" + taskTitle + "」的完成状态";
-        String finalAnswer = addTask
-                ? "已为你准备好追加任务「" + taskTitle + "」的提案，确认后执行。"
-                : done
-                ? "已为你准备好「" + taskTitle + "」任务勾选提案，确认后执行。"
-                : "已为你准备好「" + taskTitle + "」任务取消勾选提案，确认后执行。";
+        String actionLabel;
+        String finalAnswer;
+        if ("ADD".equals(writeType)) {
+            actionLabel = "提案追加任务「" + taskTitle + "」到目标阶段";
+            finalAnswer = "已为你准备好追加任务「" + taskTitle + "」的提案，确认后执行。";
+        } else if ("RENAME".equals(writeType)) {
+            actionLabel = "提案将任务「" + taskTitle + "」重命名为「" + newTitle + "」";
+            finalAnswer = "已为你准备好将任务「" + taskTitle + "」重命名为「" + newTitle + "」的提案，确认后执行。";
+        } else {
+            actionLabel = done
+                    ? "提案勾选任务「" + taskTitle + "」为完成"
+                    : "提案取消任务「" + taskTitle + "」的完成状态";
+            finalAnswer = done
+                    ? "已为你准备好「" + taskTitle + "」任务勾选提案，确认后执行。"
+                    : "已为你准备好「" + taskTitle + "」任务取消勾选提案，确认后执行。";
+        }
 
         emitter.emit(run.getUsedSteps() + 1, "SUGGEST_WRITE", "SUCCESS", actionLabel);
         recordTerminalStep(run, decision, run.getUsedSteps() + 1);
@@ -282,6 +339,58 @@ public class LearningAgentRuntime extends AbstractAgentRuntime implements AgentR
                             task.getTitle() == null ? "" : task.getTitle().trim()));
         } catch (Exception e) {
             log.warn("ADD 重复预检失败，交给 confirm 裁判: userId={}, planRef={}", userId, planRef, e);
+            return false;
+        }
+    }
+
+    /**
+     * RENAME 预检（V3.3）：新名是否与目标阶段内其他任务重名（排除被改名的原任务自身及其同名项）。
+     * 同名改名边界（newTitle equalsIgnoreCase taskTitle）不在这里判——排除自身逻辑必然漏掉，
+     * 由调用点显式拒绝。任何定位歧义 / 异常返回 false——不阻塞提案，confirm 层仍有裁判兜底。
+     */
+    private boolean renameNewTitleAlreadyExists(Long userId, String planRef, String stageTitle,
+                                                String oldTitle, String newTitle) {
+        if (oldTitle == null || oldTitle.isBlank() || newTitle == null || newTitle.isBlank()) {
+            return false;
+        }
+        try {
+            List<LearningPlans> actives = learningPlansService.listByUser(userId).stream()
+                    .filter(plan -> LearningPlans.STATUS_ACTIVE.equals(plan.getStatus()))
+                    .toList();
+            if (actives.isEmpty()) {
+                return false;
+            }
+            LearningPlans plan;
+            if (planRef != null && !planRef.isBlank()) {
+                List<LearningPlans> matched = learningPlansService.matchActivePlansByMessage(userId, planRef);
+                if (matched.size() != 1) {
+                    return false;
+                }
+                plan = matched.get(0);
+            } else if (actives.size() == 1) {
+                plan = actives.get(0);
+            } else {
+                return false;
+            }
+            LearningPlansDetailVO detail = learningPlansService.getDetail(plan.getId(), userId);
+            if (detail == null || detail.getStages() == null) {
+                return false;
+            }
+            List<LearningPlansDetailVO.StageProgress> stageMatches = detail.getStages().stream()
+                    .filter(stage -> stageTitle.trim().equalsIgnoreCase(
+                            stage.getTitle() == null ? "" : stage.getTitle().trim()))
+                    .toList();
+            if (stageMatches.size() != 1 || stageMatches.get(0).getTasks() == null) {
+                return false;
+            }
+            return stageMatches.get(0).getTasks().stream().anyMatch(task -> {
+                String title = task.getTitle() == null ? "" : task.getTitle().trim();
+                boolean sameAsNew = newTitle.trim().equalsIgnoreCase(title);
+                boolean sameAsOld = oldTitle.trim().equalsIgnoreCase(title);
+                return sameAsNew && !sameAsOld; // 排除被改名的原任务自身（含其同名项）
+            });
+        } catch (Exception e) {
+            log.warn("RENAME 新名重复预检失败，交给 confirm 裁判: userId={}, planRef={}", userId, planRef, e);
             return false;
         }
     }

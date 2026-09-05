@@ -26,6 +26,11 @@ public interface LearningPlansService extends IService<LearningPlans> {
     // 4. 任务勾选：校验归属 → 改 tasks JSON 第 index 项的 done → 写回（进度实时聚合，不存库）
     void updateTaskDone(Long planId, Long stageId, int taskIndex, boolean done, Long userId);
 
+    /**
+     * V3.3 任务重命名：改 tasks JSON 第 taskIndex 项的 title（done 保留），其余同 updateTaskDone。
+     */
+    void renameTask(Long planId, Long stageId, int taskIndex, String newTitle, Long userId);
+
     // 5. 标题关键词匹配（分词 AND 全命中，查询 Tool 详情用；不过滤状态）
     List<LearningPlans> matchPlansByTitle(Long userId, String keyword);
 

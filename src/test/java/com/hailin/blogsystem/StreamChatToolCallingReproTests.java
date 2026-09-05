@@ -4,7 +4,9 @@ import com.hailin.blogsystem.ai.TokenUsageAccumulator;
 import com.hailin.blogsystem.entity.AiPrompt;
 import com.hailin.blogsystem.service.AiModelService;
 import com.hailin.blogsystem.utils.UserContext;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 
@@ -16,8 +18,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * 链路冒烟测试（真实 LLM）：普通聊天流式 + 工具调用（查询学习计划）。
  * 回归场景：qwen 流式 tool_calls 分片 name 缺失 → 聚合断言炸流 → 自动降级非流式重跑。
+ * 默认套件跳过，需显式 -DrunRealLlm=true 才发真实 LLM 请求。
  */
 @SpringBootTest
+@Tag("integration")
+@EnabledIfSystemProperty(named = "runRealLlm", matches = "true")
 class StreamChatToolCallingReproTests {
 
     @Autowired

@@ -1,16 +1,26 @@
 package com.hailin.blogsystem;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hailin.blogsystem.entity.dto.AiIntent;
 import com.hailin.blogsystem.service.AiIntentClassifier;
 import org.junit.jupiter.api.Tag;
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+
+import java.io.InputStream;
+import java.util.List;
+import java.util.Objects;
+import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 @Tag("integration")
+@Tag("eval")
 @SpringBootTest
 @EnabledIfSystemProperty(named = "runRealLlm", matches = "true")
 class AiIntentClassifierIntegrationTests {
@@ -18,103 +28,115 @@ class AiIntentClassifierIntegrationTests {
     @Autowired
     private AiIntentClassifier aiIntentClassifier;
 
-    @Test
-    void classifiesLearningDifficultyAsLearningAssist() {
-        AiIntent intent = aiIntentClassifier.classify(
-                "我感觉微服务计划中的阶段二挺难的，帮我拆成几个更小的任务",
-                null
-        );
+    // ------------------------------------------------------------------
+    // 评测集：JSON 文件驱动（classifier-evaluation-cases.json）
+    // 加样例 = 加 JSON 行；-DevalCase=子串 可只跑名称匹配的样例（省 LLM 调用）
+    // ------------------------------------------------------------------
 
-        assertThat(intent.getIntent()).isEqualTo("LEARNING_ASSIST");
-        assertThat(intent.getLearningPlanRef()).contains("微服务");
-        assertThat(intent.getLearningStageRef()).contains("阶段二");
-        assertThat(intent.getConfidence()).isGreaterThanOrEqualTo(0.55);
+    /**
+     * 一条分类器评测样例。字段全部可空，非 null 才断言；
+     * 显式 false 也能断言（expectedNeedsThinking），不能靠 null 跳过。
+     */
+    record ClassifierEvalCase(
+            String name,
+            String category,
+            String message,
+            String expectedIntent,
+            String expectedPlanRefContains,
+            String expectedStageRefContains,
+            Boolean expectedPlanRefNonBlank,
+            Double expectedConfidenceMin,
+            Boolean expectedNeedsThinking,
+            Boolean expectedNeedsThinkingReasonNonBlank,
+            String expectedSuggestedAction
+    ) {
     }
 
-    @Test
-    void classifiesStateDependentChatAsNeedsThinking() {
-        // V3.0：状态依赖句（记忆/上下文信号明确）→ GENERAL_CHAT + needsThinking=true
-        AiIntent intent = aiIntentClassifier.classify(
-                "结合我最近的情况，给个建议",
-                null
+    static Stream<Arguments> evalCases() throws Exception {
+        InputStream inputStream = AiIntentClassifierIntegrationTests.class
+                .getResourceAsStream("/agent/classifier-evaluation-cases.json");
+
+        assertThat(inputStream)
+                .as("分类器评测集文件必须存在")
+                .isNotNull();
+
+        List<ClassifierEvalCase> cases = new ObjectMapper().readValue(
+                Objects.requireNonNull(inputStream),
+                new TypeReference<>() {
+                }
         );
 
-        assertThat(intent.getIntent()).isEqualTo("GENERAL_CHAT");
-        assertThat(intent.getNeedsThinking()).isTrue();
-        assertThat(intent.getNeedsThinkingReason()).isNotBlank();
+        assertThat(cases)
+                .as("分类器评测集不能为空")
+                .isNotEmpty();
+
+        // 每例必须带 name/message，否则无法定位失败
+        for (ClassifierEvalCase c : cases) {
+            assertThat(c.name())
+                    .as("样例缺少 name")
+                    .isNotBlank();
+            assertThat(c.message())
+                    .as("样例 %s 缺少 message", c.name())
+                    .isNotBlank();
+        }
+
+        String evalCaseFilter = System.getProperty("evalCase");
+        if (evalCaseFilter != null && !evalCaseFilter.isBlank()) {
+            cases = cases.stream()
+                    .filter(c -> c.name().contains(evalCaseFilter))
+                    .toList();
+            assertThat(cases)
+                    .as("-DevalCase=%s 无匹配样例", evalCaseFilter)
+                    .isNotEmpty();
+        }
+
+        return cases.stream().map(c -> Arguments.of(c.name(), c));
     }
 
-    @Test
-    void classifiesPureConceptChatAsNoThinking() {
-        // V3.0：纯概念问答 → GENERAL_CHAT + needsThinking=false（默认 false 语义）
-        AiIntent intent = aiIntentClassifier.classify(
-                "什么是缓存穿透",
-                null
-        );
+    @ParameterizedTest(name = "[{index}] {0}")
+    @MethodSource("evalCases")
+    void classifierMatchesFixedEvalCase(String caseName, ClassifierEvalCase c) {
+        AiIntent intent = aiIntentClassifier.classify(c.message(), null);
 
-        assertThat(intent.getIntent()).isEqualTo("GENERAL_CHAT");
-        assertThat(intent.getNeedsThinking()).isFalse();
-    }
-
-    @Test
-    void classifiesExplicitAddTaskRequestAsLearningAgentNotLearningAssist() {
-        // V3.1：用户给出任务名（受控写素材）→ LEARNING_AGENT（走 SUGGEST_WRITE 受控写），
-        // 不是 LEARNING_ASSIST workflow（AI 拆解语义）——两意图分界靠真实模型锁定
-        AiIntent intent = aiIntentClassifier.classify(
-                "给 Redis 计划第二阶段加一个缓存雪崩防护任务",
-                null
-        );
-
-        assertThat(intent.getIntent()).isEqualTo("LEARNING_AGENT");
-    }
-
-    @Test
-    void classifiesProgressRequestWithPlanNamedAsLearningProgress() {
-        // 回归：用户点名计划 + 阶段的调整诉求 → LEARNING_PROGRESS + learningPlanRef 摘录
-        // （摘录丢失 → 入口拿整句匹配多计划会失手 → 用户被迫先选计划）
-        AiIntent intent = aiIntentClassifier.classify(
-                "把 C++ 计划的第二阶段压缩一下",
-                null
-        );
-
-        assertThat(intent.getIntent()).isEqualTo("LEARNING_PROGRESS");
-        assertThat(intent.getLearningPlanRef()).isNotBlank();
-    }
-
-    @Test
-    void classifiesAssistRequestWithPlanNamedAsLearningAssist() {
-        // 回归：用户点名计划 + 阶段的攻坚拆解诉求 → LEARNING_ASSIST + learningPlanRef 摘录
-        AiIntent intent = aiIntentClassifier.classify(
-                "C++ 计划的第三阶段太难了，你能帮我拆解一下吗",
-                null
-        );
-
-        assertThat(intent.getIntent()).isEqualTo("LEARNING_ASSIST");
-        assertThat(intent.getLearningPlanRef()).isNotBlank();
-    }
-
-    @Test
-    void classifiesNamedAddTaskWithPlanAndStageAsLearningAgent() {
-        // 回归（用户实测场景 3）：点名计划 + 阶段 + 具体任务名 → LEARNING_AGENT 受控写，
-        // 不能落普通聊天工具链（无写工具 → LLM 只能回复「无法直接修改」）
-        AiIntent intent = aiIntentClassifier.classify(
-                "C++ 计划的阶段1，帮我加一下这个小任务：练习引用与指针在函数传参中的区别",
-                null
-        );
-
-        assertThat(intent.getIntent()).isEqualTo("LEARNING_AGENT");
-        assertThat(intent.getSuggestedAction()).isEqualTo("AGENT");
-    }
-
-    @Test
-    void classifiesMultilineNamedAddTaskRequestAsLearningAgent() {
-        // 回归（用户实测翻车场景）：多行消息 + 长任务名曾导致模型把规则文字混进 JSON → 解析失败降级普通聊天
-        AiIntent intent = aiIntentClassifier.classify(
-                "C++计划的阶段1,帮我加一下这个小任务\n练习引用与指针在函数传参中的区别",
-                null
-        );
-
-        assertThat(intent.getIntent()).isEqualTo("LEARNING_AGENT");
-        assertThat(intent.getSuggestedAction()).isEqualTo("AGENT");
+        if (c.expectedIntent() != null) {
+            assertThat(intent.getIntent())
+                    .as("用例 %s：intent", caseName)
+                    .isEqualTo(c.expectedIntent());
+        }
+        if (c.expectedPlanRefContains() != null) {
+            assertThat(intent.getLearningPlanRef())
+                    .as("用例 %s：learningPlanRef 应包含", caseName)
+                    .contains(c.expectedPlanRefContains());
+        }
+        if (c.expectedStageRefContains() != null) {
+            assertThat(intent.getLearningStageRef())
+                    .as("用例 %s：learningStageRef 应包含", caseName)
+                    .contains(c.expectedStageRefContains());
+        }
+        if (Boolean.TRUE.equals(c.expectedPlanRefNonBlank())) {
+            assertThat(intent.getLearningPlanRef())
+                    .as("用例 %s：learningPlanRef 不应为空", caseName)
+                    .isNotBlank();
+        }
+        if (c.expectedConfidenceMin() != null) {
+            assertThat(intent.getConfidence())
+                    .as("用例 %s：confidence", caseName)
+                    .isGreaterThanOrEqualTo(c.expectedConfidenceMin());
+        }
+        if (c.expectedNeedsThinking() != null) {
+            assertThat(intent.getNeedsThinking())
+                    .as("用例 %s：needsThinking", caseName)
+                    .isEqualTo(c.expectedNeedsThinking());
+        }
+        if (Boolean.TRUE.equals(c.expectedNeedsThinkingReasonNonBlank())) {
+            assertThat(intent.getNeedsThinkingReason())
+                    .as("用例 %s：needsThinkingReason 不应为空", caseName)
+                    .isNotBlank();
+        }
+        if (c.expectedSuggestedAction() != null) {
+            assertThat(intent.getSuggestedAction())
+                    .as("用例 %s：suggestedAction", caseName)
+                    .isEqualTo(c.expectedSuggestedAction());
+        }
     }
 }

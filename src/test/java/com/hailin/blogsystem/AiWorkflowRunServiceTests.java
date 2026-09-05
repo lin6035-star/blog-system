@@ -215,6 +215,9 @@ class AiWorkflowRunServiceTests {
 
         AiWorkflowCreateArticleDTO dto = new AiWorkflowCreateArticleDTO();
         dto.setRequirement("帮我写一篇 Redis 缓存原理的博客");
+        //生产链路 topicEvidence 由分类器从原话摘录后透传（AiMessageServiceImpl 兜底 intent.topic）；
+        //测试直调 Service 需补，否则 isRequirementUnclear 判需求模糊停在需求确认
+        dto.setTopicEvidence("Redis 缓存原理");
 
         AiWorkflowRunVO created = aiWorkflowRunService.createArticleWorkflow(dto);
 
@@ -254,6 +257,7 @@ class AiWorkflowRunServiceTests {
 
         AiWorkflowCreateArticleDTO dto = new AiWorkflowCreateArticleDTO();
         dto.setRequirement("帮我写一篇 Redis 缓存博客");
+        dto.setTopicEvidence("Redis 缓存博客");
 
         AiWorkflowRunVO created = aiWorkflowRunService.createArticleWorkflow(dto);
 
@@ -319,6 +323,7 @@ class AiWorkflowRunServiceTests {
 
         AiWorkflowCreateArticleDTO dto = new AiWorkflowCreateArticleDTO();
         dto.setRequirement("帮我写一篇 Redis 缓存原理的博客");
+        dto.setTopicEvidence("Redis 缓存原理");
 
         AiWorkflowRunVO created = aiWorkflowRunService.createArticleWorkflow(dto);
         AiWorkflowRunVO approved = aiWorkflowRunService.approve(Long.valueOf(created.getId()));
@@ -382,6 +387,7 @@ class AiWorkflowRunServiceTests {
 
         AiWorkflowCreateArticleDTO dto = new AiWorkflowCreateArticleDTO();
         dto.setRequirement("帮我写一篇 Redis 博客");
+        dto.setTopicEvidence("Redis 博客");
 
         AiWorkflowRunVO vo = aiWorkflowRunService.createArticleWorkflow(dto);
 
@@ -418,6 +424,7 @@ class AiWorkflowRunServiceTests {
 
         AiWorkflowCreateArticleDTO dto = new AiWorkflowCreateArticleDTO();
         dto.setRequirement("帮我写一篇 Redis 缓存原理的博客");
+        dto.setTopicEvidence("Redis 缓存原理");
 
         // create → WAITING_OUTLINE_CONFIRM
         AiWorkflowRunVO created = aiWorkflowRunService.createArticleWorkflow(dto);
@@ -676,6 +683,7 @@ class AiWorkflowRunServiceTests {
 
         AiWorkflowCreateArticleDTO dto = new AiWorkflowCreateArticleDTO();
         dto.setRequirement("帮我写一篇 Redis 缓存原理的博客");
+        dto.setTopicEvidence("Redis 缓存原理");
 
         AiWorkflowRunVO created =
                 aiWorkflowRunService.createArticleWorkflow(dto);
@@ -699,6 +707,7 @@ class AiWorkflowRunServiceTests {
                 new AiWorkflowCreateArticleDTO();
 
         dto.setRequirement("帮我写一篇 Redis 缓存原理的博客");
+        dto.setTopicEvidence("Redis 缓存原理");
 
         AiWorkflowRunVO created =
                 aiWorkflowRunService.createArticleWorkflow(dto);

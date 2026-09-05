@@ -169,12 +169,15 @@ public class LlmAgentStepDecider implements AgentStepDecider {
                   input.reason = 建议原因（中文）
                   input.initialMessage = 用户原始诉求（可选）
                   input.risk = 风险等级 LOW / MEDIUM / HIGH（可选）
-                - SUGGEST_WRITE：用户要求修改学习计划任务 / 追加新任务时，产出写动作提案（终态，后端裁判 + 用户确认后才会执行，你不能直接改任何数据）。注意双层 actionType：外层固定 SUGGEST_WRITE，内层 input.actionType 才是写动作类型，二选一：
+                - SUGGEST_WRITE：用户要求修改学习计划任务 / 追加新任务 / 重命名已有任务时，产出写动作提案（终态，后端裁判 + 用户确认后才会执行，你不能直接改任何数据）。注意双层 actionType：外层固定 SUGGEST_WRITE，内层 input.actionType 才是写动作类型，三选一：
                   - input.actionType = UPDATE_TASK_DONE：勾选完成 / 取消勾选已有任务。
                     input.taskTitle = 已有任务标题（从观察中摘录，必须真实存在）
                     input.done = true（勾选完成）/ false（取消勾选）
                   - input.actionType = ADD_LEARNING_TASK：向某阶段追加用户点名的新任务（一次一个）。
                     input.taskTitle = 用户要求添加的新任务标题（来自用户原话，不在观察中；不加不猜）
+                  - input.actionType = UPDATE_LEARNING_TASK：把已有任务改名 / 重命名（一次一个，只改名）。
+                    input.taskTitle = 被改名的任务标题（旧名，从观察中摘录，必须真实存在）
+                    input.newTitle = 用户给的新任务名（来自用户原话；不猜不改写）
                   input.stageTitle = 目标阶段标题（从观察中摘录）
                   input.planRef = 计划名称关键词（可选，用于定位计划）
 
@@ -187,6 +190,7 @@ public class LlmAgentStepDecider implements AgentStepDecider {
                 - 观察显示用户需要调整计划 / 制定计划 / 攻坚阶段时，用 SUGGEST_WORKFLOW 建议对应流程（只能建议 LEARNING_PLAN / LEARNING_PROGRESS / LEARNING_ASSIST，不能建议文章类 Workflow）
                 - 用户明确要求勾选 / 取消勾选某个已有任务时，用 SUGGEST_WRITE 提案（input.actionType=UPDATE_TASK_DONE，taskTitle 必须来自观察，不能编造）
                 - 用户明确给出任务名要求添加到某计划/阶段（如「给 XX 计划加一个 XX 任务」）时，用 SUGGEST_WRITE 提案（input.actionType=ADD_LEARNING_TASK，taskTitle=用户给的新任务名；这与「帮我把阶段拆细」的 LEARNING_ASSIST 拆解诉求不同——拆解是 Workflow 建议，不是写动作）
+                - 用户明确要求把某个已有任务改名 / 重命名（如「把缓存击穿任务改名为缓存击穿防护」）时，用 SUGGEST_WRITE 提案（input.actionType=UPDATE_LEARNING_TASK，taskTitle=旧名必须来自观察，newTitle=新名来自用户原话；一次只改一个任务，不要顺带做勾选等其他修改）
                 - 写动作提案必须带内层 input.actionType（外层固定 SUGGEST_WRITE，两个 actionType 含义不同，别混淆）
                 - 禁止在没有任何查询观察时使用 SUGGEST_WORKFLOW / SUGGEST_WRITE（后端会拒绝）
                 - 每步只能输出一个动作

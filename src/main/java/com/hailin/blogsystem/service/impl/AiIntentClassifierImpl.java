@@ -211,7 +211,8 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 - suggestedWorkflowType=null
 
                                 当用户明确要求勾选 / 取消勾选学习计划中的任务、
-                                标记任务完成 / 取消完成时（V2.4 受控写动作）：
+                                标记任务完成 / 取消完成时（V2.4 受控写动作），
+                                或把已有任务改名 / 重命名（V3.3 受控写改名，新名来自用户原话）时：
                                 - intent=LEARNING_AGENT
                                 - suggestedAction=AGENT
                                 - suggestedWorkflowType=null
@@ -232,6 +233,7 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 - “帮我把 Redis 计划的缓存击穿任务勾掉 / 标记完成” -> LEARNING_AGENT（受控写提案）
                                 - “把那个任务取消勾选” -> LEARNING_AGENT（受控写提案）
                                 - “给 Redis 计划第二阶段加一个'缓存雪崩防护'任务” -> LEARNING_AGENT（受控写追加，任务名用户已给）
+                                - “把 Redis 计划的缓存击穿任务改名为缓存击穿防护” -> LEARNING_AGENT（受控写改名，旧名新名都来自用户原话）
                                 - “第二阶段太难，帮我加几个练习任务” -> LEARNING_ASSIST（任务名要 AI 生成）
                                 - “我有几个学习规划” -> LEARNING_PLAN_QUERY（查询已有计划，不是 Agent）
                                 - “Redis 是什么” -> GENERAL_CHAT
@@ -273,6 +275,10 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 - 用户点名具体任务要求加入某计划/阶段
                                   （任务名来自用户原话，如"给 Redis 计划第二阶段加一个'缓存雪崩防护'任务"）：
                                   AGENT（intent=LEARNING_AGENT，受控写追加，不是 WORKFLOW）
+
+                                - 用户点名已有任务并给出新名要求改名 / 重命名
+                                  （如"把缓存击穿改成缓存击穿防护"）：
+                                  AGENT（intent=LEARNING_AGENT，受控写改名，不是 WORKFLOW）
 
                                 - 继续学习安排、下一步学什么、理一下学习思路：
                                   AGENT（intent=LEARNING_AGENT）
@@ -339,6 +345,9 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 - intent=LEARNING_PROGRESS
                                 - suggestedAction=WORKFLOW
                                 - suggestedWorkflowType=LEARNING_PROGRESS
+                                （注意：仅把某个已有任务改名 / 重命名且新名来自用户原话 →
+                                不是 LEARNING_PROGRESS，走 LEARNING_AGENT 受控写改名提案；
+                                “调整、压缩、重排”整段/整体结构仍属本类）
 
                                 当用户表达某个学习计划、阶段或任务难度过高、
                                 卡住、理解困难，并希望解释、拆解，

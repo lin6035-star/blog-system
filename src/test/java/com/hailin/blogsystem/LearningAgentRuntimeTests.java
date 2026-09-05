@@ -356,6 +356,118 @@ class LearningAgentRuntimeTests {
         assertThat(steps.get(1).getErrorMessage()).contains("已存在同名任务");
     }
 
+    @Test
+    void renameProposalWithObservationMarksWaitingWriteConfirm() {
+        // V3.3：内层 actionType=UPDATE_LEARNING_TASK → proposal 带 taskTitle(旧名) + newTitle(新名)，done 恒 false
+        when(decider.decide(any(), any(), anyInt(), anyInt()))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_LEARNING_DASHBOARD))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
+                        .withInput(Map.of(
+                                "actionType", "UPDATE_LEARNING_TASK",
+                                "planRef", "Redis 学习计划",
+                                "stageTitle", "第二阶段",
+                                "taskTitle", "缓存击穿",
+                                "newTitle", "缓存击穿防护")));
+        when(executor.execute(any(), any(), any()))
+                .thenReturn("学习计划总览：共 1 个计划。\n- 阶段《第二阶段》：缓存击穿；");
+
+        AgentRunResult result = runtime.run(100L, 200L, "把缓存击穿任务改名为缓存击穿防护");
+
+        assertThat(result.status()).isEqualTo(AiAgentRunStatus.WAITING_WRITE_CONFIRM);
+        assertThat(result.pendingWriteAction()).isNotNull();
+        assertThat(result.pendingWriteAction().actionType()).isEqualTo("UPDATE_LEARNING_TASK");
+        assertThat(result.pendingWriteAction().taskTitle()).isEqualTo("缓存击穿");
+        assertThat(result.pendingWriteAction().newTitle()).isEqualTo("缓存击穿防护");
+        assertThat(result.pendingWriteAction().done()).isFalse();
+
+        AiAgentRun saved = captureRun();
+        assertThat(saved.getContextJson()).contains("UPDATE_LEARNING_TASK");
+        assertThat(saved.getContextJson()).contains("缓存击穿防护");
+    }
+
+    @Test
+    void renameProposalRejectedWhenNewTitleAlreadyExists() {
+        // V3.3：新名与阶段内其他任务撞名 → 提案前预检拒绝（FAILED step）→ LLM 直接告知，不弹确认卡
+        when(decider.decide(any(), any(), anyInt(), anyInt()))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_LEARNING_DASHBOARD))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
+                        .withInput(Map.of(
+                                "actionType", "UPDATE_LEARNING_TASK",
+                                "planRef", "Redis 学习计划",
+                                "stageTitle", "阶段二",
+                                "taskTitle", "缓存击穿",
+                                "newTitle", "缓存雪崩防护")))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
+                        .withInput(Map.of("answer", "阶段二里已经有缓存雪崩防护这个任务了，换个名字吧。")));
+        when(executor.execute(any(), any(), any()))
+                .thenReturn("学习计划总览：共 1 个计划。\n- 阶段《阶段二》：缓存击穿；缓存雪崩防护；");
+        when(learningPlansService.listByUser(100L)).thenReturn(List.of(activePlan(1L, "Redis 学习计划")));
+        when(learningPlansService.matchActivePlansByMessage(100L, "Redis 学习计划"))
+                .thenReturn(List.of(activePlan(1L, "Redis 学习计划")));
+        when(learningPlansService.getDetail(1L, 100L)).thenReturn(
+                detailWithStages(stageWithTasks(11L, "阶段二", "缓存击穿", "缓存雪崩防护")));
+
+        AgentRunResult result = runtime.run(100L, 200L, "把缓存击穿改名为缓存雪崩防护");
+
+        assertThat(result.status()).isEqualTo(AiAgentRunStatus.COMPLETED);
+        assertThat(result.finalAnswer()).contains("换个名字吧");
+        assertThat(result.pendingWriteAction()).isNull();
+        List<AiAgentStep> steps = captureSteps();
+        assertThat(steps).hasSize(3);
+        assertThat(steps.get(1).getActionType()).isEqualTo("SUGGEST_WRITE");
+        assertThat(steps.get(1).getStatus()).isEqualTo("FAILED");
+        assertThat(steps.get(1).getErrorMessage()).contains("已存在同名任务");
+    }
+
+    @Test
+    void renameProposalRejectedWhenNewTitleSameAsOld() {
+        // V3.3 边界：同名改名（newTitle == taskTitle）——precheck 排除自身必漏，调用点显式拒绝
+        when(decider.decide(any(), any(), anyInt(), anyInt()))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_LEARNING_DASHBOARD))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
+                        .withInput(Map.of(
+                                "actionType", "UPDATE_LEARNING_TASK",
+                                "stageTitle", "阶段一",
+                                "taskTitle", "缓存击穿",
+                                "newTitle", "缓存击穿")))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
+                        .withInput(Map.of("answer", "新名字和原来一样，不用改。")));
+        when(executor.execute(any(), any(), any()))
+                .thenReturn("学习计划总览：共 1 个计划。\n- 阶段《阶段一》：缓存击穿；");
+
+        AgentRunResult result = runtime.run(100L, 200L, "把缓存击穿改名为缓存击穿");
+
+        assertThat(result.status()).isEqualTo(AiAgentRunStatus.COMPLETED);
+        assertThat(result.finalAnswer()).contains("不用改");
+        assertThat(result.pendingWriteAction()).isNull();
+        List<AiAgentStep> steps = captureSteps();
+        assertThat(steps.get(1).getActionType()).isEqualTo("SUGGEST_WRITE");
+        assertThat(steps.get(1).getStatus()).isEqualTo("FAILED");
+        assertThat(steps.get(1).getErrorMessage()).contains("与原任务名相同");
+    }
+
+    @Test
+    void renameProposalWithUnknownActionTypeFailsRun() {
+        // V3.3（Codex 评审收紧）：非空但不认识的 actionType（模型幻觉 DELETE/MOVE 等）→ FAILED 不生成提案，
+        // 绝不回落 UPDATE_TASK_DONE（回落 + done 缺省 true = 误勾选任务）
+        when(decider.decide(any(), any(), anyInt(), anyInt()))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_LEARNING_DASHBOARD))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
+                        .withInput(Map.of(
+                                "actionType", "DELETE_LEARNING_TASK",
+                                "taskTitle", "缓存击穿")));
+        when(executor.execute(any(), any(), any())).thenReturn("学习计划总览：共 1 个计划");
+
+        AgentRunResult result = runtime.run(100L, 200L, "把缓存击穿任务删掉");
+
+        assertThat(result.status()).isEqualTo(AiAgentRunStatus.FAILED);
+        AiAgentRun saved = captureRun();
+        assertThat(saved.getErrorMessage()).contains("不支持的 actionType");
+        assertThat(result.pendingWriteAction()).isNull();
+        // markFailed 终局：run 落 FAILED，不再产出 WAITING_WRITE_CONFIRM 提案（无 pendingWriteAction 落库）
+        assertThat(saved.getContextJson()).doesNotContain("pendingWriteAction");
+    }
+
     private LearningPlans activePlan(Long id, String title) {
         LearningPlans plan = new LearningPlans();
         plan.setId(id);

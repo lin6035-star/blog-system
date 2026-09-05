@@ -141,6 +141,7 @@ public class AgentWriteActionService {
         return switch (proposal.actionType()) {
             case AgentWriteProposal.TYPE_UPDATE_TASK_DONE -> executeUpdateTaskDone(run, proposal, userId);
             case AgentWriteProposal.TYPE_ADD_LEARNING_TASK -> executeAddLearningTask(run, proposal, userId);
+            case AgentWriteProposal.TYPE_UPDATE_LEARNING_TASK -> executeRenameLearningTask(run, proposal, userId);
             default -> throw new BusinessException(
                     BlogConstants.ErrorCode.SERVER_ERROR,
                     "提案数据异常，无法执行");
@@ -209,6 +210,60 @@ public class AgentWriteActionService {
                 + proposal.stageTitle() + "」追加任务「" + proposal.taskTitle() + "」。";
 
         markExecuted(run, proposal, target.plan().getId(), target.stage().getId(), null,
+                beforeTasks, afterTasks);
+        log.info("写动作执行完成: runId={}, {}", run.getId(), resultMessage);
+        return resultMessage;
+    }
+
+    /**
+     * UPDATE_LEARNING_TASK（V3.3）：定位 计划→阶段→旧任务（taskTitle 必须已存在且唯一）→
+     * 新名重复预检（排除 taskIndex 自身）→ renameTask + 快照留痕。同名改名、复合动作不做。
+     */
+    private String executeRenameLearningTask(AiAgentRun run, AgentWriteProposal proposal, Long userId) {
+        if (proposal.taskTitle() == null || proposal.taskTitle().isBlank()
+                || proposal.newTitle() == null || proposal.newTitle().isBlank()
+                || proposal.stageTitle() == null || proposal.stageTitle().isBlank()) {
+            throw new BusinessException(
+                    BlogConstants.ErrorCode.BAD_REQUEST,
+                    "提案缺少任务标题、新任务名或阶段标题");
+        }
+        // 同名改名边界（防御纵深：提案前已预检过，此处再拒——提案可能被篡改/旧版本生成）
+        if (proposal.newTitle().trim().equalsIgnoreCase(proposal.taskTitle().trim())) {
+            throw new BusinessException(
+                    BlogConstants.ErrorCode.BAD_REQUEST,
+                    "新任务名与原任务名相同");
+        }
+        PlanStageTarget target = resolvePlanAndStage(proposal, userId);
+        int taskIndex = resolveTaskIndex(target.stage(), proposal);
+        log.info("写动作目标解析成功: runId={}, planId={}, stageId={}, taskIndex={}",
+                run.getId(), target.plan().getId(), target.stage().getId(), taskIndex);
+
+        // 新名重复预检（排除 taskIndex 自身，防御纵深，镜像 ADD 分支）
+        if (target.stage().getTasks() != null) {
+            for (int i = 0; i < target.stage().getTasks().size(); i++) {
+                if (i == taskIndex) {
+                    continue;
+                }
+                String title = target.stage().getTasks().get(i).getTitle();
+                if (proposal.newTitle().trim().equalsIgnoreCase(title == null ? "" : title.trim())) {
+                    throw new BusinessException(
+                            BlogConstants.ErrorCode.CONFLICT,
+                            "任务「" + proposal.newTitle() + "」已在阶段「" + proposal.stageTitle() + "」中");
+                }
+            }
+        }
+
+        // before 快照
+        String beforeTasks = readStageTasks(target.stage().getId());
+        learningPlansService.renameTask(target.plan().getId(), target.stage().getId(),
+                taskIndex, proposal.newTitle().trim(), userId);
+        // after 快照
+        String afterTasks = readStageTasks(target.stage().getId());
+
+        String resultMessage = "已将任务「" + proposal.taskTitle() + "」重命名为「"
+                + proposal.newTitle().trim() + "」。";
+
+        markExecuted(run, proposal, target.plan().getId(), target.stage().getId(), taskIndex,
                 beforeTasks, afterTasks);
         log.info("写动作执行完成: runId={}, {}", run.getId(), resultMessage);
         return resultMessage;
@@ -311,6 +366,9 @@ public class AgentWriteActionService {
             executed.put("stageTitle", proposal.stageTitle());
             executed.put("taskTitle", proposal.taskTitle());
             executed.put("done", proposal.done());
+            if (proposal.newTitle() != null) {
+                executed.put("newTitle", proposal.newTitle());
+            }
             executed.put("beforeTasks", beforeTasks);
             executed.put("afterTasks", afterTasks);
             executed.put("executedAt", LocalDateTime.now().toString());
@@ -342,7 +400,8 @@ public class AgentWriteActionService {
                     node.path("planRef").asText(null),
                     node.path("stageTitle").asText(null),
                     node.path("taskTitle").asText(null),
-                    Boolean.parseBoolean(node.path("done").asText("false"))
+                    Boolean.parseBoolean(node.path("done").asText("false")),
+                    node.path("newTitle").asText(null)
             );
         } catch (Exception e) {
             return null;
