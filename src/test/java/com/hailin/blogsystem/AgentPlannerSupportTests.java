@@ -1,6 +1,10 @@
 package com.hailin.blogsystem;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.hailin.blogsystem.ai.agent.AgentRuntimeRouteRegistry;
+import com.hailin.blogsystem.ai.agent.ArticleAgentRuntime;
+import com.hailin.blogsystem.ai.agent.GeneralAgentRuntime;
+import com.hailin.blogsystem.ai.agent.LearningAgentRuntime;
 import com.hailin.blogsystem.ai.planner.AgentPlannerSupport;
 import com.hailin.blogsystem.config.BlogAiProperties;
 import com.hailin.blogsystem.entity.AiSessions;
@@ -36,7 +40,13 @@ class AgentPlannerSupportTests {
         properties = new BlogAiProperties();
         workflowRunMapper = mock(AiWorkflowRunMapper.class);
         when(workflowRunMapper.selectList(any())).thenReturn(List.of());
-        planner = new AgentPlannerSupport(properties, workflowRunMapper, new ObjectMapper());
+        // V3.5：Planner 判定名单查路由注册表——用真实注册表（mock 三个 runtime），名单与生产一致
+        AgentRuntimeRouteRegistry routeRegistry = new AgentRuntimeRouteRegistry(
+                mock(LearningAgentRuntime.class),
+                mock(ArticleAgentRuntime.class),
+                mock(GeneralAgentRuntime.class)
+        );
+        planner = new AgentPlannerSupport(properties, workflowRunMapper, new ObjectMapper(), routeRegistry);
     }
 
     @Test

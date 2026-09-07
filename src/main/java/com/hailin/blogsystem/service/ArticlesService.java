@@ -20,6 +20,14 @@ public interface ArticlesService extends IService<Articles>{
 
     void updateArticle(Long id, ArticlesDTO articlesDTO);
 
+    /**
+     * V3.4 Agent 受控写（UPDATE_ARTICLE_TITLE）专用：只改自己文章的标题（字段级，绝不走全量 updateArticle）。
+     * expectedOldTitle = 提案锚定的旧标题（proposal.articleTitle），条件更新 WHERE title = expectedOldTitle，
+     * 影响 0 行 = 标题已被并发修改 → 拒绝不覆盖（用户需重新发起）；newTitle 非空/trim 由调用方负责。
+     * 副作用：清详情缓存 + 列表缓存；已发布文章刷新 RAG 索引（doc 含标题）。
+     */
+    void updateArticleTitle(Long id, String expectedOldTitle, String newTitle, Long userId);
+
     void deleteArticle(Long id);
 
     void hideArticle(Long id);

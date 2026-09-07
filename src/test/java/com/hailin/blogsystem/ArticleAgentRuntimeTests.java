@@ -6,13 +6,16 @@ import com.hailin.blogsystem.ai.agent.AgentStepDecision;
 import com.hailin.blogsystem.ai.agent.ArticleAgentActionExecutor;
 import com.hailin.blogsystem.ai.agent.ArticleAgentRuntime;
 import com.hailin.blogsystem.ai.agent.ArticleAgentStepDecider;
+import com.hailin.blogsystem.ai.agent.AgentWriteProposal;
 import com.hailin.blogsystem.entity.AiAgentRun;
 import com.hailin.blogsystem.entity.AiAgentStep;
+import com.hailin.blogsystem.entity.Articles;
 import com.hailin.blogsystem.entity.dto.AiAgentRunStatus;
 import com.hailin.blogsystem.entity.dto.AgentStepActionType;
 import com.hailin.blogsystem.entity.dto.PageContextDTO;
 import com.hailin.blogsystem.mapper.AiAgentRunMapper;
 import com.hailin.blogsystem.mapper.AiAgentStepMapper;
+import com.hailin.blogsystem.service.ArticlesService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -29,8 +32,8 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * 文章域 Agent 核心循环测试（V2.5）。
- * 决策器和执行器全部 mock，验证文章域白名单 / 建议 articleId 透出 / 禁写提案 / 循环骨架。
+ * 文章域 Agent 核心循环测试（V2.5 / V3.4）。
+ * 决策器和执行器全部 mock，验证文章域白名单 / 建议 articleId 透出 / 受控写提案（UPDATE_ARTICLE_TITLE）/ 循环骨架。
  */
 class ArticleAgentRuntimeTests {
 
@@ -38,6 +41,7 @@ class ArticleAgentRuntimeTests {
     private ArticleAgentActionExecutor executor;
     private AiAgentRunMapper runMapper;
     private AiAgentStepMapper stepMapper;
+    private ArticlesService articlesService;
     private ArticleAgentRuntime runtime;
 
     private static PageContextDTO articleContext(String articleId) {
@@ -47,12 +51,21 @@ class ArticleAgentRuntimeTests {
         return pageContext;
     }
 
+    private static Articles article(Long id, Long authorId, String title) {
+        Articles article = new Articles();
+        article.setId(id);
+        article.setAuthorId(authorId);
+        article.setTitle(title);
+        return article;
+    }
+
     @BeforeEach
     void setUp() {
         decider = mock(ArticleAgentStepDecider.class);
         executor = mock(ArticleAgentActionExecutor.class);
         runMapper = mock(AiAgentRunMapper.class);
         stepMapper = mock(AiAgentStepMapper.class);
+        articlesService = mock(ArticlesService.class);
 
         // MyBatis-Plus ASSIGN_ID 在 mock 下不生效，insert 时手动赋 id
         when(runMapper.insert(any(AiAgentRun.class))).thenAnswer(inv -> {
@@ -62,7 +75,7 @@ class ArticleAgentRuntimeTests {
         });
 
         runtime = new ArticleAgentRuntime(
-                decider, executor, runMapper, stepMapper, new ObjectMapper()
+                decider, executor, runMapper, stepMapper, new ObjectMapper(), articlesService
         );
     }
 
@@ -147,18 +160,161 @@ class ArticleAgentRuntimeTests {
     }
 
     @Test
-    void suggestWriteRejectedByWhitelist() {
-        // 文章域白名单无 SUGGEST_WRITE：非法动作直接 FAILED（文章域禁写提案）
+    void suggestWriteWithoutObservationRejectedThenContinues() {
+        // V3.4：SUGGEST_WRITE 已进文章域白名单，但零观察提案被拒（没查就提案 = 拍脑袋）→ 循环继续
         when(decider.decide(any(), any(), anyInt(), anyInt()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
-                        .withInput(Map.of("taskTitle", "缓存击穿")));
+                        .withInput(Map.of("actionType", AgentWriteProposal.TYPE_UPDATE_ARTICLE_TITLE,
+                                "newTitle", "Redis 缓存实战")))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
+                        .withInput(Map.of("answer", "我先看一下你的文章")));
 
-        AgentRunResult result = runtime.run(100L, 200L, "帮我把任务勾掉",
+        AgentRunResult result = runtime.run(100L, 200L, "帮我把标题改了",
+                articleContext("12"), com.hailin.blogsystem.ai.agent.AgentStepEmitter.noop());
+
+        assertThat(result.status()).isEqualTo(AiAgentRunStatus.COMPLETED);
+        List<AiAgentStep> steps = captureSteps();
+        assertThat(steps.get(0).getActionType()).isEqualTo("SUGGEST_WRITE");
+        assertThat(steps.get(0).getStatus()).isEqualTo("FAILED");
+        assertThat(steps.get(0).getErrorMessage()).contains("零观察");
+    }
+
+    @Test
+    void suggestArticleTitleProposalReachesWaitingConfirm() {
+        // V3.4 成功路径：QUERY_ARTICLE 观察 → SUGGEST_WRITE(UPDATE_ARTICLE_TITLE) →
+        // 提案端查库拿权威旧标题 → WAITING_WRITE_CONFIRM + pendingWriteAction（articleId 锚 + articleTitle 锚 + newTitle）
+        when(decider.decide(any(), any(), anyInt(), anyInt()))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
+                        .withInput(Map.of("actionType", AgentWriteProposal.TYPE_UPDATE_ARTICLE_TITLE,
+                                "newTitle", "Redis 缓存实战")));
+        when(executor.execute(any(), any(), any()))
+                .thenReturn("当前文章分析：\n- 标题：《Redis 缓存原理》");
+        when(articlesService.getById(12L)).thenReturn(article(12L, 100L, "Redis 缓存原理"));
+
+        AgentRunResult result = runtime.run(100L, 200L, "把标题改成 Redis 缓存实战",
+                articleContext("12"), com.hailin.blogsystem.ai.agent.AgentStepEmitter.noop());
+
+        assertThat(result.status()).isEqualTo(AiAgentRunStatus.WAITING_WRITE_CONFIRM);
+        assertThat(result.pendingWriteAction()).isNotNull();
+        assertThat(result.pendingWriteAction().actionType())
+                .isEqualTo(AgentWriteProposal.TYPE_UPDATE_ARTICLE_TITLE);
+        // articleId 锚 = 页面上下文；articleTitle 锚 = DB 权威旧标题（不是观察摘录）
+        assertThat(result.pendingWriteAction().articleId()).isEqualTo("12");
+        assertThat(result.pendingWriteAction().articleTitle()).isEqualTo("Redis 缓存原理");
+        assertThat(result.pendingWriteAction().newTitle()).isEqualTo("Redis 缓存实战");
+
+        AiAgentRun saved = captureRun();
+        assertThat(saved.getStatus()).isEqualTo("WAITING_WRITE_CONFIRM");
+        assertThat(saved.getContextJson()).contains("UPDATE_ARTICLE_TITLE");
+        assertThat(saved.getContextJson()).contains("Redis 缓存实战");
+    }
+
+    @Test
+    void suggestWriteUnknownActionTypeFailsRun() {
+        // V3.4：文章域只认 UPDATE_ARTICLE_TITLE——学习域动作/幻觉动作一律 FAILED 终局，绝不回落到任何动作
+        when(decider.decide(any(), any(), anyInt(), anyInt()))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
+                        .withInput(Map.of("actionType", AgentWriteProposal.TYPE_UPDATE_TASK_DONE,
+                                "taskTitle", "缓存击穿")));
+        when(executor.execute(any(), any(), any()))
+                .thenReturn("当前文章分析：\n- 标题：《Redis 缓存原理》");
+
+        AgentRunResult result = runtime.run(100L, 200L, "把任务勾掉",
                 articleContext("12"), com.hailin.blogsystem.ai.agent.AgentStepEmitter.noop());
 
         assertThat(result.status()).isEqualTo(AiAgentRunStatus.FAILED);
         AiAgentRun saved = captureRun();
-        assertThat(saved.getErrorMessage()).contains("非法动作");
+        assertThat(saved.getErrorMessage()).contains("不支持的 actionType");
+        // 未产生任何写提案（run 直接终局 FAILED，contextJson 无 pendingWriteAction）
+        assertThat(saved.getStatus()).isEqualTo("FAILED");
+        assertThat(saved.getContextJson()).doesNotContain("pendingWriteAction");
+    }
+
+    @Test
+    void suggestWriteMissingNewTitleFailsRun() {
+        when(decider.decide(any(), any(), anyInt(), anyInt()))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
+                        .withInput(Map.of("actionType", AgentWriteProposal.TYPE_UPDATE_ARTICLE_TITLE)));
+        when(executor.execute(any(), any(), any()))
+                .thenReturn("当前文章分析：\n- 标题：《Redis 缓存原理》");
+
+        AgentRunResult result = runtime.run(100L, 200L, "帮我把标题改一下",
+                articleContext("12"), com.hailin.blogsystem.ai.agent.AgentStepEmitter.noop());
+
+        assertThat(result.status()).isEqualTo(AiAgentRunStatus.FAILED);
+        AiAgentRun saved = captureRun();
+        assertThat(saved.getErrorMessage()).contains("缺少 newTitle");
+    }
+
+    @Test
+    void suggestWriteWithoutPageContextFailsRun() {
+        // V3.4 范围锁死文章详情页：无页面上下文 articleId → FAILED，LLM input 摘录不作数
+        when(decider.decide(any(), any(), anyInt(), anyInt()))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
+                        .withInput(Map.of("actionType", AgentWriteProposal.TYPE_UPDATE_ARTICLE_TITLE,
+                                "newTitle", "Redis 缓存实战",
+                                "articleId", "999")));
+        when(executor.execute(any(), any(), any()))
+                .thenReturn("当前文章分析：\n- 标题：《Redis 缓存原理》");
+
+        AgentRunResult result = runtime.run(100L, 200L, "把标题改成 Redis 缓存实战",
+                null, com.hailin.blogsystem.ai.agent.AgentStepEmitter.noop());
+
+        assertThat(result.status()).isEqualTo(AiAgentRunStatus.FAILED);
+        AiAgentRun saved = captureRun();
+        assertThat(saved.getErrorMessage()).contains("缺少当前文章上下文");
+    }
+
+    @Test
+    void suggestWriteOtherUsersArticleEndsTerminally() {
+        // V3.4：归属失败 → 终局失败（COMPLETED + 友好文案，不误写、不继续循环）
+        when(decider.decide(any(), any(), anyInt(), anyInt()))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
+                        .withInput(Map.of("actionType", AgentWriteProposal.TYPE_UPDATE_ARTICLE_TITLE,
+                                "newTitle", "Redis 缓存实战")));
+        when(executor.execute(any(), any(), any()))
+                .thenReturn("当前文章分析：\n- 标题：《别人的文章》");
+        when(articlesService.getById(12L)).thenReturn(article(12L, 101L, "别人的文章"));
+
+        AgentRunResult result = runtime.run(100L, 200L, "把标题改了",
+                articleContext("12"), com.hailin.blogsystem.ai.agent.AgentStepEmitter.noop());
+
+        assertThat(result.status()).isEqualTo(AiAgentRunStatus.COMPLETED);
+        assertThat(result.finalAnswer()).contains("不属于你");
+        assertThat(result.usedSteps()).isEqualTo(2);
+        List<AiAgentStep> steps = captureSteps();
+        assertThat(steps.get(1).getActionType()).isEqualTo("SUGGEST_WRITE");
+        assertThat(steps.get(1).getStatus()).isEqualTo("FAILED");
+    }
+
+    @Test
+    void suggestWriteSameTitleRejectedThenContinues() {
+        // V3.4：新标题 == 当前标题（无变化）→ FAILED step + observation，不弹卡，循环继续由 LLM 告知
+        when(decider.decide(any(), any(), anyInt(), anyInt()))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
+                        .withInput(Map.of("actionType", AgentWriteProposal.TYPE_UPDATE_ARTICLE_TITLE,
+                                "newTitle", "redis 缓存原理")))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
+                        .withInput(Map.of("answer", "标题没变化，不需要修改")));
+        when(executor.execute(any(), any(), any()))
+                .thenReturn("当前文章分析：\n- 标题：《Redis 缓存原理》");
+        when(articlesService.getById(12L)).thenReturn(article(12L, 100L, "Redis 缓存原理"));
+
+        AgentRunResult result = runtime.run(100L, 200L, "把标题改一下",
+                articleContext("12"), com.hailin.blogsystem.ai.agent.AgentStepEmitter.noop());
+
+        assertThat(result.status()).isEqualTo(AiAgentRunStatus.COMPLETED);
+        assertThat(result.finalAnswer()).isEqualTo("标题没变化，不需要修改");
+        List<AiAgentStep> steps = captureSteps();
+        assertThat(steps.get(1).getActionType()).isEqualTo("SUGGEST_WRITE");
+        assertThat(steps.get(1).getStatus()).isEqualTo("FAILED");
+        assertThat(steps.get(1).getErrorMessage()).contains("新标题与原标题相同");
     }
 
     @Test

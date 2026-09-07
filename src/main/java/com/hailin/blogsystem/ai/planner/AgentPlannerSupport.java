@@ -10,6 +10,7 @@ import com.hailin.blogsystem.entity.dto.AgentDecision;
 import com.hailin.blogsystem.entity.dto.AiIntent;
 import com.hailin.blogsystem.entity.dto.AiWorkflowType;
 import com.hailin.blogsystem.entity.dto.PageContextDTO;
+import com.hailin.blogsystem.ai.agent.AgentRuntimeRouteRegistry;
 import com.hailin.blogsystem.mapper.AiWorkflowRunMapper;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
@@ -59,6 +60,7 @@ public class AgentPlannerSupport {
     private final BlogAiProperties properties;
     private final AiWorkflowRunMapper workflowRunMapper;
     private final ObjectMapper objectMapper;
+    private final AgentRuntimeRouteRegistry agentRuntimeRouteRegistry;
 
     /**
      * 全域 Agent Planner 入口。
@@ -550,27 +552,27 @@ public class AgentPlannerSupport {
     }
 
     /**
-     * 判断是否进入 Agent Runtime（LEARNING_AGENT）。
+     * 判断是否进入学习 Agent Runtime（LEARNING_AGENT）。
      *
-     * 只认分类器主判，不做正则兜底。
+     * 只认分类器主判，不做正则兜底（判定名单单点在 AgentRuntimeRouteRegistry，V3.5 收口）。
      * 注意：LEARNING_AGENT 故意不放进 isLearningDomain，
      * 从而与学习 Workflow 管道隔离（见 decide() 注释）。
      */
     private boolean isLearningAgentIntent(AiIntent intent) {
         return intent != null
-                && "LEARNING_AGENT".equals(intent.getIntent());
+                && agentRuntimeRouteRegistry.learningAgentIntents().contains(intent.getIntent());
     }
 
     /**
      * 判断是否进入文章 Agent Runtime（ARTICLE_AGENT，V2.5）。
      *
-     * 只认分类器主判，不做正则兜底。
+     * 只认分类器主判，不做正则兜底（判定名单单点在 AgentRuntimeRouteRegistry，V3.5 收口）。
      * 注意：ARTICLE_AGENT 故意不放进任何 Workflow 管道，
      * 与 LEARNING_AGENT 同理隔离（见 decide() 注释）。
      */
     private boolean isArticleAgentIntent(AiIntent intent) {
         return intent != null
-                && "ARTICLE_AGENT".equals(intent.getIntent());
+                && agentRuntimeRouteRegistry.articleAgentIntents().contains(intent.getIntent());
     }
 
     /**

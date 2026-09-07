@@ -70,5 +70,23 @@
     "message": "帮我调整第二阶段",
     "expectedIntent": "LEARNING_PROGRESS",
     "expectedSuggestedAction": "WORKFLOW"
+  },
+  {
+    "name": "分界：详情页点名完整新标题走 ARTICLE_AGENT 受控写",
+    "category": "boundary",
+    "message": "把标题改成 Redis 缓存实战",
+    "pageType": "article-detail",
+    "pageArticleId": "12",
+    "expectedIntent": "ARTICLE_AGENT",
+    "expectedSuggestedAction": "AGENT"
+  },
+  {
+    "name": "回归：文章页泛泛改标题诉求不漂移到受控写",
+    "category": "regression",
+    "message": "帮我把标题改短一些",
+    "pageType": "article-detail",
+    "pageArticleId": "12",
+    "expectedIntent": "OPTIMIZE_ARTICLE_WORKFLOW",
+    "expectedSuggestedAction": "WORKFLOW"
   }
 ]

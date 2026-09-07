@@ -69,6 +69,21 @@ class ArticleAgentStepDeciderTests {
     }
 
     @Test
+    void parsesSuggestWriteDecisionWithArticleTitleUpdate() {
+        // V3.4：内层 actionType=UPDATE_ARTICLE_TITLE + newTitle（外层 SUGGEST_WRITE，双层分层语义）
+        when(callSpec.content()).thenReturn(
+                "{\"actionType\":\"SUGGEST_WRITE\",\"input\":{\"actionType\":\"UPDATE_ARTICLE_TITLE\",\"newTitle\":\"Redis 实战\"}}"
+        );
+
+        AgentStepDecision decision = decider.decide("把标题改成 Redis 实战", "当前文章分析：...", 2, 5);
+
+        assertThat(decision.actionType()).isEqualTo(AgentStepActionType.SUGGEST_WRITE);
+        assertThat(decision.input())
+                .containsEntry("actionType", "UPDATE_ARTICLE_TITLE")
+                .containsEntry("newTitle", "Redis 实战");
+    }
+
+    @Test
     void repairsOnceWhenFirstOutputIsInvalidJson() {
         when(callSpec.content())
                 .thenReturn("我不是 JSON")

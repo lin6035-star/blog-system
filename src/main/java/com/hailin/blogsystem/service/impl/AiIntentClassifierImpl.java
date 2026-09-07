@@ -392,6 +392,9 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 - suggestedWorkflowType=OPTIMIZE_ARTICLE
                                 - articleId 从页面上下文中获取
 
+                                例外：当用户原话给出完整新标题要求改名（"把标题改成 XX" / "标题改名为 XX"）时，
+                                不是 OPTIMIZE——新标题已由用户指定、无需 AI 生成改法，这是受控写改标题，判 ARTICLE_AGENT（见下）。
+
                                 这类请求不需要用户在编辑器页面。
                                 如果缺少 articleId，输出 GENERAL_CHAT。
                                 不要在意图识别阶段生成优化方案。
@@ -410,9 +413,15 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 - "这篇文章还能怎么改" / "感觉写得不太好，帮我分析一下"
                                 - "帮我看看这篇文章有什么问题"（没有具体指令）
 
+                                例外（V3.4 受控写改标题）：当用户原话给出完整新标题要求改当前文章标题
+                                （"把标题改成 XX" / "标题改名为 XX"，XX 完整出现在用户原话里）时，
+                                判 ARTICLE_AGENT（Agent 提案改标题 → 后端弹确认卡 → 用户确认后才执行，
+                                后端只改标题不动其他内容），不要判 OPTIMIZE_ARTICLE_WORKFLOW。
+
                                 明确优化指令（不判 ARTICLE_AGENT，判 OPTIMIZE_ARTICLE_WORKFLOW）：
                                 - "把第二段删掉" / "帮我把标题改短" / "把开头重写得更吸引人"
                                 - "帮我优化这篇文章"（明确要求优化）
+                                注意："帮我把标题改短"这类没有给出具体新标题的仍走 Workflow，与上面的改名例外不冲突。
 
                                 如果缺少 articleId，输出 GENERAL_CHAT。
                                 Agent 只查询文章、记忆、站内知识后给出优化建议或建议启动优化流程，

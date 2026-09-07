@@ -22,6 +22,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
 import java.util.List;
@@ -470,6 +471,42 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
         else{  //隐藏 -》 从RAG删除
             safelyDeleteArticleRagIndex(article.getId());
         }
+    }
+
+
+    /**
+     * V3.4 Agent 受控写（UPDATE_ARTICLE_TITLE）专用：只改自己文章的标题。
+     * 不走 updateArticle（全量 BeanUtil.copyProperties 会把 DTO 未传字段置 null）。
+     * 归属校验用显式 userId（对齐学习域 service 模式，Agent 确认链路可测）。
+     * 旧值条件更新 = 轻量 CAS：WHERE title = expectedOldTitle 影响 0 行 → 标题在提案后被并发修改
+     * （如用户编辑器另存），本次改名基于的旧标题已失效 → 拒绝不覆盖，用户需重新发起提案。
+     * （Articles 无 @Version；本方法标题条件更新是并发防护的最后一层，主窗口由 confirm 端 stale 校验拦截）
+     */
+    @Override
+    @Transactional
+    public void updateArticleTitle(Long id, String expectedOldTitle, String newTitle, Long userId) {
+        Articles articles = getById(id);
+        if (articles == null) {
+            throw new IllegalArgumentException("未找到该博文");
+        }
+        if (!articles.getAuthorId().equals(userId)) {
+            throw new IllegalArgumentException("无权操作该文章");
+        }
+
+        boolean updated = lambdaUpdate()
+                .eq(Articles::getId, id)
+                .eq(Articles::getAuthorId, userId)
+                .eq(Articles::getTitle, expectedOldTitle)
+                .set(Articles::getTitle, newTitle)
+                .set(Articles::getUpdatedAt, LocalDateTime.now())
+                .update();
+        if (!updated) {
+            throw new IllegalArgumentException("文章标题已变化，请重新发起修改");
+        }
+
+        deleteArticleDetailCache(id);
+        deleteArticleListCache();
+        syncArticleRagIndex(articles);  // 状态取自更新前行（改名不动状态）：已发布 → 重刷 RAG doc（含标题）
     }
 
 

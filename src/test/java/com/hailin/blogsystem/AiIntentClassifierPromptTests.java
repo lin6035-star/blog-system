@@ -2,8 +2,10 @@ package com.hailin.blogsystem;
 
 import com.hailin.blogsystem.service.impl.AiIntentClassifierImpl;
 import org.junit.jupiter.api.Test;
+import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.mock.mockito.MockBean;
 
 import java.lang.reflect.Method;
 
@@ -14,6 +16,10 @@ class AiIntentClassifierPromptTests {
 
     @Autowired
     private AiIntentClassifierImpl classifier;
+
+    /** mock 掉真 ES vectorStore（prompt 文本测试只依赖分类器 bean，不依赖本地 ES 可用性） */
+    @MockBean
+    private VectorStore vectorStore;
 
     @Test
     void promptDefinesSemanticLearningWorkflowIntents() throws Exception {

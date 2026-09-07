@@ -3,14 +3,17 @@ package com.hailin.blogsystem;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hailin.blogsystem.entity.dto.AiIntent;
+import com.hailin.blogsystem.entity.dto.PageContextDTO;
 import com.hailin.blogsystem.service.AiIntentClassifier;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.mock.mockito.MockBean;
 
 import java.io.InputStream;
 import java.util.List;
@@ -28,6 +31,10 @@ class AiIntentClassifierIntegrationTests {
     @Autowired
     private AiIntentClassifier aiIntentClassifier;
 
+    /** mock 掉真 ES vectorStore（评测门只测分类器 prompt，不依赖本地 ES 可用性） */
+    @MockBean
+    private VectorStore vectorStore;
+
     // ------------------------------------------------------------------
     // 评测集：JSON 文件驱动（classifier-evaluation-cases.json）
     // 加样例 = 加 JSON 行；-DevalCase=子串 可只跑名称匹配的样例（省 LLM 调用）
@@ -41,6 +48,8 @@ class AiIntentClassifierIntegrationTests {
             String name,
             String category,
             String message,
+            String pageType,
+            String pageArticleId,
             String expectedIntent,
             String expectedPlanRefContains,
             String expectedStageRefContains,
@@ -96,7 +105,14 @@ class AiIntentClassifierIntegrationTests {
     @ParameterizedTest(name = "[{index}] {0}")
     @MethodSource("evalCases")
     void classifierMatchesFixedEvalCase(String caseName, ClassifierEvalCase c) {
-        AiIntent intent = aiIntentClassifier.classify(c.message(), null);
+        // 样例可带页面上下文（V3.4 起：article-detail 分界依赖 pageType/articleId）
+        PageContextDTO pageContext = null;
+        if (c.pageType() != null) {
+            pageContext = new PageContextDTO();
+            pageContext.setPageType(c.pageType());
+            pageContext.setArticleId(c.pageArticleId());
+        }
+        AiIntent intent = aiIntentClassifier.classify(c.message(), pageContext);
 
         if (c.expectedIntent() != null) {
             assertThat(intent.getIntent())

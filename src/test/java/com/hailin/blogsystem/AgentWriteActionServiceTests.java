@@ -1,16 +1,21 @@
 package com.hailin.blogsystem;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.hailin.blogsystem.ai.agent.AgentWriteActionExecutor;
 import com.hailin.blogsystem.ai.agent.AgentWriteActionService;
 import com.hailin.blogsystem.ai.agent.AgentWriteActionView;
+import com.hailin.blogsystem.ai.agent.ArticleAgentWriteActionExecutor;
+import com.hailin.blogsystem.ai.agent.LearningAgentWriteActionExecutor;
 import com.hailin.blogsystem.ai.workflow.WorkflowActionLock;
 import com.hailin.blogsystem.entity.AiAgentRun;
+import com.hailin.blogsystem.entity.Articles;
 import com.hailin.blogsystem.entity.LearningPlans;
 import com.hailin.blogsystem.entity.LearningStages;
 import com.hailin.blogsystem.entity.vo.LearningPlansDetailVO;
 import com.hailin.blogsystem.exception.BusinessException;
 import com.hailin.blogsystem.mapper.AiAgentRunMapper;
 import com.hailin.blogsystem.mapper.LearningStageMapper;
+import com.hailin.blogsystem.service.ArticlesService;
 import com.hailin.blogsystem.service.LearningPlansService;
 import com.hailin.blogsystem.utils.UserContext;
 import org.junit.jupiter.api.AfterEach;
@@ -67,10 +72,24 @@ class AgentWriteActionServiceTests {
             + "\"stageTitle\":\"阶段二\","
             + "\"taskTitle\":\"缓存击穿\"}}";
 
+    /** V3.4：改文章标题提案（articleId=定位锚，articleTitle=提案时刻 DB 权威旧标题锚，newTitle=用户新标题） */
+    private static final String PROPOSAL_ARTICLE_RENAME_CONTEXT = "{\"pendingWriteAction\":{"
+            + "\"actionType\":\"UPDATE_ARTICLE_TITLE\","
+            + "\"articleId\":\"1\","
+            + "\"articleTitle\":\"Published Article\","
+            + "\"newTitle\":\"Renamed Title\"}}";
+
+    /** V3.4：缺 newTitle 的改标题提案——必须拒绝，绝不执行 */
+    private static final String PROPOSAL_ARTICLE_RENAME_CONTEXT_MISSING_NEW_TITLE = "{\"pendingWriteAction\":{"
+            + "\"actionType\":\"UPDATE_ARTICLE_TITLE\","
+            + "\"articleId\":\"1\","
+            + "\"articleTitle\":\"Published Article\"}}";
+
     private AiAgentRunMapper runMapper;
     private LearningStageMapper learningStageMapper;
     private WorkflowActionLock actionLock;
     private LearningPlansService learningPlansService;
+    private ArticlesService articlesService;
     private AgentWriteActionService service;
 
     @BeforeEach
@@ -81,9 +100,16 @@ class AgentWriteActionServiceTests {
         when(actionLock.acquireOrThrow(anyString(), any()))
                 .thenReturn(new WorkflowActionLock.LockHandle(1L, "key", "token"));
         learningPlansService = mock(LearningPlansService.class);
+        articlesService = mock(ArticlesService.class);
 
+        // V3.6 壳化：壳只收公共骨架，域执行器注入各自域 mock service（行为断言全部平移不变）
+        AgentWriteActionExecutor learningExecutor =
+                new LearningAgentWriteActionExecutor(learningStageMapper, learningPlansService);
+        AgentWriteActionExecutor articleExecutor =
+                new ArticleAgentWriteActionExecutor(articlesService);
         service = new AgentWriteActionService(
-                runMapper, learningStageMapper, new ObjectMapper(), actionLock, learningPlansService
+                runMapper, new ObjectMapper(), actionLock,
+                List.of(learningExecutor, articleExecutor)
         );
         UserContext.set(100L);
     }
@@ -373,6 +399,102 @@ class AgentWriteActionServiceTests {
         verify(learningPlansService, never()).renameTask(any(), any(), anyInt(), any(), any());
         verify(learningPlansService, never()).updateTaskDone(any(), any(), anyInt(), anyBoolean(), any());
         verify(learningPlansService, never()).appendTasks(any(), any(), any(), any());
+    }
+
+    @Test
+    void confirmUpdateArticleTitleRenamesAndRecordsSnapshot() {
+        // V3.4：UPDATE_ARTICLE_TITLE → stale 校验通过（DB 当前标题 == proposal.articleTitle 锚）→
+        // expectedOldTitle = proposal.articleTitle（锚，非 confirm 时查的标题）→ updateArticleTitle + 快照留痕
+        when(runMapper.selectById(1L)).thenReturn(
+                run(1L, "WAITING_WRITE_CONFIRM", PROPOSAL_ARTICLE_RENAME_CONTEXT));
+        when(runMapper.update(any(AiAgentRun.class), any())).thenReturn(1);
+        when(articlesService.getById(1L))
+                .thenReturn(article(1L, 100L, "Published Article"), article(1L, 100L, "Renamed Title"));
+
+        String result = service.confirmWrite(1L);
+
+        assertThat(result).contains("已将文章《Published Article》的标题改为《Renamed Title》");
+        // expectedOldTitle 必须是提案锚（proposal.articleTitle），不是 confirm 时查的当前标题
+        verify(articlesService).updateArticleTitle(eq(1L), eq("Published Article"), eq("Renamed Title"), eq(100L));
+        verify(learningPlansService, never()).updateTaskDone(any(), any(), anyInt(), anyBoolean(), any());
+        verify(learningPlansService, never()).appendTasks(any(), any(), any(), any());
+        verify(learningPlansService, never()).renameTask(any(), any(), anyInt(), any(), any());
+        // 快照留痕：articleId/articleTitle/newTitle + beforeArticle/afterArticle
+        ArgumentCaptor<AiAgentRun> patchCaptor = ArgumentCaptor.forClass(AiAgentRun.class);
+        verify(runMapper, atLeastOnce()).updateById(patchCaptor.capture());
+        AiAgentRun patch = patchCaptor.getValue();
+        assertThat(patch.getStatus()).isEqualTo("COMPLETED");
+        assertThat(patch.getContextJson()).contains("writeActionResult");
+        assertThat(patch.getContextJson()).contains("UPDATE_ARTICLE_TITLE");
+        assertThat(patch.getContextJson()).contains("articleId");
+        assertThat(patch.getContextJson()).contains("newTitle");
+        assertThat(patch.getContextJson()).contains("beforeArticle");
+        assertThat(patch.getContextJson()).contains("afterArticle");
+    }
+
+    @Test
+    void confirmUpdateArticleTitleRejectsStaleProposal() {
+        // V3.4 并发防护主窗口：提案后用户编辑器改了标题（DB 当前标题 != 提案锚）→ stale 拒绝，不误写
+        when(runMapper.selectById(1L)).thenReturn(
+                run(1L, "WAITING_WRITE_CONFIRM", PROPOSAL_ARTICLE_RENAME_CONTEXT));
+        when(runMapper.update(any(AiAgentRun.class), any())).thenReturn(1);
+        when(articlesService.getById(1L)).thenReturn(article(1L, 100L, "Edited Elsewhere"));
+
+        assertThatThrownBy(() -> service.confirmWrite(1L))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("文章标题已变化");
+        verify(articlesService, never()).updateArticleTitle(any(), any(), any(), any());
+    }
+
+    @Test
+    void confirmUpdateArticleTitleRejectsOtherUsersArticle() {
+        // V3.4：归属校验——文章作者 ≠ 当前用户 → 拒绝，不执行
+        when(runMapper.selectById(1L)).thenReturn(
+                run(1L, "WAITING_WRITE_CONFIRM", PROPOSAL_ARTICLE_RENAME_CONTEXT));
+        when(runMapper.update(any(AiAgentRun.class), any())).thenReturn(1);
+        when(articlesService.getById(1L)).thenReturn(article(1L, 101L, "Published Article"));
+
+        assertThatThrownBy(() -> service.confirmWrite(1L))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("不存在或无权访问");
+        verify(articlesService, never()).updateArticleTitle(any(), any(), any(), any());
+    }
+
+    @Test
+    void confirmUpdateArticleTitleRejectsSameTitle() {
+        // V3.4：新标题与原标题相同（无变化）→ 拒绝，不弹卡不执行
+        String sameTitleContext = PROPOSAL_ARTICLE_RENAME_CONTEXT
+                .replace("\"newTitle\":\"Renamed Title\"", "\"newTitle\":\"published article\"");
+        when(runMapper.selectById(1L)).thenReturn(
+                run(1L, "WAITING_WRITE_CONFIRM", sameTitleContext));
+        when(runMapper.update(any(AiAgentRun.class), any())).thenReturn(1);
+        when(articlesService.getById(1L)).thenReturn(article(1L, 100L, "Published Article"));
+
+        assertThatThrownBy(() -> service.confirmWrite(1L))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("新标题与原标题相同");
+        verify(articlesService, never()).updateArticleTitle(any(), any(), any(), any());
+    }
+
+    @Test
+    void confirmUpdateArticleTitleRejectsMissingNewTitle() {
+        // V3.4：缺 newTitle 的提案（旧版本/被篡改）→ BAD_REQUEST，绝不执行
+        when(runMapper.selectById(1L)).thenReturn(
+                run(1L, "WAITING_WRITE_CONFIRM", PROPOSAL_ARTICLE_RENAME_CONTEXT_MISSING_NEW_TITLE));
+        when(runMapper.update(any(AiAgentRun.class), any())).thenReturn(1);
+
+        assertThatThrownBy(() -> service.confirmWrite(1L))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("提案缺少文章信息或新标题");
+        verify(articlesService, never()).updateArticleTitle(any(), any(), any(), any());
+    }
+
+    private Articles article(Long id, Long authorId, String title) {
+        Articles article = new Articles();
+        article.setId(id);
+        article.setAuthorId(authorId);
+        article.setTitle(title);
+        return article;
     }
 
     private AiAgentRun run(Long id, String status, String contextJson) {

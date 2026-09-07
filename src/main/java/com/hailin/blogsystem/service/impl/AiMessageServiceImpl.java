@@ -10,6 +10,7 @@ import com.hailin.blogsystem.ai.agent.AgentRuntime;
 import com.hailin.blogsystem.ai.agent.AgentStepEmitter;
 import com.hailin.blogsystem.ai.agent.AgentWorkflowSuggestion;
 import com.hailin.blogsystem.ai.agent.AgentWriteProposal;
+import com.hailin.blogsystem.ai.agent.AgentRuntimeRouteRegistry;
 import com.hailin.blogsystem.ai.agent.ArticleAgentRuntime;
 import com.hailin.blogsystem.ai.agent.GeneralAgentRuntime;
 import com.hailin.blogsystem.ai.agent.LearningAgentRuntime;
@@ -83,6 +84,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
     private final LearningAgentRuntime learningAgentRuntime;
     private final ArticleAgentRuntime articleAgentRuntime;
     private final GeneralAgentRuntime generalAgentRuntime;
+    private final AgentRuntimeRouteRegistry agentRuntimeRouteRegistry;
 
     private static final String ROLE_USER = "user";
     private static final String ROLE_ASSISTANT = "assistant";
@@ -359,45 +361,10 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
          * 同步执行有界只读 Loop（maxSteps=5），结果按普通消息流式返回。
          */
         if (routeDecision.getAction() == AgentAction.AGENT) {
-            // V2.5：按意图分发领域 Runtime（学习 / 文章），共用同一流式管道
-            if ("ARTICLE_AGENT".equals(intent == null ? null : intent.getIntent())) {
-                return streamAgentReply(
-                        articleAgentRuntime,
-                        message,
-                        pageContext,
-                        rawPageContextJson,
-                        userId,
-                        sessionId,
-                        session,
-                        requestId,
-                        "暂时无法分析文章，请稍后重试。"
-                );
-            }
-            // V3：GENERAL_CHAT + needsThinking=true（Planner 已归一化）→ 通用 Agent Runtime。
-            // 该分支直接 return，天然跳过下方普通聊天链路的自动 RAG 注入（无双份检索）。
-            if ("GENERAL_CHAT".equals(intent == null ? null : intent.getIntent())) {
-                return streamAgentReply(
-                        generalAgentRuntime,
-                        message,
-                        pageContext,
-                        rawPageContextJson,
-                        userId,
-                        sessionId,
-                        session,
-                        requestId,
-                        "暂时无法结合你的情况回答，请稍后重试。"
-                );
-            }
-            return streamAgentReply(
-                    learningAgentRuntime,
-                    message,
-                    pageContext,
-                    rawPageContextJson,
-                    userId,
-                    sessionId,
-                    session,
-                    requestId,
-                    "暂时无法整理学习建议，请稍后重试。"
+            // V3.5：按意图查路由注册表分发领域 Runtime（intent → runtime + 兜底文案单点登记）
+            return dispatchAgentRuntime(
+                    intent, message, pageContext, rawPageContextJson,
+                    userId, sessionId, session, requestId
             );
         }
 
@@ -582,6 +549,48 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
      * AGENT_STEP / STOP 透出（workflowSuggestion / writeAction）与 agentRunId 绑定
      * 全部通用，领域差异只体现在 runtime 与兜底文案。
      */
+    /**
+     * Agent Runtime 分发（V3.5 收口，主分发与 fallback 分发共用）：
+     * 按 intent 查路由注册表（intent → runtime + 兜底文案单点登记）。
+     *
+     * 未登记 intent：现在不可能发生（分类器 AGENT 白名单已全登记）——warn + 显式学习域兜底，
+     * 把「新 intent 漏配静默掉进学习域」变成可见日志（漏配时去 AgentRuntimeRouteRegistry 补登记）。
+     * 注意：这里不持有任何域判定逻辑（needsThinking / 游客门等在 Planner），只查表 + 防御兜底。
+     */
+    private Flux<AiChatEventVO> dispatchAgentRuntime(
+            AiIntent intent,
+            String message,
+            PageContextDTO pageContext,
+            String rawPageContextJson,
+            Long userId,
+            Long sessionId,
+            AiSessions session,
+            String requestId
+    ) {
+        String intentName = intent == null ? null : intent.getIntent();
+        AgentRuntime runtime = agentRuntimeRouteRegistry.resolve(intentName);
+        if (runtime == null) {
+            log.warn("Agent intent 未登记路由，落入学习域显式兜底: intent={}", intentName);
+            runtime = learningAgentRuntime;
+        }
+        String fallbackReply = agentRuntimeRouteRegistry.fallbackMessage(intentName);
+        if (fallbackReply == null) {
+            // 与 learning 兜底同文（防御分支：只会在未登记漏配时走到，文案随注册表 learning 行同步）
+            fallbackReply = "暂时无法整理学习建议，请稍后重试。";
+        }
+        return streamAgentReply(
+                runtime,
+                message,
+                pageContext,
+                rawPageContextJson,
+                userId,
+                sessionId,
+                session,
+                requestId,
+                fallbackReply
+        );
+    }
+
     private Flux<AiChatEventVO> streamAgentReply(
             AgentRuntime runtime,
             String message,
@@ -1766,44 +1775,10 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         if (routeDecision.getAction() == AgentAction.AGENT) {
             removeById(userMessage.getId());
 
-            // V2.5：按意图分发领域 Runtime（与主分发一致）
-            if ("ARTICLE_AGENT".equals(intent == null ? null : intent.getIntent())) {
-                return streamAgentReply(
-                        articleAgentRuntime,
-                        message,
-                        pageContext,
-                        rawPageContextJson,
-                        userId,
-                        sessionId,
-                        session,
-                        requestId,
-                        "暂时无法分析文章，请稍后重试。"
-                );
-            }
-            // V3：通用 Agent Runtime（与主分发一致）
-            if ("GENERAL_CHAT".equals(intent == null ? null : intent.getIntent())) {
-                return streamAgentReply(
-                        generalAgentRuntime,
-                        message,
-                        pageContext,
-                        rawPageContextJson,
-                        userId,
-                        sessionId,
-                        session,
-                        requestId,
-                        "暂时无法结合你的情况回答，请稍后重试。"
-                );
-            }
-            return streamAgentReply(
-                    learningAgentRuntime,
-                    message,
-                    pageContext,
-                    rawPageContextJson,
-                    userId,
-                    sessionId,
-                    session,
-                    requestId,
-                    "暂时无法整理学习建议，请稍后重试。"
+            // V3.5：与主分发同一注册表分发（intent → runtime + 兜底文案单点）
+            return dispatchAgentRuntime(
+                    intent, message, pageContext, rawPageContextJson,
+                    userId, sessionId, session, requestId
             );
         }
 

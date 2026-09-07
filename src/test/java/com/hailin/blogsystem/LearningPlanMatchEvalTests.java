@@ -15,8 +15,10 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.mock.mockito.MockBean;
 
 import java.io.InputStream;
 import java.time.LocalDateTime;
@@ -55,6 +57,10 @@ class LearningPlanMatchEvalTests {
     private LearningStageMapper learningStageMapper;
 
     private final ObjectMapper objectMapper = new ObjectMapper();
+
+    /** mock 掉真 ES vectorStore（离线门只测确定性匹配规则，不依赖本地 ES 可用性） */
+    @MockBean
+    private VectorStore vectorStore;
 
     // ------------------------------------------------------------------
     // 评测集结构

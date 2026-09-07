@@ -256,7 +256,9 @@ public class LearningAgentRuntime extends AbstractAgentRuntime implements AgentR
                 text(input, "stageTitle"),
                 taskTitle,
                 done,
-                "RENAME".equals(writeType) ? newTitle : null
+                "RENAME".equals(writeType) ? newTitle : null,
+                null,
+                null
         );
 
         String actionLabel;
