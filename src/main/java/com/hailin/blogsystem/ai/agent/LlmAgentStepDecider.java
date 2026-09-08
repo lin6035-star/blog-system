@@ -127,7 +127,16 @@ public class LlmAgentStepDecider implements AgentStepDecider {
                         entry -> input.put(entry.getKey(), entry.getValue().asText())
                 );
             }
-            return new AgentStepDecision(actionType, input);
+            // V3.8：顶层 anchorMode（文章域指代定位模式）并入 input，由领域 runtime 消费。
+            // 并入 input 而非决策 record——零构造点波及，学习/通用域无此字段不受影响。
+            String anchorMode = root.path("anchorMode").asText("").trim();
+            if (!anchorMode.isBlank()) {
+                input.put("anchorMode", anchorMode);
+            }
+            // V3.10：顶层 "thought"（LLM 侧 ReAct 术语）→ AgentThoughtSanitizer 分级闸门清洗
+            // → 存入 thoughtSummary（展示副产品，非决策依据；缺失/违规 → null 全链路可容忍）。
+            String thoughtSummary = AgentThoughtSanitizer.sanitize(root.path("thought").asText(""));
+            return new AgentStepDecision(actionType, input, thoughtSummary);
         } catch (Exception e) {
             log.warn("Agent 决策 JSON 解析失败: {}", truncate(json, 200));
             return null;
@@ -213,6 +222,16 @@ public class LlmAgentStepDecider implements AgentStepDecider {
         sb.append("目标：").append(goal).append('\n');
         sb.append("已有观察：\n").append(clippedContext.isBlank() ? "（无）" : clippedContext).append('\n');
         sb.append("当前步数：").append(stepNo).append('/').append(maxSteps);
+        // V3.10：thought 书写规范只在正常轮追加（repair 轮宽容缺失，不增加解析负担）。
+        // 规范领域无关，收在基类单点——三域决策器共用 buildUserPrompt，零领域 prompt 改动。
+        if (!repair) {
+            sb.append("\n\nJSON 顶层可选字段 \"thought\"——给用户看的思考摘要：\n")
+                    .append("- 一句中文，解释这一步的动机（为什么查这个、看到什么、为什么下一步这么做），第一人称、口语化\n")
+                    .append("- 禁止出现任何动作英文名（QUERY_xxx / SEARCH_RAG / SUGGEST_xxx 等）与机制词：")
+                    .append("调用、接口、API、模型、工具、参数、JSON、白名单、决策、第 N 步、步骤\n")
+                    .append("- 不要把最终答案写进 thought\n")
+                    .append("- 想不出自然的说法就省略该字段（缺失不影响任何流程）\n");
+        }
         return sb.toString();
     }
 

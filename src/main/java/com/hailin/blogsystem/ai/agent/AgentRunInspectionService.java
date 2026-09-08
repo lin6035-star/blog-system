@@ -104,6 +104,8 @@ public class AgentRunInspectionService {
         vo.setStatus(step.getStatus());
         vo.setErrorMessage(step.getErrorMessage());
         vo.setDurationMs(step.getDurationMs());
+        // V3.10：思考摘要（与实时 AGENT_STEP 事件一致，刷新前后行文本不串味；可空）
+        vo.setThoughtSummary(step.getThoughtSummary());
         // 展示文案与实时 AGENT_STEP 事件一致（刷新前后思考面板不串味）
         vo.setMessage("SUCCESS".equals(step.getStatus())
                 ? AgentStepLabelSupport.completedMessage(

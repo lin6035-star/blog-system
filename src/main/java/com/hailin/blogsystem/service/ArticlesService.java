@@ -28,6 +28,16 @@ public interface ArticlesService extends IService<Articles>{
      */
     void updateArticleTitle(Long id, String expectedOldTitle, String newTitle, Long userId);
 
+    /**
+     * V3.7 Agent 受控写（HIDE_ARTICLE / PUBLISH_ARTICLE）专用：原子条件状态更新（不直接走 hideArticle/publishArticle——
+     * 它们是无条件 set status，confirm 前置校验到执行之间有 TOCTOU 窗口）。
+     * expectedStatus = 动作前置状态（HIDE 前置 PUBLISHED / PUBLISH 前置 HIDDEN，从动作方向推导），
+     * 归属 + 前置状态进 WHERE：0 行 = 提案后状态已被并发修改 → 拒绝不覆盖。
+     * 成功副作用按 targetStatus 对齐 hideArticle/publishArticle：清详情/列表缓存 + RAG 删/建；
+     * target=PUBLISHED 额外 publishedAt=now（与编辑器「重新发布」语义一致，不发明新语义）。
+     */
+    void updateArticleVisibility(Long id, Integer expectedStatus, Integer targetStatus, Long userId);
+
     void deleteArticle(Long id);
 
     void hideArticle(Long id);

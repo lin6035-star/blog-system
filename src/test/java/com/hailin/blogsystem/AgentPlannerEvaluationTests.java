@@ -70,7 +70,8 @@ class AgentPlannerEvaluationTests {
                 properties,
                 workflowRunMapper,
                 objectMapper,
-                routeRegistry
+                routeRegistry,
+                mock(com.hailin.blogsystem.ai.agent.ArticleSessionAnchorService.class)
         );
     }
 

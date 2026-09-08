@@ -11,6 +11,7 @@ import com.hailin.blogsystem.entity.dto.AiIntent;
 import com.hailin.blogsystem.entity.dto.AiWorkflowType;
 import com.hailin.blogsystem.entity.dto.PageContextDTO;
 import com.hailin.blogsystem.ai.agent.AgentRuntimeRouteRegistry;
+import com.hailin.blogsystem.ai.agent.ArticleSessionAnchorService;
 import com.hailin.blogsystem.mapper.AiWorkflowRunMapper;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
@@ -61,6 +62,7 @@ public class AgentPlannerSupport {
     private final AiWorkflowRunMapper workflowRunMapper;
     private final ObjectMapper objectMapper;
     private final AgentRuntimeRouteRegistry agentRuntimeRouteRegistry;
+    private final ArticleSessionAnchorService articleSessionAnchorService;
 
     /**
      * 全域 Agent Planner 入口。
@@ -101,7 +103,7 @@ public class AgentPlannerSupport {
          * ARTICLE_AGENT 也不会被 resolveArticleWorkflowType 误判成 OPTIMIZE_ARTICLE。
          */
         if (isArticleAgentIntent(intent)) {
-            return decideArticleAgent(intent, pageContext);
+            return decideArticleAgent(intent, pageContext, session, userId);
         }
 
         /*
@@ -163,23 +165,18 @@ public class AgentPlannerSupport {
         }
 
         /*
-         * 当前文章问答也属于 CHAT + 当前文章上下文。
+         * 当前文章问答（V3.9）：恒放行文章检索模式，不预判目标——
+         * QA 的决策形态与目标无关（都是 CHAT），目标由 ArticleQaTargetResolver 单点决议
+         * （页面文章 / 会话锚 / 追问态 / 说明态），Planner 预判会造成与 resolver 的割裂。
+         * RETRIEVAL_CURRENT_ARTICLE 只是触发 QA 消费点的开关，不代表真有目标；
+         * 无目标时 resolver 产出 promptNote（正文注入位），不是无提示普通聊。
          */
         if ("ARTICLE_DETAIL_QA".equals(intent.getIntent())) {
-            if (!hasArticleId(pageContext, intent)) {
-                return chat(
-                        intent.getIntent(),
-                        RETRIEVAL_NONE,
-                        List.of("article_context_missing"),
-                        "缺少当前文章 ID，不能执行当前文章检索"
-                );
-            }
-
             return chat(
                     intent.getIntent(),
                     RETRIEVAL_CURRENT_ARTICLE,
-                    List.of("article_detail_qa_intent", "article_context_valid"),
-                    "用户询问当前文章，使用当前文章上下文"
+                    List.of("article_detail_qa_intent"),
+                    "用户询问某篇文章内容，检索模式放行，目标由 QA resolver 单点决议"
             );
         }
 
@@ -355,7 +352,8 @@ public class AgentPlannerSupport {
      * - 分类器建议 AGENT 但缺 articleId → CTA（用户大概率真想优化文章，引导补充信息）
      * - 其余（分类器内部不一致）→ 普通聊天
      */
-    private AgentDecision decideArticleAgent(AiIntent intent, PageContextDTO pageContext) {
+    private AgentDecision decideArticleAgent(AiIntent intent, PageContextDTO pageContext,
+                                             AiSessions session, Long userId) {
         List<String> ruleHits = new ArrayList<>();
 
         if (isCtaSuggestion(intent)) {
@@ -376,12 +374,30 @@ public class AgentPlannerSupport {
                     .build();
         }
 
-        if (!hasArticleId(pageContext, intent)) {
+        // V3.8：信源收紧——页面文章只看后端 pageContext（分类器 intent.articleId 是 LLM 输出，
+        // 不参与定位，防幻觉 ID 绕过 CTA）。文章域可信文章源 = pageContext ∪ 会话锚（都是后端事件）。
+        if (!hasPageArticle(pageContext)) {
             ruleHits.add("article_context_missing");
+            // V3.8：页面无文章 → 会话文章锚兜底（resolve 已校验文章存在 + 归属本人）。
+            // 放行 = 只给候选，目标由 runtime 首步 anchorMode 消解，不在 Planner 定死。
+            ArticleSessionAnchorService.ArticleAnchor anchor =
+                    articleSessionAnchorService.resolve(
+                            session == null ? null : session.getId(), userId);
+            if (anchor != null) {
+                ruleHits.add("session_article_anchor_resolved");
+                return AgentDecision.builder()
+                        .action(AgentAction.AGENT)
+                        .intent(intent.getIntent())
+                        .retrievalMode(RETRIEVAL_NONE)
+                        .ruleHits(ruleHits)
+                        .reason("分类器主判 ARTICLE_AGENT，会话文章锚命中，进入文章 Agent Runtime")
+                        .build();
+            }
             return cta(
                     intent.getIntent(),
                     ruleHits,
-                    "文章 Agent 缺少当前文章上下文，降级 CTA 等待澄清"
+                    "你说的这篇文章在这段对话里还没有出现过。打开那篇文章的详情页，"
+                            + "再对我说\"把这篇…\"，我就能直接帮你处理。"
             );
         }
 
@@ -749,6 +765,10 @@ public class AgentPlannerSupport {
      *
      * 这里仅判断是否存在，不在 Planner 中做最终权限裁决。
      * 文章是否存在、是否属于当前用户，继续由业务 Service 校验。
+     *
+     * V3.8 注意：文章域 Agent 裁决（decideArticleAgent）不再走此方法——改用 hasPageArticle
+     * （只信后端 pageContext），分类器 LLM 输出的 articleId 不参与定位（防幻觉 ID 绕过会话锚兜底）。
+     * QA / OPTIMIZE Workflow 等旧链路保持原语义不变。
      */
     private boolean hasArticleId(
             PageContextDTO pageContext,
@@ -763,6 +783,13 @@ public class AgentPlannerSupport {
         return intent != null
                 && intent.getArticleId() != null
                 && !intent.getArticleId().isBlank();
+    }
+
+    /** V3.8：页面文章是否有效（只信后端 pageContext，不采信分类器 LLM 输出）。 */
+    private boolean hasPageArticle(PageContextDTO pageContext) {
+        return pageContext != null
+                && pageContext.getArticleId() != null
+                && !pageContext.getArticleId().isBlank();
     }
 
     private AgentDecision decideArticleAction(

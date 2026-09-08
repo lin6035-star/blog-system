@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hailin.blogsystem.ai.agent.AgentRuntimeRouteRegistry;
 import com.hailin.blogsystem.ai.agent.ArticleAgentRuntime;
 import com.hailin.blogsystem.ai.agent.GeneralAgentRuntime;
+import com.hailin.blogsystem.ai.agent.ArticleSessionAnchorService;
 import com.hailin.blogsystem.ai.agent.LearningAgentRuntime;
 import com.hailin.blogsystem.ai.planner.AgentPlannerSupport;
 import com.hailin.blogsystem.config.BlogAiProperties;
@@ -33,12 +34,14 @@ class AgentPlannerSupportTests {
 
     private BlogAiProperties properties;
     private AiWorkflowRunMapper workflowRunMapper;
+    private ArticleSessionAnchorService anchorService;
     private AgentPlannerSupport planner;
 
     @BeforeEach
     void setUp() {
         properties = new BlogAiProperties();
         workflowRunMapper = mock(AiWorkflowRunMapper.class);
+        anchorService = mock(ArticleSessionAnchorService.class);
         when(workflowRunMapper.selectList(any())).thenReturn(List.of());
         // V3.5：Planner 判定名单查路由注册表——用真实注册表（mock 三个 runtime），名单与生产一致
         AgentRuntimeRouteRegistry routeRegistry = new AgentRuntimeRouteRegistry(
@@ -46,7 +49,8 @@ class AgentPlannerSupportTests {
                 mock(ArticleAgentRuntime.class),
                 mock(GeneralAgentRuntime.class)
         );
-        planner = new AgentPlannerSupport(properties, workflowRunMapper, new ObjectMapper(), routeRegistry);
+        planner = new AgentPlannerSupport(properties, workflowRunMapper, new ObjectMapper(),
+                routeRegistry, anchorService);
     }
 
     @Test
@@ -398,6 +402,62 @@ class AgentPlannerSupportTests {
     }
 
     @Test
+    void articleDetailQuestionAlwaysUsesCurrentArticleRetrievalWithoutPageOrAnchor() {
+        // V3.9：QA 意图恒放行文章检索模式（无页面、无锚也不回落普通聊）——
+        // 目标有无由 QA resolver 单点决议（无目标产 promptNote），Planner 不预判
+        AiIntent intent = new AiIntent();
+        intent.setIntent("ARTICLE_DETAIL_QA");
+        intent.setConfidence(0.96);
+        intent.setSuggestedAction("CHAT");
+        intent.setRisk("LOW");
+
+        AgentDecision decision = planner.decide(
+                "刚才那篇讲了什么",
+                intent,
+                null,
+                1L,
+                session(10L)
+        );
+
+        assertThat(decision.getAction()).isEqualTo(AgentAction.CHAT);
+        assertThat(decision.getRetrievalMode())
+                .isEqualTo("CURRENT_ARTICLE");
+        assertThat(decision.getRuleHits())
+                .contains("article_detail_qa_intent");
+    }
+
+    @Test
+    void articleDetailQuestionRetrievalIsIndependentOfAnchorState() {
+        // V3.9：放行与锚状态无关（Planner 不查锚）——同页面配置下有无锚决策形态一致
+        AiIntent intent = new AiIntent();
+        intent.setIntent("ARTICLE_DETAIL_QA");
+        intent.setConfidence(0.96);
+        intent.setSuggestedAction("CHAT");
+        intent.setRisk("LOW");
+
+        PageContextDTO pageContext = new PageContextDTO();
+        pageContext.setArticleId("12");
+
+        AgentDecision withPage = planner.decide(
+                "这篇文章讲了什么",
+                intent,
+                pageContext,
+                1L,
+                session(10L)
+        );
+        AgentDecision withoutPage = planner.decide(
+                "刚才那篇讲了什么",
+                intent,
+                null,
+                1L,
+                session(10L)
+        );
+
+        assertThat(withPage.getRetrievalMode()).isEqualTo("CURRENT_ARTICLE");
+        assertThat(withoutPage.getRetrievalMode()).isEqualTo("CURRENT_ARTICLE");
+    }
+
+    @Test
     void normalChatUsesChatWithoutRetrieval() {
         AiIntent intent = new AiIntent();
         intent.setIntent("GENERAL_CHAT");
@@ -705,6 +765,31 @@ class AgentPlannerSupportTests {
 
         assertThat(decision.getAction()).isEqualTo(AgentAction.CTA);
         assertThat(decision.getRuleHits()).contains("article_context_missing");
+    }
+
+    @Test
+    void articleAgentOnHomePageWithSessionAnchorRoutesToAgent() {
+        // V3.8 场景 A：首页（无页面上下文）说"帮我把刚刚那篇隐藏了"，会话锚命中 → 放行进文章 Agent Runtime
+        when(anchorService.resolve(10L, 1L))
+                .thenReturn(new ArticleSessionAnchorService.ArticleAnchor(12L, "Java 后端面试突围"));
+
+        AiIntent intent = new AiIntent();
+        intent.setIntent("ARTICLE_AGENT");
+        intent.setConfidence(0.9);
+        intent.setSuggestedAction("AGENT");
+        intent.setRisk("LOW");
+
+        AgentDecision decision = planner.decide(
+                "帮我把刚刚那篇文章隐藏了",
+                intent,
+                null,
+                1L,
+                session(10L)
+        );
+
+        assertThat(decision.getAction()).isEqualTo(AgentAction.AGENT);
+        assertThat(decision.getRuleHits()).contains("article_context_missing");
+        assertThat(decision.getRuleHits()).contains("session_article_anchor_resolved");
     }
 
     @Test

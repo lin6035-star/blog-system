@@ -88,5 +88,78 @@
     "pageArticleId": "12",
     "expectedIntent": "OPTIMIZE_ARTICLE_WORKFLOW",
     "expectedSuggestedAction": "WORKFLOW"
+  },
+  {
+    "name": "分界：详情页隐藏当前文章走 ARTICLE_AGENT 受控写",
+    "category": "boundary",
+    "message": "把这篇隐藏了，不想让其他人看到",
+    "pageType": "article-detail",
+    "pageArticleId": "12",
+    "expectedIntent": "ARTICLE_AGENT",
+    "expectedSuggestedAction": "AGENT"
+  },
+  {
+    "name": "回归：文章页内容修改指令不漂移到受控写",
+    "category": "regression",
+    "message": "把第二段删掉，再润色一下开头",
+    "pageType": "article-detail",
+    "pageArticleId": "12",
+    "expectedIntent": "OPTIMIZE_ARTICLE_WORKFLOW",
+    "expectedSuggestedAction": "WORKFLOW"
+  },
+  {
+    "name": "V3.8 分界：首页近指隐藏走 ARTICLE_AGENT 会话锚兜底",
+    "category": "boundary",
+    "message": "帮我把刚刚那篇文章隐藏了，不想让它公开",
+    "expectedIntent": "ARTICLE_AGENT",
+    "expectedSuggestedAction": "AGENT"
+  },
+  {
+    "name": "V3.8 回归：泛指对话外的文章不升级 ARTICLE_AGENT",
+    "category": "regression",
+    "message": "把我 Redis 那篇隐藏了",
+    "expectedIntent": "GENERAL_CHAT"
+  },
+  {
+    "name": "V3.9 首页近指文章内容问走 ARTICLE_DETAIL_QA",
+    "category": "boundary",
+    "message": "你刚才介绍的那篇文章，缓存击穿那段再讲讲",
+    "expectedIntent": "ARTICLE_DETAIL_QA",
+    "expectedSuggestedAction": "CHAT"
+  },
+  {
+    "name": "V3.9 首页近指总结走 ARTICLE_DETAIL_QA",
+    "category": "boundary",
+    "message": "刚才那篇讲了什么",
+    "expectedIntent": "ARTICLE_DETAIL_QA",
+    "expectedSuggestedAction": "CHAT"
+  },
+  {
+    "name": "V3.9 回归：首页纯概念问不升级 ARTICLE_DETAIL_QA",
+    "category": "regression",
+    "message": "Redis 缓存是什么",
+    "expectedIntent": "GENERAL_CHAT"
+  },
+  {
+    "name": "V3.9 分界：标题特征指本对话外文章不判 ARTICLE_DETAIL_QA",
+    "category": "boundary",
+    "message": "Redis 缓存那篇讲了什么",
+    "expectedIntent": "GENERAL_CHAT"
+  },
+  {
+    "name": "V3.9 分界：找站内文章走 ARTICLE_SEARCH 不漂移到 QA",
+    "category": "boundary",
+    "message": "有没有 Redis 缓存相关的文章",
+    "expectedIntent": "ARTICLE_SEARCH",
+    "expectedSuggestedAction": "CHAT"
+  },
+  {
+    "name": "V3.9 详情页近指文章内容问走 ARTICLE_DETAIL_QA",
+    "category": "boundary",
+    "message": "总结一下刚刚那篇",
+    "pageType": "article-detail",
+    "pageArticleId": "12",
+    "expectedIntent": "ARTICLE_DETAIL_QA",
+    "expectedSuggestedAction": "CHAT"
   }
 ]

@@ -36,6 +36,13 @@ public class AiAgentStep {
     private String actionType;
 
     /**
+     * V3.10：思考摘要（AgentThoughtSanitizer 清洗后，仅展示用，非决策依据）。
+     * 来源 = LLM 决策 JSON 顶层 "thought"；null = 无摘要（前端回退模板文案）。
+     * 不存模型原始输出——原始链不落库（审计看 actionType / input / observation / 状态）。
+     */
+    private String thoughtSummary;
+
+    /**
      * 动作输入摘要 JSON（LLM 给的关键词 / planId 等）。
      */
     private String inputJson;

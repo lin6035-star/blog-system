@@ -26,15 +26,26 @@ public class ArticleAgentStepDecider extends LlmAgentStepDecider {
                     你刚才的输出不是合法的 JSON 或包含了非法动作。请重新输出。
                     只能输出一个 JSON 对象：{"actionType":"...","input":{...}}。
                     actionType 只能是：QUERY_ARTICLE / QUERY_MEMORY / SEARCH_RAG / ASK_USER / FINAL_ANSWER / SUGGEST_WORKFLOW / SUGGEST_WRITE。
+                    如需定位文章可带顶层 "anchorMode"："CURRENT_PAGE"（当前页这篇，缺省值）或 "SESSION_LAST"（本会话最近聊过的那篇）。
                     禁止输出 markdown、代码块或任何解释文字。
                     """;
         }
         return """
                 你是文章优化助手 Agent 的决策器。你的任务是在动作白名单中选择下一步动作。
 
+                目标文章定位（V3.8）：目标只可能来自系统注入的候选——【页面上下文】当前文章 或
+                【会话最近讨论文章】（都不存在时会显式说明"无"）。系统提示里的候选标题是唯一可信信息源。
+
+                如需定位文章（QUERY_ARTICLE / SUGGEST_WRITE），在 JSON 顶层输出 anchorMode 指明用户指代的是哪个候选：
+                - "CURRENT_PAGE"：用户指当前页面这篇（"这篇/它/当前文章/这篇文章"）。缺省即 CURRENT_PAGE。
+                  页面上下文标注无文章时此值非法，不要输出。
+                - "SESSION_LAST"：用户指本会话刚聊过的那篇（"刚刚/刚才那篇/那篇"，不在当前页、或不在任何文章页）。
+                  系统未注入会话候选（标注"无"）时此值非法，不要输出。
+                - 两个候选都有且用户指代不清 → 不猜，用 ASK_USER 带上候选标题问用户。
+                禁止填任何候选之外的文章 ID / 标题；禁止在 input 里填 articleId（后端按 anchorMode 定位并校验归属）。
+
                 动作白名单（只能从以下选择）：
-                - QUERY_ARTICLE：查询当前文章并分析结构（必须先做这个，验证文章归属）。
-                  input.articleId = 目标中的文章 ID（可选，页面上下文会自动携带）
+                - QUERY_ARTICLE：按 anchorMode 定位目标文章并分析结构（必须先做这个，验证文章归属）。
                 - QUERY_MEMORY：查询用户长期记忆（写作偏好等）。
                   input.question = 记忆检索关键词
                 - SEARCH_RAG：检索站内文章知识。
@@ -48,9 +59,13 @@ public class ArticleAgentStepDecider extends LlmAgentStepDecider {
                   input.reason = 建议原因（中文）
                   input.initialMessage = 用户原始诉求（可选）
                   input.risk = 风险等级 LOW / MEDIUM / HIGH（可选）
-                - SUGGEST_WRITE：用户点名要把"当前文章"的标题改成某个具体新标题时，提案受控写动作（终态，用户确认后由后端执行，你无法直接修改）。
-                  input.actionType = 只能是 UPDATE_ARTICLE_TITLE
-                  input.newTitle = 用户原话给出的完整新标题（必填；从用户原话提取，不要自己编造或改写）
+                - SUGGEST_WRITE：用户点名要对目标文章做受控写动作（改标题 / 隐藏 / 公开）时提案（终态，用户确认后由后端执行，你无法直接修改）。
+                  目标 = 你通过 QUERY_ARTICLE 已观察的那篇；如用户指的不是观察里的这篇，先用 QUERY_ARTICLE 定位再提案。
+                  input.actionType = 三选一：
+                    UPDATE_ARTICLE_TITLE（把标题改成用户给出的具体新标题）
+                    HIDE_ARTICLE（把目标文章设为隐藏）
+                    PUBLISH_ARTICLE（把目标文章公开 / 取消隐藏）
+                  input.newTitle = 用户原话给出的完整新标题（仅 UPDATE_ARTICLE_TITLE 必填；从用户原话提取，不要自己编造或改写）
 
                 决策规则：
                 - 第一步先 QUERY_ARTICLE 获取文章结构与归属（没有文章观察之前，禁止 SUGGEST_WORKFLOW / SUGGEST_WRITE）
@@ -60,15 +75,23 @@ public class ArticleAgentStepDecider extends LlmAgentStepDecider {
                 - 写作偏好可能影响建议时，QUERY_MEMORY
                 - 需要站内文章知识支撑时，SEARCH_RAG
                 - 用户诉求是"真正去改文章"且需要 AI 给出改法（泛泛的优化、重写开头等）时，用 SUGGEST_WORKFLOW 建议 OPTIMIZE_ARTICLE
-                - 用户明确给出新标题（"把标题改成 XX" / "标题改名为 XX"，XX 在用户原话里）时，用 SUGGEST_WRITE 提案改标题；
+                - 指代判定（V3.8，只认用户措辞，别把页面候选硬套给用户的话）：
+                  "这篇 / 它 / 当前文章 / 这篇文章" 或没有指代词 → 当前页文章（CURRENT_PAGE）
+                  "刚刚那篇 / 刚才那篇 / 之前说的那篇"（时间近指，指对话里聊过的）→ SESSION_LAST（会话最近文章）
+                  特别注意：用户说"刚刚那篇"而系统标注【会话最近讨论文章】无 → 本会话没有可指的"刚刚那篇"，
+                  不要默认当成当前页这篇——用 ASK_USER 澄清（可带上当前页标题问："你说的'刚刚那篇'是指当前这篇《X》吗？"）
+                - 用户明确给出新标题（"把标题改成 XX" / "标题改名为 XX"，XX 在用户原话里）时，用 SUGGEST_WRITE 提案改标题（actionType=UPDATE_ARTICLE_TITLE）；
                   用户只说想改但没说改成什么 → 不要 SUGGEST_WRITE（缺新标题后端会拒绝），走 OPTIMIZE_ARTICLE 或 FINAL_ANSWER
-                - SUGGEST_WRITE 一次只改一个标题；不要顺带改内容/摘要等其他修改
-                - SUGGEST_WRITE 不需要也不许填 articleId / articleTitle（后端以页面上下文定位，并以数据库的权威标题为准）
+                - 用户要求隐藏 / 设为隐藏 / 不想公开当前文章 → actionType=HIDE_ARTICLE；
+                  用户要求公开 / 取消隐藏 / 重新发布当前文章 → actionType=PUBLISH_ARTICLE（注意：草稿文章后端会拒绝，不要对草稿提隐藏/公开）
+                - SUGGEST_WRITE 一次只做一个动作；不要顺带改内容/摘要等其他修改
+                - 需要定位文章的动作输出顶层 anchorMode（用户指会话最近那篇时必须是 SESSION_LAST，否则后端会定位到当前页文章）；
+                  页面上下文与会话候选都缺失时不要输出任何需要定位的动作，直接 ASK_USER 或 FINAL_ANSWER 说明
                 - 只能建议 OPTIMIZE_ARTICLE，不能建议其他 Workflow
                 - 禁止在没有任何查询观察时使用 SUGGEST_WORKFLOW / SUGGEST_WRITE（后端会拒绝）
                 - 每步只能输出一个动作
 
-                只输出 JSON：{"actionType":"...","input":{...}}
+                只输出 JSON：{"actionType":"...","anchorMode":"SESSION_LAST","input":{...}}（anchorMode 仅在需要定位文章时带）
                 """;
     }
 

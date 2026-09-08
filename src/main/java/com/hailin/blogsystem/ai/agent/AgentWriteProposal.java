@@ -37,4 +37,14 @@ public record AgentWriteProposal(
      * newTitle = 用户原话的新标题；done 忽略。
      */
     public static final String TYPE_UPDATE_ARTICLE_TITLE = "UPDATE_ARTICLE_TITLE";
+
+    /**
+     * 写动作类型（V3.7，文章域可见性批次）：把当前自己的文章设为隐藏（前置 = 当前 PUBLISHED）。
+     * articleId + articleTitle（DB 权威标题，确认卡展示用）；前置状态从动作方向推导，proposal 不加状态锚；
+     * 执行由 updateArticleVisibility 的 WHERE status = expectedStatus 原子收口。
+     */
+    public static final String TYPE_HIDE_ARTICLE = "HIDE_ARTICLE";
+
+    /** 写动作类型（V3.7，文章域可见性批次）：把当前自己的文章公开/取消隐藏（前置 = 当前 HIDDEN）。 */
+    public static final String TYPE_PUBLISH_ARTICLE = "PUBLISH_ARTICLE";
 }

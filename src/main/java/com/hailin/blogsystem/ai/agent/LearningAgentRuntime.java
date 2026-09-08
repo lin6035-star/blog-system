@@ -140,7 +140,7 @@ public class LearningAgentRuntime extends AbstractAgentRuntime implements AgentR
         int nextStepNo = run.getUsedSteps() + 1;
         if (observations.isEmpty()) {
             String rejectReason = "首轮零观察写动作提案被拒绝：必须先执行至少一个只读查询";
-            emitter.emit(nextStepNo, "SUGGEST_WRITE", "FAILED", "提案被拒绝：需先完成一次查询");
+            emitter.emit(nextStepNo, "SUGGEST_WRITE", "FAILED", "提案被拒绝：需先完成一次查询", null);
             recordRejectedStep(run, decision, nextStepNo, rejectReason);
             observations.add("系统提示：你在没有任何查询结果时尝试提案写动作，后端已拒绝。"
                     + "请先执行只读查询（QUERY_LEARNING_DASHBOARD / QUERY_MEMORY / SEARCH_RAG）再决策。");
@@ -173,7 +173,7 @@ public class LearningAgentRuntime extends AbstractAgentRuntime implements AgentR
         Map<String, Object> input = decision.input() == null ? Map.of() : decision.input();
         String taskTitle = text(input, "taskTitle");
         if (taskTitle == null || taskTitle.isBlank()) {
-            emitter.emit(run.getUsedSteps() + 1, "SUGGEST_WRITE", "FAILED", "提案缺少任务标题");
+            emitter.emit(run.getUsedSteps() + 1, "SUGGEST_WRITE", "FAILED", "提案缺少任务标题", null);
             return markFailed(run, "Agent 写动作提案无效（缺少 taskTitle）");
         }
         String actionType = text(input, "actionType");
@@ -189,14 +189,14 @@ public class LearningAgentRuntime extends AbstractAgentRuntime implements AgentR
         } else if (AgentWriteProposal.TYPE_UPDATE_LEARNING_TASK.equals(actionType)) {
             writeType = "RENAME";
         } else {
-            emitter.emit(run.getUsedSteps() + 1, "SUGGEST_WRITE", "FAILED", "不支持的写动作类型");
+            emitter.emit(run.getUsedSteps() + 1, "SUGGEST_WRITE", "FAILED", "不支持的写动作类型", null);
             return markFailed(run, "Agent 写动作提案无效（不支持的 actionType：" + actionType + "）");
         }
 
         // RENAME 专属必填：显式改名但缺新名 → FAILED 绝不回落 UPDATE（回落 + done 缺省 true = 误勾选）
         String newTitle = text(input, "newTitle");
         if ("RENAME".equals(writeType) && (newTitle == null || newTitle.isBlank())) {
-            emitter.emit(run.getUsedSteps() + 1, "SUGGEST_WRITE", "FAILED", "提案缺少新任务名");
+            emitter.emit(run.getUsedSteps() + 1, "SUGGEST_WRITE", "FAILED", "提案缺少新任务名", null);
             return markFailed(run, "Agent 写动作提案无效（缺少 newTitle）");
         }
         // V3.1 补充：ADD 提案前预检目标阶段是否已存在同名任务——已存在则不弹确认卡，
@@ -208,7 +208,7 @@ public class LearningAgentRuntime extends AbstractAgentRuntime implements AgentR
                     && targetStageAlreadyHasTask(run.getUserId(), planRef, stageTitle, taskTitle)) {
                 int nextStepNo = run.getUsedSteps() + 1;
                 String rejectReason = "目标阶段已存在同名任务「" + taskTitle + "」，追加提案被拒绝";
-                emitter.emit(nextStepNo, "SUGGEST_WRITE", "FAILED", rejectReason);
+                emitter.emit(nextStepNo, "SUGGEST_WRITE", "FAILED", rejectReason, null);
                 recordRejectedStep(run, decision, nextStepNo, rejectReason);
                 observations.add("系统提示：目标阶段「" + stageTitle + "」已存在同名任务「" + taskTitle
                         + "」，后端拒绝了追加提案。请直接告知用户该任务已存在（不要生成追加提案，"
@@ -234,7 +234,7 @@ public class LearningAgentRuntime extends AbstractAgentRuntime implements AgentR
             }
             if (rejectReason != null) {
                 int nextStepNo = run.getUsedSteps() + 1;
-                emitter.emit(nextStepNo, "SUGGEST_WRITE", "FAILED", rejectReason);
+                emitter.emit(nextStepNo, "SUGGEST_WRITE", "FAILED", rejectReason, null);
                 recordRejectedStep(run, decision, nextStepNo, rejectReason);
                 observations.add("系统提示：" + rejectReason
                         + "。请直接告知用户（不要生成改名提案，如用户确实要改可建议换成其他任务名）。");
@@ -278,7 +278,8 @@ public class LearningAgentRuntime extends AbstractAgentRuntime implements AgentR
                     : "已为你准备好「" + taskTitle + "」任务取消勾选提案，确认后执行。";
         }
 
-        emitter.emit(run.getUsedSteps() + 1, "SUGGEST_WRITE", "SUCCESS", actionLabel);
+        emitter.emit(run.getUsedSteps() + 1, "SUGGEST_WRITE", "SUCCESS", actionLabel,
+                decision.thoughtSummary());
         recordTerminalStep(run, decision, run.getUsedSteps() + 1);
         run.setStatus(AiAgentRunStatus.WAITING_WRITE_CONFIRM.name());
         run.setFinalAnswer(finalAnswer);

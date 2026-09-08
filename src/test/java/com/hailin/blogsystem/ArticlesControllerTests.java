@@ -3,6 +3,7 @@ package com.hailin.blogsystem;
 import com.hailin.blogsystem.ai.rag.ArticleRagIndexService;
 import com.hailin.blogsystem.ai.rag.ArticleRagSyncService;
 import com.hailin.blogsystem.entity.Articles;
+import com.hailin.blogsystem.constants.BlogConstants;
 import com.hailin.blogsystem.constants.RedisConstants;
 import com.hailin.blogsystem.service.ArticlesService;
 import com.hailin.blogsystem.utils.JwtUtil;
@@ -76,6 +77,66 @@ class ArticlesControllerTests {
         if (keys != null && !keys.isEmpty()) {
             stringRedisTemplate.delete(keys);
         }
+    }
+
+    @Test
+    void hiddenArticleDetailVisibleToOwner() throws Exception {
+        // V3.7 修复：隐藏文章作者本人可见（阅读页预览入口），游客/他人仍不可见
+        setHidden(1L);
+        try {
+            String authorToken = jwtUtil.generateToken(100L);
+            mockMvc.perform(get("/api/articles/1")
+                            .header("Authorization", "Bearer " + authorToken))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.code").value(0))
+                    .andExpect(jsonPath("$.data.id").value(1));
+        } finally {
+            restorePublished(1L);
+        }
+    }
+
+    @Test
+    void hiddenArticleDetailInvisibleToGuest() throws Exception {
+        setHidden(1L);
+        try {
+            mockMvc.perform(get("/api/articles/1"))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.code").value(40400));
+        } finally {
+            restorePublished(1L);
+        }
+    }
+
+    @Test
+    void hiddenArticleDetailInvisibleToOtherLoggedInUser() throws Exception {
+        setHidden(1L);
+        try {
+            String readerToken = jwtUtil.generateToken(101L);
+            mockMvc.perform(get("/api/articles/1")
+                            .header("Authorization", "Bearer " + readerToken))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.code").value(40400));
+        } finally {
+            restorePublished(1L);
+        }
+    }
+
+    /** 隐藏文章并清详情缓存（模拟 hideArticle 副作用，避免命中旧 PUBLISHED 缓存） */
+    private void setHidden(Long id) {
+        Articles article = articlesService.getById(id);
+        article.setStatus(BlogConstants.ArticlesStatus.HIDDEN);
+        articlesService.updateById(article);
+        try {
+            stringRedisTemplate.delete(RedisConstants.ARTICLE_DETAIL_KEY_PREFIX + id);
+        } catch (Exception ignored) {
+            // Redis 不可用则跳过（缓存命中场景在该环境下不存在）
+        }
+    }
+
+    private void restorePublished(Long id) {
+        Articles article = articlesService.getById(id);
+        article.setStatus(BlogConstants.ArticlesStatus.PUBLISHED);
+        articlesService.updateById(article);
     }
 
     @Test

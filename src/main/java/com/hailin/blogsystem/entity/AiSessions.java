@@ -23,6 +23,16 @@ public class AiSessions {
      * 当 Workflow COMPLETED / CANCELLED 后清空。
      */
     private Long activeWorkflowRunId;
+
+    /**
+     * 会话文章锚（V3.8）：本会话最后一次"真实进入文章上下文"的文章 ID（定位本体）。
+     * 锚写入受控：文章域 Agent 定位成功（AGENT_RUN）/ 详情页 QA / 页面 ACTION；
+     * 闲聊与纯浏览不写。lastArticleTitle 仅为快照，权威标题读锚时查库现取。
+     */
+    private Long lastArticleId;
+    private String lastArticleTitle;
+    private String lastArticleSource;
+    private LocalDateTime lastArticleUpdatedAt;
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
 }

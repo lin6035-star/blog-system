@@ -318,6 +318,7 @@ CREATE TABLE IF NOT EXISTS ai_agent_steps (
     agent_run_id BIGINT NOT NULL,
     step_no INT NOT NULL,
     action_type VARCHAR(64) NOT NULL,
+    thought_summary VARCHAR(500),
     input_json CLOB,
     output_json CLOB,
     status VARCHAR(32) NOT NULL,

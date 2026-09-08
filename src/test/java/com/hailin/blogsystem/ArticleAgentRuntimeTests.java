@@ -6,6 +6,7 @@ import com.hailin.blogsystem.ai.agent.AgentStepDecision;
 import com.hailin.blogsystem.ai.agent.ArticleAgentActionExecutor;
 import com.hailin.blogsystem.ai.agent.ArticleAgentRuntime;
 import com.hailin.blogsystem.ai.agent.ArticleAgentStepDecider;
+import com.hailin.blogsystem.ai.agent.ArticleSessionAnchorService;
 import com.hailin.blogsystem.ai.agent.AgentWriteProposal;
 import com.hailin.blogsystem.entity.AiAgentRun;
 import com.hailin.blogsystem.entity.AiAgentStep;
@@ -42,6 +43,7 @@ class ArticleAgentRuntimeTests {
     private AiAgentRunMapper runMapper;
     private AiAgentStepMapper stepMapper;
     private ArticlesService articlesService;
+    private ArticleSessionAnchorService anchorService;
     private ArticleAgentRuntime runtime;
 
     private static PageContextDTO articleContext(String articleId) {
@@ -52,10 +54,15 @@ class ArticleAgentRuntimeTests {
     }
 
     private static Articles article(Long id, Long authorId, String title) {
+        return article(id, authorId, title, null);
+    }
+
+    private static Articles article(Long id, Long authorId, String title, Integer status) {
         Articles article = new Articles();
         article.setId(id);
         article.setAuthorId(authorId);
         article.setTitle(title);
+        article.setStatus(status);
         return article;
     }
 
@@ -66,6 +73,7 @@ class ArticleAgentRuntimeTests {
         runMapper = mock(AiAgentRunMapper.class);
         stepMapper = mock(AiAgentStepMapper.class);
         articlesService = mock(ArticlesService.class);
+        anchorService = mock(ArticleSessionAnchorService.class);
 
         // MyBatis-Plus ASSIGN_ID 在 mock 下不生效，insert 时手动赋 id
         when(runMapper.insert(any(AiAgentRun.class))).thenAnswer(inv -> {
@@ -75,7 +83,8 @@ class ArticleAgentRuntimeTests {
         });
 
         runtime = new ArticleAgentRuntime(
-                decider, executor, runMapper, stepMapper, new ObjectMapper(), articlesService
+                decider, executor, runMapper, stepMapper, new ObjectMapper(),
+                articlesService, anchorService
         );
     }
 
@@ -251,7 +260,8 @@ class ArticleAgentRuntimeTests {
 
     @Test
     void suggestWriteWithoutPageContextFailsRun() {
-        // V3.4 范围锁死文章详情页：无页面上下文 articleId → FAILED，LLM input 摘录不作数
+        // V3.8：无页面上下文且会话锚 resolve 为空（无决议目标）→ 提案 FAILED；LLM input 摘录不作数
+        when(anchorService.resolve(200L, 100L)).thenReturn(null);
         when(decider.decide(any(), any(), anyInt(), anyInt()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
@@ -266,7 +276,76 @@ class ArticleAgentRuntimeTests {
 
         assertThat(result.status()).isEqualTo(AiAgentRunStatus.FAILED);
         AiAgentRun saved = captureRun();
-        assertThat(saved.getErrorMessage()).contains("缺少当前文章上下文");
+        assertThat(saved.getErrorMessage()).contains("未决议定位目标");
+    }
+
+    @Test
+    void homePageSessionAnchorHideProposalReachesWaitingConfirm() {
+        // V3.8 场景 A（首页指代）：无页面上下文 + 会话锚 resolve 12 →
+        // 首步 QUERY_ARTICLE anchorMode=SESSION_LAST 决议目标 12 → 提案 HIDE_ARTICLE(12) → WAITING_WRITE_CONFIRM
+        when(anchorService.resolve(200L, 100L))
+                .thenReturn(new ArticleSessionAnchorService.ArticleAnchor(12L, "Java 后端面试突围"));
+        when(decider.decide(any(), any(), anyInt(), anyInt()))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE)
+                        .withInput(Map.of("anchorMode", "SESSION_LAST")))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
+                        .withInput(Map.of("actionType", AgentWriteProposal.TYPE_HIDE_ARTICLE)));
+        when(executor.execute(any(), any(), any()))
+                .thenReturn("当前文章分析：\n- 标题：《Java 后端面试突围》");
+        when(articlesService.getById(12L)).thenReturn(article(12L, 100L, "Java 后端面试突围", 1));
+
+        AgentRunResult result = runtime.run(100L, 200L, "帮我把刚刚那篇文章隐藏了",
+                null, com.hailin.blogsystem.ai.agent.AgentStepEmitter.noop());
+
+        assertThat(result.status()).isEqualTo(AiAgentRunStatus.WAITING_WRITE_CONFIRM);
+        assertThat(result.pendingWriteAction()).isNotNull();
+        assertThat(result.pendingWriteAction().actionType()).isEqualTo(AgentWriteProposal.TYPE_HIDE_ARTICLE);
+        // 目标 = 会话锚 12（首页无页面上下文，不可能落到别的文章）
+        assertThat(result.pendingWriteAction().articleId()).isEqualTo("12");
+        // QUERY_ARTICLE 执行成功 → 会话锚 AGENT_RUN 写点
+        verify(anchorService).mark(200L, 12L, ArticleSessionAnchorService.SOURCE_AGENT_RUN);
+    }
+
+    @Test
+    void sessionLastWinsOverPageContextForProposal() {
+        // V3.8 场景 B（错位指代）：站文章 99 详情页说"刚刚那篇"（指会话锚 12）→
+        // anchorMode=SESSION_LAST → 提案目标是 12（不是当前页 99，不会被页面上下文抢走）
+        when(anchorService.resolve(200L, 100L))
+                .thenReturn(new ArticleSessionAnchorService.ArticleAnchor(12L, "Java 后端面试突围"));
+        when(decider.decide(any(), any(), anyInt(), anyInt()))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE)
+                        .withInput(Map.of("anchorMode", "SESSION_LAST")))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
+                        .withInput(Map.of("actionType", AgentWriteProposal.TYPE_HIDE_ARTICLE)));
+        when(executor.execute(any(), any(), any()))
+                .thenReturn("当前文章分析：\n- 标题：《Java 后端面试突围》");
+        when(articlesService.getById(12L)).thenReturn(article(12L, 100L, "Java 后端面试突围", 1));
+
+        AgentRunResult result = runtime.run(100L, 200L, "帮我把刚刚那篇隐藏了",
+                articleContext("99"), com.hailin.blogsystem.ai.agent.AgentStepEmitter.noop());
+
+        assertThat(result.status()).isEqualTo(AiAgentRunStatus.WAITING_WRITE_CONFIRM);
+        // 提案目标是会话锚文章 12，不是当前页文章 99
+        assertThat(result.pendingWriteAction().articleId()).isEqualTo("12");
+    }
+
+    @Test
+    void pageContextArticleIsDefaultTargetWhenNoAnchorMode() {
+        // V3.8 回归：详情页无 anchorMode（缺省 CURRENT_PAGE）→ 目标 = 当前页文章，提案针对当前页
+        when(decider.decide(any(), any(), anyInt(), anyInt()))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
+                        .withInput(Map.of("actionType", AgentWriteProposal.TYPE_HIDE_ARTICLE)));
+        when(executor.execute(any(), any(), any()))
+                .thenReturn("当前文章分析：\n- 标题：《Redis 缓存原理》");
+        when(articlesService.getById(12L)).thenReturn(article(12L, 100L, "Redis 缓存原理", 1));
+
+        AgentRunResult result = runtime.run(100L, 200L, "把这篇隐藏了",
+                articleContext("12"), com.hailin.blogsystem.ai.agent.AgentStepEmitter.noop());
+
+        assertThat(result.status()).isEqualTo(AiAgentRunStatus.WAITING_WRITE_CONFIRM);
+        assertThat(result.pendingWriteAction().articleId()).isEqualTo("12");
+        verify(anchorService).mark(200L, 12L, ArticleSessionAnchorService.SOURCE_AGENT_RUN);
     }
 
     @Test
@@ -327,7 +406,7 @@ class ArticleAgentRuntimeTests {
 
         List<String[]> events = new java.util.ArrayList<>();
         runtime.run(100L, 200L, "帮我看看这篇文章",
-                articleContext("12"), (stepNo, actionType, status, message) ->
+                articleContext("12"), (stepNo, actionType, status, message, thoughtSummary) ->
                         events.add(new String[]{String.valueOf(stepNo), actionType, status, message}));
 
         assertThat(events).hasSize(3);
@@ -413,6 +492,93 @@ class ArticleAgentRuntimeTests {
         assertThat(steps.get(0).getStatus()).isEqualTo("FAILED");
         AiAgentRun saved = captureRun();
         assertThat(saved.getContextJson()).contains("动作执行失败");
+    }
+
+    @Test
+    void suggestHideArticleProposalReachesWaitingConfirm() {
+        // V3.7：已发布文章提隐藏 → 提案（前置 PUBLISHED 满足）→ WAITING_WRITE_CONFIRM
+        when(decider.decide(any(), any(), anyInt(), anyInt()))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
+                        .withInput(Map.of("actionType", "HIDE_ARTICLE")));
+        when(executor.execute(any(), any(), any()))
+                .thenReturn("当前文章分析：\n- 标题：《Redis 缓存原理》\n- 状态：已发布");
+        when(articlesService.getById(12L))
+                .thenReturn(article(12L, 100L, "Redis 缓存原理", 1));
+
+        AgentRunResult result = runtime.run(100L, 200L, "把这篇隐藏了",
+                articleContext("12"), com.hailin.blogsystem.ai.agent.AgentStepEmitter.noop());
+
+        assertThat(result.status()).isEqualTo(AiAgentRunStatus.WAITING_WRITE_CONFIRM);
+        assertThat(result.pendingWriteAction().actionType()).isEqualTo("HIDE_ARTICLE");
+        assertThat(result.pendingWriteAction().articleId()).isEqualTo("12");
+        assertThat(result.pendingWriteAction().articleTitle()).isEqualTo("Redis 缓存原理");
+        AiAgentRun saved = captureRun();
+        assertThat(saved.getContextJson()).contains("HIDE_ARTICLE");
+    }
+
+    @Test
+    void suggestPublishArticleProposalReachesWaitingConfirm() {
+        // V3.7：隐藏中文章提公开 → 提案（前置 HIDDEN 满足）
+        when(decider.decide(any(), any(), anyInt(), anyInt()))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
+                        .withInput(Map.of("actionType", "PUBLISH_ARTICLE")));
+        when(executor.execute(any(), any(), any()))
+                .thenReturn("当前文章分析：\n- 标题：《Redis 缓存原理》\n- 状态：已隐藏");
+        when(articlesService.getById(12L))
+                .thenReturn(article(12L, 100L, "Redis 缓存原理", 2));
+
+        AgentRunResult result = runtime.run(100L, 200L, "把这篇公开了",
+                articleContext("12"), com.hailin.blogsystem.ai.agent.AgentStepEmitter.noop());
+
+        assertThat(result.status()).isEqualTo(AiAgentRunStatus.WAITING_WRITE_CONFIRM);
+        assertThat(result.pendingWriteAction().actionType()).isEqualTo("PUBLISH_ARTICLE");
+    }
+
+    @Test
+    void suggestVisibilityChangeOnDraftFailsRun() {
+        // V3.7：草稿拒绝——Agent 不从详情页把草稿发布/隐藏（编辑器人工闸保留）
+        when(decider.decide(any(), any(), anyInt(), anyInt()))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
+                        .withInput(Map.of("actionType", "HIDE_ARTICLE")));
+        when(executor.execute(any(), any(), any()))
+                .thenReturn("当前文章分析：\n- 标题：《未发布的草稿》");
+        when(articlesService.getById(12L))
+                .thenReturn(article(12L, 100L, "未发布的草稿", 0));
+
+        AgentRunResult result = runtime.run(100L, 200L, "把这篇文章隐藏",
+                articleContext("12"), com.hailin.blogsystem.ai.agent.AgentStepEmitter.noop());
+
+        assertThat(result.status()).isEqualTo(AiAgentRunStatus.FAILED);
+        AiAgentRun saved = captureRun();
+        assertThat(saved.getErrorMessage()).contains("还未发布");
+    }
+
+    @Test
+    void suggestHideAlreadyHiddenArticleRejectedThenContinues() {
+        // V3.7：已是目标状态（已隐藏再提隐藏）→ FAILED step 不弹卡，循环继续由 LLM 告知
+        when(decider.decide(any(), any(), anyInt(), anyInt()))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
+                        .withInput(Map.of("actionType", "HIDE_ARTICLE")))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
+                        .withInput(Map.of("answer", "这篇文章已经是隐藏状态了")));
+        when(executor.execute(any(), any(), any()))
+                .thenReturn("当前文章分析：\n- 标题：《Redis 缓存原理》\n- 状态：已隐藏");
+        when(articlesService.getById(12L))
+                .thenReturn(article(12L, 100L, "Redis 缓存原理", 2));
+
+        AgentRunResult result = runtime.run(100L, 200L, "把这篇隐藏了",
+                articleContext("12"), com.hailin.blogsystem.ai.agent.AgentStepEmitter.noop());
+
+        assertThat(result.status()).isEqualTo(AiAgentRunStatus.COMPLETED);
+        assertThat(result.finalAnswer()).isEqualTo("这篇文章已经是隐藏状态了");
+        List<AiAgentStep> steps = captureSteps();
+        assertThat(steps.get(1).getActionType()).isEqualTo("SUGGEST_WRITE");
+        assertThat(steps.get(1).getStatus()).isEqualTo("FAILED");
+        assertThat(steps.get(1).getErrorMessage()).contains("已处于隐藏状态");
     }
 
     private AiAgentRun captureRun() {

@@ -130,19 +130,23 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 当 pageType 是 article-detail，且用户询问“这篇文章讲了什么”“总结这篇文章”“这篇文章重点是什么”“这篇文章里的某个内容是什么意思”“分析当前文章”时，输出 ARTICLE_DETAIL_QA。
                                 当 pageType 是 article-detail，且用户要求回到顶部、回到文章开头、滚动到顶部时，输出 ARTICLE_ACTION，actionType=scrollToTop。       
                                 
-                                ARTICLE_DETAIL_QA 不需要 actionType。
-                                如果缺少 articleId，输出 GENERAL_CHAT。
-
-                                当用户询问当前文章内容、总结当前文章、
-                                解释当前文章中的某个概念时：
+                                ARTICLE_DETAIL_QA = 对一篇具体文章的内容问答
+                                （讲了什么 / 总结 / 文中概念解释 / 追问文中观点），不需要 actionType。
+                                判定不依赖页面（V3.9 跨页指代）：在任意页面或无页面上下文的对话里，
+                                用户明确近指一篇本对话中已出现/刚聊过的文章问内容
+                                （“这篇文章”“那篇”“刚刚那篇”“你刚才说的那篇”）时，
+                                同样输出 ARTICLE_DETAIL_QA：
 
                                 - intent=ARTICLE_DETAIL_QA
                                 - suggestedAction=CHAT
                                 - suggestedWorkflowType=null
 
-                                后端根据 pageContext.articleId 加载当前文章，
-                                并使用 CURRENT_ARTICLE 检索模式。
-                                如果没有 articleId，不能猜测文章 ID。
+                                后端按 pageContext 文章 → 本会话最近聊过的文章 的顺序定位目标；
+                                articleId 允许为空（跨页取不到就不填，禁止编造或猜测 articleId）。
+                                区分（务必遵守）：
+                                - 无文章指代的纯概念问（“Redis 缓存是什么”“Java 怎么学”）-> GENERAL_CHAT
+                                - 找站内有没有某类文章（“有没有/推荐 XX 文章”）-> ARTICLE_SEARCH
+                                - 用具体标题/主题指一篇本对话未出现过的文章（“Redis 缓存那篇…”）-> 无法定位，不判 ARTICLE_DETAIL_QA
                                  
                                 actionType 可选：likeArticle, unlikeArticle, favoriteArticle, unfavoriteArticle, followAuthor, unfollowAuthor, copyArticleLink, scrollToComments, saveDraft, publish, fillArticle, scrollToTop。
 
@@ -394,6 +398,8 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
 
                                 例外：当用户原话给出完整新标题要求改名（"把标题改成 XX" / "标题改名为 XX"）时，
                                 不是 OPTIMIZE——新标题已由用户指定、无需 AI 生成改法，这是受控写改标题，判 ARTICLE_AGENT（见下）。
+                                例外（V3.7）：用户要求隐藏 / 公开 / 取消隐藏当前文章（状态操作，不涉及内容）时，
+                                也不是 OPTIMIZE——状态操作不走内容优化 Workflow，判 ARTICLE_AGENT 受控写（见下）。
 
                                 这类请求不需要用户在编辑器页面。
                                 如果缺少 articleId，输出 GENERAL_CHAT。
@@ -418,12 +424,26 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 判 ARTICLE_AGENT（Agent 提案改标题 → 后端弹确认卡 → 用户确认后才执行，
                                 后端只改标题不动其他内容），不要判 OPTIMIZE_ARTICLE_WORKFLOW。
 
+                                例外（V3.7 受控写可见性）：当用户要求隐藏 / 公开 / 取消隐藏当前文章
+                                （"把这篇隐藏了" / "设为隐藏" / "把这篇公开" / "取消隐藏"）时，
+                                判 ARTICLE_AGENT（Agent 提案隐藏/公开 → 后端弹确认卡 → 确认后执行），
+                                不要判 OPTIMIZE_ARTICLE_WORKFLOW——状态操作不涉及内容修改，不属于文章优化。
+
+                                例外（V3.8 跨页文章操作）：当用户不在文章详情页（首页/其他页），
+                                但原话里明确要对某篇文章做受控操作（改标题/改名/隐藏/公开/取消隐藏，
+                                如"帮我把刚刚那篇文章隐藏了"）时，仍判 ARTICLE_AGENT（suggestedAction=AGENT），
+                                articleId 置空不填、不要编造——后端会用本会话最近聊过的那篇文章兜底定位并校验归属，
+                                不要因为缺少 articleId 就降级 GENERAL_CHAT。
+                                但如果原话只是泛指这段对话里没出现过的文章（如"把我 Redis 那篇隐藏了"）
+                                或没有明确操作动词，维持 GENERAL_CHAT。
+
                                 明确优化指令（不判 ARTICLE_AGENT，判 OPTIMIZE_ARTICLE_WORKFLOW）：
                                 - "把第二段删掉" / "帮我把标题改短" / "把开头重写得更吸引人"
                                 - "帮我优化这篇文章"（明确要求优化）
                                 注意："帮我把标题改短"这类没有给出具体新标题的仍走 Workflow，与上面的改名例外不冲突。
 
-                                如果缺少 articleId，输出 GENERAL_CHAT。
+                                articleId 只从页面上下文获取；页面上下文缺失时按上方 V3.8 例外处理
+                                （受控操作仍判 ARTICLE_AGENT 并留空 articleId，后端会话锚兜底）。
                                 Agent 只查询文章、记忆、站内知识后给出优化建议或建议启动优化流程，
                                 不会直接修改文章（写动作必须用户确认）。
 

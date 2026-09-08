@@ -246,15 +246,20 @@ class LearningAgentRuntimeTests {
     @Test
     void emitterReceivesStepEventsInOrder() {
         // V2.3：思考面板事件序列——动作 RUNNING → SUCCESS，终态 SUCCESS
+        // V3.10：thoughtSummary 携带断言——决策 1 带思考摘要，事件 RUNNING/SUCCESS 同一句（D4），
+        // 终态 FINAL_ANSWER 无摘要 → null
         when(decider.decide(any(), any(), anyInt(), anyInt()))
-                .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_LEARNING_DASHBOARD))
+                .thenReturn(new AgentStepDecision(AgentStepActionType.QUERY_LEARNING_DASHBOARD,
+                        Map.of(), "先看看你今天的学习计划"))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
                         .withInput(Map.of("answer", "建议继续学 Redis")));
         when(executor.execute(any(), any(), any())).thenReturn("找到 1 个活跃计划");
 
         List<String[]> events = new java.util.ArrayList<>();
-        runtime.run(100L, 200L, "帮我安排今天学什么", (stepNo, actionType, status, message) ->
-                events.add(new String[]{String.valueOf(stepNo), actionType, status, message}));
+        runtime.run(100L, 200L, "帮我安排今天学什么",
+                (stepNo, actionType, status, message, thoughtSummary) ->
+                        events.add(new String[]{String.valueOf(stepNo), actionType, status, message,
+                                thoughtSummary}));
 
         assertThat(events).hasSize(3);
         // 第 1 步：查询 RUNNING → SUCCESS
@@ -264,10 +269,20 @@ class LearningAgentRuntimeTests {
         assertThat(events.get(1)[0]).isEqualTo("1");
         assertThat(events.get(1)[1]).isEqualTo("QUERY_LEARNING_DASHBOARD");
         assertThat(events.get(1)[2]).isEqualTo("SUCCESS");
-        // 第 2 步：终态 FINAL_ANSWER SUCCESS
+        // V3.10：RUNNING/SUCCESS 同一句 thoughtSummary（行文本跨状态稳定）
+        assertThat(events.get(0)[4]).isEqualTo("先看看你今天的学习计划");
+        assertThat(events.get(1)[4]).isEqualTo("先看看你今天的学习计划");
+        // 第 2 步：终态 FINAL_ANSWER SUCCESS（无思考摘要 → null）
         assertThat(events.get(2)[0]).isEqualTo("2");
         assertThat(events.get(2)[1]).isEqualTo("FINAL_ANSWER");
         assertThat(events.get(2)[2]).isEqualTo("SUCCESS");
+        assertThat(events.get(2)[4]).isNull();
+        // V3.10：落库与事件同源——执行步与终态步都落 thoughtSummary
+        //（DB 每步只 insert 一次，RUNNING → SUCCESS 是同一条 step 的状态更新，故 2 行）
+        List<AiAgentStep> steps = captureSteps();
+        assertThat(steps).hasSize(2);
+        assertThat(steps.get(0).getThoughtSummary()).isEqualTo("先看看你今天的学习计划");
+        assertThat(steps.get(1).getThoughtSummary()).isNull();
     }
 
     @Test

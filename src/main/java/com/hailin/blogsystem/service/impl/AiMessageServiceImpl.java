@@ -11,10 +11,13 @@ import com.hailin.blogsystem.ai.agent.AgentStepEmitter;
 import com.hailin.blogsystem.ai.agent.AgentWorkflowSuggestion;
 import com.hailin.blogsystem.ai.agent.AgentWriteProposal;
 import com.hailin.blogsystem.ai.agent.AgentRuntimeRouteRegistry;
+import com.hailin.blogsystem.ai.agent.ArticleSessionAnchorService;
 import com.hailin.blogsystem.ai.agent.ArticleAgentRuntime;
 import com.hailin.blogsystem.ai.agent.GeneralAgentRuntime;
 import com.hailin.blogsystem.ai.agent.LearningAgentRuntime;
 import com.hailin.blogsystem.ai.planner.AgentPlannerSupport;
+import com.hailin.blogsystem.ai.qa.ArticleQaTargetResolver;
+import com.hailin.blogsystem.ai.qa.ArticleQaTargetResolver.QaTarget;
 import com.hailin.blogsystem.ai.trace.AgentDecisionTrace;
 import com.hailin.blogsystem.ai.trace.AgentDecisionTraceSink;
 import com.hailin.blogsystem.ai.workflow.CreateArticleWorkflowHandler;
@@ -85,6 +88,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
     private final ArticleAgentRuntime articleAgentRuntime;
     private final GeneralAgentRuntime generalAgentRuntime;
     private final AgentRuntimeRouteRegistry agentRuntimeRouteRegistry;
+    private final ArticleSessionAnchorService articleSessionAnchorService;
+    private final ArticleQaTargetResolver articleQaTargetResolver;
 
     private static final String ROLE_USER = "user";
     private static final String ROLE_ASSISTANT = "assistant";
@@ -370,15 +375,21 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
 
 
         AiArticleActionCommand articleActionFromIntent = buildArticleActionFromDecision(routeDecision, intent, pageContext);
-        String extraPromptContext = buildExtraPromptContextFromIntent(intent, pageContext);
+        // V3.8：页面 ACTION（点赞/收藏等明确围绕当前文章的操作）→ 会话锚写点（PAGE_ACTION）
+        markAnchorForPageAction(sessionId, articleActionFromIntent, pageContext);
 
         /*
-         * 是否读取当前文章，由 Planner 的 retrievalMode 决定。
-         * 这里的 intent 只负责提供 articleId 等结构化数据。
+         * V3.9：QA 目标单点决议（每请求一次，正文注入与来源卡共用同一决议，永不分叉）。
+         * 决议含可读加载（页面文章 / 会话锚 / 追问态 / 说明态），只读不写。
          */
+        QaTarget qaTarget = routeDecision.usesRetrieval("CURRENT_ARTICLE")
+                ? articleQaTargetResolver.resolve(message, pageContext, sessionId, userId)
+                : null;
+
+        String extraPromptContext = buildExtraPromptContextFromIntent(intent, pageContext);
         if ((extraPromptContext == null || extraPromptContext.isBlank())
-                && routeDecision.usesRetrieval("CURRENT_ARTICLE")) {
-            extraPromptContext = buildArticleDetailContextFromIntent(intent, pageContext);
+                && qaTarget != null) {
+            extraPromptContext = buildArticleDetailContextFromQaTarget(qaTarget, sessionId);
         }
 
         AiNavigateCommand navigateFromIntent = buildNavigateFromDecision(routeDecision, intent, pageContext);
@@ -398,7 +409,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         boolean currentArticleRetrieval = routeDecision.usesRetrieval("CURRENT_ARTICLE");
         boolean articleSearchRetrieval = routeDecision.usesRetrieval("ARTICLE_SEARCH");
 
-        ArticleRagContext currentArticleReference = buildCurrentArticleReference(routeDecision, intent, pageContext);
+        ArticleRagContext currentArticleReference = buildCurrentArticleReferenceFromQaTarget(qaTarget);
 
         List<ArticleRagContext> ragContexts;
 
@@ -625,16 +636,21 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
          * 与 Workflow 的 Flux.create + boundedElastic 模式一致。
          */
         Flux<AiChatEventVO> agentEvents = Flux.create(sink -> {
-            AgentStepEmitter emitter = (stepNo, actionType, status, stepMessage) ->
-                    emitIfOpen(sink, AiChatEventVO.builder()
-                            .eventType(AiChatEventType.AGENT_STEP.getValue())
-                            .eventData(Map.of(
-                                    "stepNo", stepNo,
-                                    "actionType", actionType,
-                                    "status", status,
-                                    "message", stepMessage
-                            ))
-                            .build());
+            AgentStepEmitter emitter = (stepNo, actionType, status, stepMessage, thoughtSummary) -> {
+                // 注意：不能用 Map.of——thoughtSummary 允许 null（V3.10 D3 空值可容忍），
+                // Map.of 遇 null value 直接抛 NPE 会让整个 Agent run FAILED
+                Map<String, Object> data = new HashMap<>();
+                data.put("stepNo", stepNo);
+                data.put("actionType", actionType);
+                data.put("status", status);
+                data.put("message", stepMessage);
+                // V3.10：思考摘要（清洗后，nullable；前端行文本优先于 message）
+                data.put("thoughtSummary", thoughtSummary);
+                emitIfOpen(sink, AiChatEventVO.builder()
+                        .eventType(AiChatEventType.AGENT_STEP.getValue())
+                        .eventData(data)
+                        .build());
+            };
 
             Schedulers.boundedElastic().schedule(() -> {
                 UserContext.set(userId);
@@ -1915,15 +1931,16 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 routeDecision.isTool("getLearningDashboard")
         );
 
+        // V3.9：QA 目标单点决议（与主分发同款——正文注入与来源卡共用同一决议）
+        QaTarget qaTarget = routeDecision.usesRetrieval("CURRENT_ARTICLE")
+                ? articleQaTargetResolver.resolve(message, pageContext, sessionId, userId)
+                : null;
+
         List<ArticleRagContext> ragContexts;
 
         if (routeDecision.usesRetrieval("CURRENT_ARTICLE")) {
             ArticleRagContext currentArticleReference =
-                    buildCurrentArticleReference(
-                            routeDecision,
-                            intent,
-                            pageContext
-                    );
+                    buildCurrentArticleReferenceFromQaTarget(qaTarget);
 
             ragContexts = currentArticleReference == null
                     ? List.of()
@@ -1950,9 +1967,9 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
 
         if ((extraPromptContext == null
                 || extraPromptContext.isBlank())
-                && routeDecision.usesRetrieval("CURRENT_ARTICLE")) {
+                && qaTarget != null) {
             extraPromptContext =
-                    buildArticleDetailContextFromIntent(intent, pageContext);
+                    buildArticleDetailContextFromQaTarget(qaTarget, sessionId);
         }
 
         appendExtraPromptContext(prompt, extraPromptContext);
@@ -2476,9 +2493,16 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         }
 
         AiArticleActionCommand articleActionFromIntent = buildArticleActionFromDecision(guestDecision, intent, pageContext);
+
+        // V3.9：游客无归属会话（sessionId/userId null）→ 无会话锚，QA 决议只剩页面候选或说明态
+        QaTarget qaTarget = guestDecision.usesRetrieval("CURRENT_ARTICLE")
+                ? articleQaTargetResolver.resolve(message, pageContext, null, null)
+                : null;
         String extraPromptContext = buildExtraPromptContextFromIntent(intent, pageContext);
-        if (extraPromptContext == null || extraPromptContext.isBlank()) {
-            extraPromptContext = buildArticleDetailContextFromIntent(intent, pageContext);
+        if ((extraPromptContext == null || extraPromptContext.isBlank())
+                && qaTarget != null) {
+            // 游客流 sessionId 为 null（会话锚写点跳过）
+            extraPromptContext = buildArticleDetailContextFromQaTarget(qaTarget, null);
         }
 
         AiNavigateCommand navigateFromIntent = buildNavigateFromDecision(guestDecision, intent, pageContext);
@@ -2495,7 +2519,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         boolean currentArticleRetrieval = guestDecision.usesRetrieval("CURRENT_ARTICLE");
         boolean articleSearchRetrieval = guestDecision.usesRetrieval("ARTICLE_SEARCH");
 
-        ArticleRagContext currentArticleReference = buildCurrentArticleReference(guestDecision, intent, pageContext);
+        ArticleRagContext currentArticleReference = buildCurrentArticleReferenceFromQaTarget(qaTarget);
 
         List<ArticleRagContext> ragContexts;
 
@@ -2688,6 +2712,27 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
     }
 
 
+    /**
+     * V3.8：页面 ACTION（点赞/收藏/关注等围绕当前文章的明确操作）→ 会话锚写点（PAGE_ACTION）。
+     * 仅在已解析出页面动作且 pageContext 带当前文章 ID 时写；ID 非法/无动作不写。
+     * 不校验文章存在（mark 只记上下文，resolve 读取时查库判有效性——锚不会指到失效文章）。
+     */
+    private void markAnchorForPageAction(Long sessionId, AiArticleActionCommand action, PageContextDTO pageContext) {
+        if (action == null || sessionId == null || pageContext == null) {
+            return;
+        }
+        String articleId = pageContext.getArticleId();
+        if (articleId == null || articleId.isBlank()) {
+            return;
+        }
+        try {
+            articleSessionAnchorService.mark(sessionId, Long.valueOf(articleId.trim()),
+                    ArticleSessionAnchorService.SOURCE_PAGE_ACTION);
+        } catch (NumberFormatException e) {
+            // 页面文章 ID 非法，不写
+        }
+    }
+
     //第一个：根据意图生成文章动作。
     private AiArticleActionCommand buildArticleActionFromDecision(
             AgentDecision decision,
@@ -2847,43 +2892,30 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         return command;
     }
 
-    //关于文章详情页的文章总结
-    private String buildArticleDetailContextFromIntent(AiIntent intent,PageContextDTO pageContext){
-        if(intent == null || !"ARTICLE_DETAIL_QA".equals(intent.getIntent())){
+    /**
+     * QA 正文注入（V3.9）：resolver 单点决议结果 → 文章上下文 prompt 或追问/说明态文案。
+     * target：拼文章内容注入 + 锚写点（PAGE_QA，同 id 幂等）；promptNote：直接作为注入文案。
+     * 文章已由 resolver 完成可读加载，这里不再查库（读权限与加载一致性收口在 resolver）。
+     */
+    private String buildArticleDetailContextFromQaTarget(QaTarget qaTarget, Long sessionId){
+        if (qaTarget == null) {
             return null;
         }
-
-        String articleId = resolveArticleIdFromIntent(intent,pageContext);
-
-        if (articleId == null || articleId.isBlank()) {
-            return "用户想询问当前文章内容，但缺少 articleId，无法读取文章详情。";
+        if (!qaTarget.hasArticle()) {
+            return qaTarget.promptNote();
         }
 
-        Long id;
-        try{
-            id = Long.valueOf(articleId);
-        }
-        catch (Exception e){
-            return "当前文章ID格式错误，无法读取文章详情。";
-        }
+        Articles article = qaTarget.article();
 
-        Articles article = articlesService.lambdaQuery()
-                .select(
-                        Articles::getId,
-                        Articles::getTitle,
-                        Articles::getSummary,
-                        Articles::getContent
-                )
-                .eq(Articles::getId,id)
-                .eq(Articles::getStatus, BlogConstants.ArticlesStatus.PUBLISHED)
-                .one();
-
-        if (article == null) {
-            return "当前文章不存在或未发布。";
+        // V3.8：QA 命中文章 = 用户明确围绕这篇文章 → 会话文章锚写点（PAGE_QA）。
+        // 游客流 sessionId 为 null 不写（会话锚无归属意义）。
+        if (sessionId != null) {
+            articleSessionAnchorService.mark(sessionId, article.getId(),
+                    ArticleSessionAnchorService.SOURCE_PAGE_QA);
         }
 
         StringBuilder sb = new StringBuilder();
-        sb.append("当前文章内容：\n");
+        sb.append("用户询问的文章内容：\n");
         sb.append("标题：").append(article.getTitle()).append("\n");
 
         if (article.getSummary() != null && !article.getSummary().isBlank()) {
@@ -2895,7 +2927,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 .append("\n");
 
         sb.append("\n请基于以上文章内容回答用户问题，不要编造文章中没有的信息。");
-        sb.append("回答中的关键结论后面请使用来源编号 [1]，因为当前文章会作为参考来源 [1] 展示。");
+        sb.append("回答中的关键结论后面请使用来源编号 [1]，因为这篇文章会作为参考来源 [1] 展示。");
 
         return sb.toString();
     }
@@ -2909,71 +2941,20 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         return text.substring(0, maxLength) + "\n\n[文章内容过长，后半部分已省略]";
     }
 
-    private String resolveArticleIdFromIntent(AiIntent intent,PageContextDTO pageContext){
-        String articleId = intent == null ? null : intent.getArticleId();
-
-        if((articleId == null || articleId.isBlank())
-        && pageContext != null
-        && !pageContext.getArticleId().isBlank()
-        && pageContext.getArticleId() != null){
-            articleId = pageContext.getArticleId();
-        }
-
-        return articleId;
-    }
-
     /**
-     * 根据 Planner 的检索模式加载当前文章引用。
-     *
-     * retrievalMode 决定是否读取当前文章；
-     * intent/pageContext 只提供 articleId 候选。
+     * QA 来源卡（V3.9）：resolver 单点决议结果 → ArticleRagContext（来源 [1]）或 null。
+     * 追问态/说明态无文章可引 → null（ragContexts 空，正文注入位已带 promptNote）。
      */
-    private ArticleRagContext buildCurrentArticleReference(
-            AgentDecision decision,
-            AiIntent intent,
-            PageContextDTO pageContext
-    ) {
-        if (decision == null
-                || !decision.usesRetrieval("CURRENT_ARTICLE")) {
+    private ArticleRagContext buildCurrentArticleReferenceFromQaTarget(QaTarget qaTarget) {
+        if (qaTarget == null || !qaTarget.hasArticle()) {
             return null;
         }
 
-        String articleId =
-                resolveArticleIdFromIntent(intent, pageContext);
-
-        if (articleId == null || articleId.isBlank()) {
-            return null;
-        }
-
-        Long id;
-
-        try {
-            id = Long.valueOf(articleId);
-        } catch (Exception e) {
-            return null;
-        }
-
-        Articles article = articlesService.lambdaQuery()
-                .select(
-                        Articles::getId,
-                        Articles::getTitle,
-                        Articles::getSummary,
-                        Articles::getContent
-                )
-                .eq(Articles::getId, id)
-                .eq(
-                        Articles::getStatus,
-                        BlogConstants.ArticlesStatus.PUBLISHED
-                )
-                .one();
-
-        if (article == null) {
-            return null;
-        }
+        Articles article = qaTarget.article();
 
         StringBuilder snippet = new StringBuilder();
 
-        snippet.append("当前文章内容：\n");
+        snippet.append("用户询问的文章内容：\n");
         snippet.append("标题：")
                 .append(article.getTitle())
                 .append("\n");
@@ -3094,6 +3075,28 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         if (workflowRunId != null) {
             cleanupWorkflowIfNoMessageReferences(session, workflowRunId);
         }
+
+        // V3.8：会话消息删光 = 会话里不再有"刚刚/那篇"可指 → 清会话文章锚。
+        // （实测 2026-09-07：用户删光消息后继续发"把刚刚那篇隐藏了"，锚仍指向已删对话里的文章，
+        // 造成"删光了 AI 还记得"的困惑；消息归零则锚归零，符合"清空对话 = 上下文归零"的心智。）
+        clearArticleAnchorIfSessionEmpty(sessionId);
+    }
+
+    /** V3.8：会话内消息数为 0 时清空文章锚（含全部消息被逐条删除的场景）。 */
+    private void clearArticleAnchorIfSessionEmpty(Long sessionId) {
+        Long remaining = lambdaQuery()
+                .eq(AiMessages::getSessionId, sessionId)
+                .count();
+        if (remaining != null && remaining > 0) {
+            return;
+        }
+        aiSessionService.lambdaUpdate()
+                .eq(AiSessions::getId, sessionId)
+                .set(AiSessions::getLastArticleId, null)
+                .set(AiSessions::getLastArticleTitle, null)
+                .set(AiSessions::getLastArticleSource, null)
+                .set(AiSessions::getLastArticleUpdatedAt, null)
+                .update();
     }
 
     /** 删除消息后联动清理：若 Workflow 已无消息引用且已结束，连带删除 step log 和 run */

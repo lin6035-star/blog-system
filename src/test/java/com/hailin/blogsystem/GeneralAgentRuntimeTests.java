@@ -171,7 +171,7 @@ class GeneralAgentRuntimeTests {
 
         List<String[]> events = new java.util.ArrayList<>();
         runtime.run(100L, 200L, "结合我的情况给个建议",
-                null, (stepNo, actionType, status, message) ->
+                null, (stepNo, actionType, status, message, thoughtSummary) ->
                         events.add(new String[]{String.valueOf(stepNo), actionType, status, message}));
 
         assertThat(events).hasSize(3);

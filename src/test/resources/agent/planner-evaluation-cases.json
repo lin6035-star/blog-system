@@ -238,7 +238,7 @@
     "expectedToolName": null,
     "expectedClientActionType": null,
     "expectedRuleHit": "article_detail_qa_intent",
-    "expectedReasonContains": "当前文章",
+    "expectedReasonContains": "QA resolver",
     "autoStartedCount": 0
   },
   {

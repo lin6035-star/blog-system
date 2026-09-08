@@ -98,13 +98,35 @@ public abstract class AbstractAgentRuntime {
     protected abstract String summaryHeader();
 
     /** SUGGEST_WORKFLOW 建议携带的 articleId（仅文章域非空；学习域默认 null）。 */
-    protected String resolveSuggestionArticleId(PageContextDTO pageContext) {
+    protected String resolveSuggestionArticleId(PageContextDTO pageContext, AiAgentRun run) {
         return null;
     }
 
-    /** 决策目标（学习域原样；文章域注入当前文章线索）。 */
-    protected String effectiveGoal(String goal, PageContextDTO pageContext) {
+    /** 决策目标（学习域原样；文章域注入当前文章 + 会话锚候选线索）。 */
+    protected String effectiveGoal(String goal, Long userId, Long sessionId, PageContextDTO pageContext) {
         return goal;
+    }
+
+    /**
+     * V3.8：每步决策后解析本 run 的定位目标（文章域用；默认不解析）。
+     * 决议结果存 run.targetArticleId（瞬态，不落库）。解析失败（目标候选缺失/无效）时置 null，
+     * 由动作执行层按缺失目标处理（FAILED step + observation，循环继续 LLM 收尾，不猜）。
+     */
+    protected void resolveStepTarget(AiAgentRun run, AgentStepDecision decision, PageContextDTO pageContext) {
+    }
+
+    /**
+     * V3.8：动作执行前对决策做后端预处理（文章域把决议目标并入 QUERY_ARTICLE 的 input；
+     * 默认原样返回）。终态动作（FINAL_ANSWER / ASK_USER / SUGGEST_*）不经此钩子。
+     */
+    protected AgentStepDecision prepareStepDecision(AiAgentRun run, AgentStepDecision decision) {
+        return decision;
+    }
+
+    /**
+     * V3.8：动作执行成功回调（文章域写会话锚；默认空）。执行失败不回调。
+     */
+    protected void onStepSucceeded(AiAgentRun run, AgentStepDecision decision, String observation) {
     }
 
     /**
@@ -185,7 +207,7 @@ public abstract class AbstractAgentRuntime {
             PageContextDTO pageContext,
             AgentStepEmitter emitter
     ) {
-        String effectiveGoal = effectiveGoal(goal, pageContext);
+        String effectiveGoal = effectiveGoal(goal, userId, sessionId, pageContext);
         AiAgentRun run = createRun(userId, sessionId, effectiveGoal);
         log.info("Agent Run 创建: runId={}, userId={}, goal={}", run.getId(), userId, truncate(effectiveGoal, 100));
 
@@ -208,9 +230,12 @@ public abstract class AbstractAgentRuntime {
                     String detail = decision == null || decision.actionType() == null
                             ? "空决策"
                             : "非法动作: " + decision.actionType();
-                    emitter.emit(nextStepNo, "DECISION", "FAILED", "决策无效：" + detail);
+                    emitter.emit(nextStepNo, "DECISION", "FAILED", "决策无效：" + detail, null);
                     return markFailed(run, "Agent 决策无效（" + detail + "）");
                 }
+
+                // V3.8：解析本 run 定位目标（在扩展终态与动作执行前，SUGGEST_WRITE 提案端消费 run 决议目标）
+                resolveStepTarget(run, decision, pageContext);
 
                 // 领域扩展终态（学习域 SUGGEST_WRITE 在此处理）
                 AgentRunResult extra = handleExtraTerminalAction(
@@ -226,13 +251,15 @@ public abstract class AbstractAgentRuntime {
 
                 // 终态：FINAL_ANSWER
                 if (decision.actionType() == AgentStepActionType.FINAL_ANSWER) {
-                    emitter.emit(nextStepNo, "FINAL_ANSWER", "SUCCESS", finalAnswerSuccessMessage());
+                    emitter.emit(nextStepNo, "FINAL_ANSWER", "SUCCESS",
+                            finalAnswerSuccessMessage(), decision.thoughtSummary());
                     return completeWithAnswer(run, decision, observations);
                 }
 
                 // 终态：ASK_USER（问题快照留 run）
                 if (decision.actionType() == AgentStepActionType.ASK_USER) {
-                    emitter.emit(nextStepNo, "ASK_USER", "SUCCESS", "需要向你确认一个问题");
+                    emitter.emit(nextStepNo, "ASK_USER", "SUCCESS",
+                            "需要向你确认一个问题", decision.thoughtSummary());
                     return markWaitingUser(run, decision, observations);
                 }
 
@@ -242,7 +269,8 @@ public abstract class AbstractAgentRuntime {
                 if (decision.actionType() == AgentStepActionType.SUGGEST_WORKFLOW) {
                     if (observations.isEmpty()) {
                         String rejectReason = "首轮零观察建议被拒绝：必须先执行至少一个只读查询";
-                        emitter.emit(nextStepNo, "SUGGEST_WORKFLOW", "FAILED", "建议被拒绝：需先完成一次查询");
+                        emitter.emit(nextStepNo, "SUGGEST_WORKFLOW", "FAILED",
+                                "建议被拒绝：需先完成一次查询", null);
                         recordRejectedStep(run, decision, nextStepNo, rejectReason);
                         observations.add(suggestWorkflowRejectHint());
                         run.setCurrentStep(nextStepNo);
@@ -256,10 +284,14 @@ public abstract class AbstractAgentRuntime {
                 }
 
                 // 执行只读动作（执行前后推步骤事件，前端实时渲染思考过程）
+                // V3.10：RUNNING/SUCCESS 携带同一句 thoughtSummary（行文本跨状态稳定，D4），
+                // FAILED 不携带——失败时优先展示失败文案，不让动机句覆盖失败原因
                 emitter.emit(nextStepNo, decision.actionType().name(), "RUNNING",
-                        "正在" + actionLabel(decision.actionType()) + "...");
+                        "正在" + actionLabel(decision.actionType()) + "...", decision.thoughtSummary());
+                // V3.8：后端预处理（决议目标并入 QUERY_ARTICLE input）
+                AgentStepDecision prepared = prepareStepDecision(run, decision);
                 String observation = executeActionAndRecordStep(
-                        run, decision, userId, nextStepNo, emitter, pageContext
+                        run, prepared, userId, nextStepNo, emitter, pageContext
                 );
                 observations.add(observation);
 
@@ -363,6 +395,7 @@ public abstract class AbstractAgentRuntime {
         step.setAgentRunId(run.getId());
         step.setStepNo(stepNo);
         step.setActionType(decision.actionType().name());
+        step.setThoughtSummary(decision.thoughtSummary());
         step.setInputJson(toJson(decision.input()));
         step.setStatus(AiAgentStepStatus.RUNNING.name());
         step.setCreatedAt(LocalDateTime.now());
@@ -376,7 +409,9 @@ public abstract class AbstractAgentRuntime {
             stepMapper.updateById(step);
             log.info("Agent Step 成功: runId={}, stepNo={}, action={}", run.getId(), stepNo, decision.actionType());
             emitter.emit(stepNo, decision.actionType().name(), "SUCCESS",
-                    "已完成" + actionLabel(decision.actionType()));
+                    "已完成" + actionLabel(decision.actionType()), decision.thoughtSummary());
+            // V3.8：执行成功领域回调（文章域写会话锚）
+            onStepSucceeded(run, decision, observation);
             return clipObservation(observation);
         } catch (Exception e) {
             log.warn("Agent Step 执行失败: runId={}, stepNo={}, action={}",
@@ -386,7 +421,7 @@ public abstract class AbstractAgentRuntime {
             step.setErrorMessage(truncate(e.getMessage(), 300));
             stepMapper.updateById(step);
             emitter.emit(stepNo, decision.actionType().name(), "FAILED",
-                    actionLabel(decision.actionType()) + "失败");
+                    actionLabel(decision.actionType()) + "失败", null);
             // 终局失败（如文章归属校验失败）：失败 step 已落库，直接抛出内部信号收尾
             if (isTerminalFailure(e)) {
                 throw new AgentRunTerminalException(stepNo, e.getMessage());
@@ -400,7 +435,14 @@ public abstract class AbstractAgentRuntime {
             AgentStepDecision decision,
             List<String> observations
     ) {
+        // answer 键兼容回退（实测 2026-09-07：模型偶发把正文写进 message 键，内容被吞成兜底文案）
         Object answer = decision.input() == null ? null : decision.input().get("answer");
+        if (answer == null || String.valueOf(answer).isBlank()) {
+            Object message = decision.input() == null ? null : decision.input().get("message");
+            if (message != null && !String.valueOf(message).isBlank()) {
+                answer = message;
+            }
+        }
         String finalAnswer = answer == null || String.valueOf(answer).isBlank()
                 ? emptyAnswerFallback()
                 : String.valueOf(answer);
@@ -414,7 +456,14 @@ public abstract class AbstractAgentRuntime {
             AgentStepDecision decision,
             List<String> observations
     ) {
+        // question 键兼容回退（与 FINAL_ANSWER 的 answer/message 同款防呆：模型偶发写 message 键）
         Object question = decision.input() == null ? null : decision.input().get("question");
+        if (question == null || String.valueOf(question).isBlank()) {
+            Object message = decision.input() == null ? null : decision.input().get("message");
+            if (message != null && !String.valueOf(message).isBlank()) {
+                question = message;
+            }
+        }
         String questionText = question == null || String.valueOf(question).isBlank()
                 ? emptyAskUserFallback()
                 : String.valueOf(question);
@@ -461,7 +510,7 @@ public abstract class AbstractAgentRuntime {
         String workflowType = text(input, "workflowType");
         if (workflowType == null || !allowedSuggestWorkflowTypes().contains(workflowType)) {
             emitter.emit(run.getUsedSteps() + 1, "SUGGEST_WORKFLOW", "FAILED",
-                    "建议的流程类型不在允许范围");
+                    "建议的流程类型不在允许范围", null);
             return markFailed(run, "Agent 建议的 Workflow 类型不在允许范围内（" + workflowType + "）");
         }
         String reason = text(input, "reason");
@@ -482,11 +531,11 @@ public abstract class AbstractAgentRuntime {
                 truncate(reason, 500),
                 truncate(initialMessage, 500),
                 risk,
-                resolveSuggestionArticleId(pageContext)
+                resolveSuggestionArticleId(pageContext, run)
         );
 
         emitter.emit(run.getUsedSteps() + 1, "SUGGEST_WORKFLOW", "SUCCESS",
-                "建议启动「" + workflowLabel(workflowType) + "」流程");
+                "建议启动「" + workflowLabel(workflowType) + "」流程", decision.thoughtSummary());
         recordTerminalStep(run, decision, run.getUsedSteps() + 1);
         run.setStatus(AiAgentRunStatus.WAITING_WORKFLOW_CONFIRM.name());
         // 正文直接用 reason（不带"建议启动「X」："前缀，建议卡已展示类型）
@@ -541,6 +590,7 @@ public abstract class AbstractAgentRuntime {
         step.setAgentRunId(run.getId());
         step.setStepNo(stepNo);
         step.setActionType(decision.actionType().name());
+        step.setThoughtSummary(decision.thoughtSummary());
         step.setInputJson(toJson(decision.input()));
         step.setStatus(AiAgentStepStatus.SUCCESS.name());
         step.setDurationMs(0L);

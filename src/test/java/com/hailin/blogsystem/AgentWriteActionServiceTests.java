@@ -85,6 +85,18 @@ class AgentWriteActionServiceTests {
             + "\"articleId\":\"1\","
             + "\"articleTitle\":\"Published Article\"}}";
 
+    /** V3.7：隐藏文章提案（前置 PUBLISHED 由动作推导，proposal 不加状态锚） */
+    private static final String PROPOSAL_HIDE_CONTEXT = "{\"pendingWriteAction\":{"
+            + "\"actionType\":\"HIDE_ARTICLE\","
+            + "\"articleId\":\"1\","
+            + "\"articleTitle\":\"Published Article\"}}";
+
+    /** V3.7：公开文章提案（前置 HIDDEN 由动作推导） */
+    private static final String PROPOSAL_PUBLISH_CONTEXT = "{\"pendingWriteAction\":{"
+            + "\"actionType\":\"PUBLISH_ARTICLE\","
+            + "\"articleId\":\"1\","
+            + "\"articleTitle\":\"Published Article\"}}";
+
     private AiAgentRunMapper runMapper;
     private LearningStageMapper learningStageMapper;
     private WorkflowActionLock actionLock;
@@ -490,11 +502,69 @@ class AgentWriteActionServiceTests {
     }
 
     private Articles article(Long id, Long authorId, String title) {
+        return article(id, authorId, title, null);
+    }
+
+    private Articles article(Long id, Long authorId, String title, Integer status) {
         Articles article = new Articles();
         article.setId(id);
         article.setAuthorId(authorId);
         article.setTitle(title);
+        article.setStatus(status);
         return article;
+    }
+
+    @Test
+    void confirmHideArticleHidesAndRecordsSnapshot() {
+        // V3.7：HIDE_ARTICLE → 前置 stale 校验通过（当前 PUBLISHED）→ updateArticleVisibility(expected=PUBLISHED, target=HIDDEN)
+        when(runMapper.selectById(1L)).thenReturn(
+                run(1L, "WAITING_WRITE_CONFIRM", PROPOSAL_HIDE_CONTEXT));
+        when(runMapper.update(any(AiAgentRun.class), any())).thenReturn(1);
+        when(articlesService.getById(1L))
+                .thenReturn(article(1L, 100L, "Published Article", 1),
+                        article(1L, 100L, "Published Article", 2));
+
+        String result = service.confirmWrite(1L);
+
+        assertThat(result).contains("已将文章《Published Article》隐藏");
+        verify(articlesService).updateArticleVisibility(eq(1L), eq(1), eq(2), eq(100L));
+        verify(learningPlansService, never()).updateTaskDone(any(), any(), anyInt(), anyBoolean(), any());
+        ArgumentCaptor<AiAgentRun> patchCaptor = ArgumentCaptor.forClass(AiAgentRun.class);
+        verify(runMapper, atLeastOnce()).updateById(patchCaptor.capture());
+        AiAgentRun patch = patchCaptor.getValue();
+        assertThat(patch.getContextJson()).contains("beforeArticle");
+        assertThat(patch.getContextJson()).contains("afterArticle");
+    }
+
+    @Test
+    void confirmHideArticleRejectsWhenStatusChangedSinceProposal() {
+        // V3.7 前置 stale：提案后文章已被并发改状态（当前 HIDDEN 而非 PUBLISHED）→ 拒绝不误写
+        when(runMapper.selectById(1L)).thenReturn(
+                run(1L, "WAITING_WRITE_CONFIRM", PROPOSAL_HIDE_CONTEXT));
+        when(runMapper.update(any(AiAgentRun.class), any())).thenReturn(1);
+        when(articlesService.getById(1L)).thenReturn(article(1L, 100L, "Published Article", 2));
+
+        assertThatThrownBy(() -> service.confirmWrite(1L))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("文章状态已变化");
+        verify(articlesService, never()).updateArticleVisibility(any(), any(), any(), any());
+    }
+
+    @Test
+    void confirmPublishArticlePublishesHiddenArticle() {
+        // V3.7：PUBLISH_ARTICLE → 前置 stale 校验通过（当前 HIDDEN）→ updateArticleVisibility(expected=HIDDEN, target=PUBLISHED)
+        when(runMapper.selectById(1L)).thenReturn(
+                run(1L, "WAITING_WRITE_CONFIRM", PROPOSAL_PUBLISH_CONTEXT));
+        when(runMapper.update(any(AiAgentRun.class), any())).thenReturn(1);
+        when(articlesService.getById(1L))
+                .thenReturn(article(1L, 100L, "Published Article", 2),
+                        article(1L, 100L, "Published Article", 1));
+
+        String result = service.confirmWrite(1L);
+
+        assertThat(result).contains("已将文章《Published Article》公开");
+        verify(articlesService).updateArticleVisibility(eq(1L), eq(2), eq(1), eq(100L));
+        verify(articlesService, never()).updateArticleTitle(any(), any(), any(), any());
     }
 
     private AiAgentRun run(Long id, String status, String contextJson) {

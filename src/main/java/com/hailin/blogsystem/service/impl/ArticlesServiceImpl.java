@@ -168,7 +168,16 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
         }
 
         if(RedisConstants.CACHE_NULL_VALUE.equals(json)){
-            return null;
+            // 登录用户可能是文章作者（隐藏文章对本人可见，V3.7 修复）：删空值缓存回源一次——
+            // 非作者访问会由 DB 路径重写空值缓存，无泄露
+            if (UserContext.get() == null) {
+                return null;
+            }
+            try {
+                stringRedisTemplate.delete(key);
+            } catch (Exception e) {
+                // Redis 删除失败不影响：下面继续走 DB 查询
+            }
         }
 
         ArticleDetailVO vo = getArticleDetailFromCache(id);
@@ -180,8 +189,7 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
             if(vo == null){
                 return null;
             }
-
-            saveArticleDetailToCache(id,vo);
+            // 共享缓存写入已内聚到 getArticleDetailFromDb（仅 PUBLISHED 写，防隐藏文章缓存泄露）
         }
 
         if(userId == null || !userId.equals(vo.getAuthorId())){
@@ -507,6 +515,57 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
         deleteArticleDetailCache(id);
         deleteArticleListCache();
         syncArticleRagIndex(articles);  // 状态取自更新前行（改名不动状态）：已发布 → 重刷 RAG doc（含标题）
+    }
+
+    /**
+     * V3.7 Agent 受控写（HIDE_ARTICLE / PUBLISH_ARTICLE）专用：原子条件状态更新。
+     * 不直接复用 hideArticle/publishArticle（无条件 set status，confirm 前置校验到执行之间有 TOCTOU——
+     * run 状态 CAS 只挡同 run 并发，挡不住文章被其他请求改状态）。
+     * expectedStatus 前置进 WHERE（动作前置可从方向推导：HIDE 前置 PUBLISHED / PUBLISH 前置 HIDDEN），
+     * 0 行 = 提案后状态已被并发修改 → 拒绝不覆盖。成功后按 targetStatus 对齐 hideArticle/publishArticle 副作用。
+     */
+    @Override
+    @Transactional
+    public void updateArticleVisibility(Long id, Integer expectedStatus, Integer targetStatus, Long userId) {
+        Articles articles = getById(id);
+        if (articles == null) {
+            throw new IllegalArgumentException("未找到该博文");
+        }
+        if (!articles.getAuthorId().equals(userId)) {
+            throw new IllegalArgumentException("无权操作该文章");
+        }
+
+        boolean updated;
+        if (Objects.equals(targetStatus, BlogConstants.ArticlesStatus.PUBLISHED)) {
+            // 公开：publishedAt=now（与编辑器「重新发布」一致——首次发布的语义时间被重置，属现有行为）
+            updated = lambdaUpdate()
+                    .eq(Articles::getId, id)
+                    .eq(Articles::getAuthorId, userId)
+                    .eq(Articles::getStatus, expectedStatus)
+                    .set(Articles::getStatus, targetStatus)
+                    .set(Articles::getPublishedAt, LocalDateTime.now())
+                    .set(Articles::getUpdatedAt, LocalDateTime.now())
+                    .update();
+        } else {
+            updated = lambdaUpdate()
+                    .eq(Articles::getId, id)
+                    .eq(Articles::getAuthorId, userId)
+                    .eq(Articles::getStatus, expectedStatus)
+                    .set(Articles::getStatus, targetStatus)
+                    .set(Articles::getUpdatedAt, LocalDateTime.now())
+                    .update();
+        }
+        if (!updated) {
+            throw new IllegalArgumentException("文章状态已变化，请重新发起修改");
+        }
+
+        deleteArticleDetailCache(id);
+        deleteArticleListCache();
+        if (Objects.equals(targetStatus, BlogConstants.ArticlesStatus.PUBLISHED)) {
+            safelyIndexArticleRag(id);      // 公开：建 RAG 索引（对齐 publishArticle）
+        } else {
+            safelyDeleteArticleRagIndex(id); // 隐藏：删 RAG 索引（对齐 hideArticle）
+        }
     }
 
 
@@ -923,24 +982,25 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
 
 
     //拆一个“查文章基础详情”的方法
+    //可见性规则（V3.7 修复：隐藏文章作者本人可看）：PUBLISHED → 任何人可见；
+    //HIDDEN → 仅作者可见（共享缓存不写隐藏文章，防游客从缓存读到）；
+    //DRAFT → 维持不可见（草稿预览走编辑器）；不存在/不可见 → 写空值缓存防穿透
     private ArticleDetailVO getArticleDetailFromDb(Long id){
         Articles articles = lambdaQuery()
                 .eq(Articles::getId,id)
-                .eq(Articles::getStatus,BlogConstants.ArticlesStatus.PUBLISHED)
                 .one();
 
         if(articles == null){
-            try{
-                stringRedisTemplate.opsForValue().set(
-                        RedisConstants.ARTICLE_DETAIL_KEY_PREFIX + id,
-                        RedisConstants.CACHE_NULL_VALUE,
-                        RedisConstants.CACHE_NULL_TTL_MINUTES,
-                        TimeUnit.MINUTES
-                );
-            }catch(Exception e){
-                // 空值缓存写入失败不影响查询结果
-            }
+            writeNullDetailCache(id);
+            return null;
+        }
 
+        Long viewerId = UserContext.get();
+        boolean published = Objects.equals(articles.getStatus(), BlogConstants.ArticlesStatus.PUBLISHED);
+        boolean hiddenOwner = Objects.equals(articles.getStatus(), BlogConstants.ArticlesStatus.HIDDEN)
+                && viewerId != null && viewerId.equals(articles.getAuthorId());
+        if(!published && !hiddenOwner){
+            writeNullDetailCache(id);
             return null;
         }
 
@@ -948,7 +1008,25 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
 
         fillArticleMeta(vo);
 
+        if(published){
+            saveArticleDetailToCache(id,vo);
+        }
+
         return vo;
+    }
+
+    /** 文章详情空值缓存（防穿透；游客/非作者访问隐藏文章、草稿、不存在时写） */
+    private void writeNullDetailCache(Long id){
+        try{
+            stringRedisTemplate.opsForValue().set(
+                    RedisConstants.ARTICLE_DETAIL_KEY_PREFIX + id,
+                    RedisConstants.CACHE_NULL_VALUE,
+                    RedisConstants.CACHE_NULL_TTL_MINUTES,
+                    TimeUnit.MINUTES
+            );
+        }catch(Exception e){
+            // 空值缓存写入失败不影响查询结果
+        }
     }
 
     //从缓存中拿文章详情的方法

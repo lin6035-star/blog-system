@@ -1,6 +1,7 @@
 package com.hailin.blogsystem.entity;
 
 import com.baomidou.mybatisplus.annotation.IdType;
+import com.baomidou.mybatisplus.annotation.TableField;
 import com.baomidou.mybatisplus.annotation.TableId;
 import com.baomidou.mybatisplus.annotation.TableName;
 import lombok.Data;
@@ -67,6 +68,13 @@ public class AiAgentRun {
      * 最终回答文本（COMPLETED 时落库）。
      */
     private String finalAnswer;
+
+    /**
+     * V3.8 运行态（瞬态，不落库）：本 run 已决议的定位目标文章 ID。
+     * 决议发生在 resolveStepTarget（决策后），SUGGEST_WRITE 提案端与动作预处理消费。
+     */
+    @TableField(exist = false)
+    private Long targetArticleId;
 
     /**
      * 失败原因（FAILED 时记录，供排查与前端友好文案）。
