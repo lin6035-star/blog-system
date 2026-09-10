@@ -115,10 +115,11 @@
     "expectedSuggestedAction": "AGENT"
   },
   {
-    "name": "V3.8 回归：泛指对话外的文章不升级 ARTICLE_AGENT",
-    "category": "regression",
+    "name": "V3.8 分界：标题指代受控操作走 ARTICLE_AGENT（定位不到澄清）",
+    "category": "boundary",
     "message": "把我 Redis 那篇隐藏了",
-    "expectedIntent": "GENERAL_CHAT"
+    "expectedIntent": "ARTICLE_AGENT",
+    "expectedSuggestedAction": "AGENT"
   },
   {
     "name": "V3.9 首页近指文章内容问走 ARTICLE_DETAIL_QA",
@@ -141,10 +142,11 @@
     "expectedIntent": "GENERAL_CHAT"
   },
   {
-    "name": "V3.9 分界：标题特征指本对话外文章不判 ARTICLE_DETAIL_QA",
+    "name": "V3.9 分界：标题指代内容问走 ARTICLE_DETAIL_QA（定位不到澄清）",
     "category": "boundary",
     "message": "Redis 缓存那篇讲了什么",
-    "expectedIntent": "GENERAL_CHAT"
+    "expectedIntent": "ARTICLE_DETAIL_QA",
+    "expectedSuggestedAction": "CHAT"
   },
   {
     "name": "V3.9 分界：找站内文章走 ARTICLE_SEARCH 不漂移到 QA",

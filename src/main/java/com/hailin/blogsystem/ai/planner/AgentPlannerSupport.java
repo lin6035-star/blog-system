@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hailin.blogsystem.config.BlogAiProperties;
 import com.hailin.blogsystem.entity.AiSessions;
 import com.hailin.blogsystem.entity.AiWorkflowRun;
+import com.hailin.blogsystem.entity.Articles;
 import com.hailin.blogsystem.entity.dto.AgentAction;
 import com.hailin.blogsystem.entity.dto.AgentDecision;
 import com.hailin.blogsystem.entity.dto.AiIntent;
@@ -380,9 +381,10 @@ public class AgentPlannerSupport {
             ruleHits.add("article_context_missing");
             // V3.8：页面无文章 → 会话文章锚兜底（resolve 已校验文章存在 + 归属本人）。
             // 放行 = 只给候选，目标由 runtime 首步 anchorMode 消解，不在 Planner 定死。
-            ArticleSessionAnchorService.ArticleAnchor anchor =
-                    articleSessionAnchorService.resolve(
-                            session == null ? null : session.getId(), userId);
+            // 2026-09-10 手测修正：锚读改**可读语义**（他人公开文章也算）——原 owned 语义会让
+            // 聊过别人文章后说「刚刚那篇」直接被 CTA 拦住（读得到却进不去）。写路径归属校验不受影响。
+            Articles anchor = articleSessionAnchorService.resolveReadable(
+                    session == null ? null : session.getId(), userId);
             if (anchor != null) {
                 ruleHits.add("session_article_anchor_resolved");
                 return AgentDecision.builder()

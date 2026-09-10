@@ -54,9 +54,13 @@ public class ArticleAgentRuntime extends AbstractAgentRuntime implements AgentRu
             "OPTIMIZE_ARTICLE"
     );
 
+    /** V3.11 手测修正：验证-补查链多一步预算（典型链 读+拦+补查+答=4 步，留 1 步绕圈余量）。 */
+    private static final int ARTICLE_MAX_STEPS = 6;
+
     private final AgentStepDecider decider;
     private final ArticlesService articlesService;
     private final ArticleSessionAnchorService anchorService;
+    private final ArticleEvidenceVerifier evidenceVerifier;
 
     public ArticleAgentRuntime(
             ArticleAgentStepDecider decider,
@@ -65,12 +69,14 @@ public class ArticleAgentRuntime extends AbstractAgentRuntime implements AgentRu
             AiAgentStepMapper stepMapper,
             ObjectMapper objectMapper,
             ArticlesService articlesService,
-            ArticleSessionAnchorService anchorService
+            ArticleSessionAnchorService anchorService,
+            ArticleEvidenceVerifier evidenceVerifier
     ) {
         super(executor, runMapper, stepMapper, objectMapper);
         this.decider = decider;
         this.articlesService = articlesService;
         this.anchorService = anchorService;
+        this.evidenceVerifier = evidenceVerifier;
     }
 
     // ==================== 领域钩子 ====================
@@ -137,6 +143,105 @@ public class ArticleAgentRuntime extends AbstractAgentRuntime implements AgentRu
         return e instanceof ArticleNotOwnedException;
     }
 
+    /** V3.11 手测修正：验证-补查链步数预算（骨架默认 5，收敛门后典型链 读+拦+补查+答 需 5-6 步）。 */
+    @Override
+    protected int maxSteps() {
+        return ARTICLE_MAX_STEPS;
+    }
+
+    // ==================== V3.11 证据收敛门（文章域接线） ====================
+
+    /**
+     * V3.11：FINAL_ANSWER 前证据收敛门——规则闸（目标文章没读 → NEED_MORE）
+     * + 语义闸（草案 vs 证据支撑性）由 ArticleEvidenceVerifier 实现。
+     */
+    @Override
+    protected Verdict verifyBeforeFinalization(
+            AiAgentRun run,
+            AgentStepDecision decision,
+            List<String> observations,
+            List<AgentStepActionType> successfulActions
+    ) {
+        return evidenceVerifier.verify(run, decision, observations, successfulActions);
+    }
+
+    /**
+     * V3.11 到顶保守收尾门（S1/S1b）：
+     * - S1：目标文章已决议但从没成功读过 → 不给 summarize 假装分析的机会
+     * - S1b：证据收敛门拦过 NEED_MORE 且从未被满足 → 不足证据不硬答
+     */
+    @Override
+    protected boolean conservativeShutdownRequired(
+            AiAgentRun run,
+            List<AgentStepActionType> successfulActions,
+            boolean hasUnresolvedVerifierRejection
+    ) {
+        boolean articleNeverRead = run.getTargetArticleId() != null
+                && !(successfulActions != null
+                && successfulActions.contains(AgentStepActionType.QUERY_ARTICLE));
+        return articleNeverRead || hasUnresolvedVerifierRejection;
+    }
+
+    @Override
+    protected String conservativeShutdownMessage() {
+        return "目前收集到的信息还不足以让我给出可靠结论，我先不硬答。"
+                + "你可以换个更具体的问题，或让我重新分析一次。";
+    }
+
+    /** V3.11：NEED_MORE 拦截提示（带文章域补查动作指引，观察面向 LLM 可带动作名）。 */
+    @Override
+    protected String verifierRejectHint(Verdict verdict) {
+        return "系统提示：你的回答依据不足（缺 " + verdict.missingEvidenceLabel()
+                + "）：" + (verdict.reason() == null || verdict.reason().isBlank()
+                ? "证据不足以支撑该回答" : verdict.reason())
+                + "。请先补充查询再回答，不要编造：需要目标文章某段/某节细节用 QUERY_ARTICLE 且 input.focus"
+                + " 指明要哪一段；概念背景用 SEARCH_RAG；写作偏好用 QUERY_MEMORY。";
+    }
+
+    // ==================== V3.12 结论锚写点 A ====================
+
+    /**
+     * FINAL_ANSWER 终态写结论锚（V3.12 设计稿 §3.2 写点 A）。
+     *
+     * 四项条件全满足才写：
+     * 1. sessionId 非空（锚是会话级状态）
+     * 2. targetArticleId 非空（无目标文章 = 无「这篇文章的结论」）
+     * 3. successfulActions 含 QUERY_ARTICLE（**证据边界**）
+     * 4. finalAnswer 非空——由骨架保证（兜底文案不调本钩子）
+     *
+     * 条件 3 的说明：V3.11 的 R1 规则闸已保证「目标文章已决议未读 → 拦截」，
+     * 拦截后步数耗尽走保守收尾（到不了这里），所以正常路径下它冗余。
+     * **保留**是因为验证器 fail-open（挂掉即放行）时这是唯一防线，成本一行。
+     *
+     * fail-open：写锚失败不影响用户看到回答（此时 run 已落库，回答已输出）。
+     */
+    @Override
+    protected void onAnswerConcluded(
+            AiAgentRun run,
+            String finalAnswer,
+            List<AgentStepActionType> successfulActions
+    ) {
+        try {
+            if (run.getSessionId() == null || run.getTargetArticleId() == null) {
+                return;
+            }
+            boolean readArticle = successfulActions != null
+                    && successfulActions.contains(AgentStepActionType.QUERY_ARTICLE);
+            if (!readArticle) {
+                return;   // 没真读过文章 → 不把无证据的回答存成结论
+            }
+            anchorService.markConclusion(
+                    run.getSessionId(),
+                    run.getTargetArticleId(),
+                    finalAnswer,
+                    run.getId(),
+                    ArticleSessionAnchorService.CONCLUSION_SOURCE_FINAL_ANSWER
+            );
+        } catch (Exception e) {
+            log.warn("结论锚写入失败（不影响回答）: runId={}", run.getId(), e);
+        }
+    }
+
     /**
      * V3.8：把定位候选（当前页面文章 + 会话最近讨论文章）注入决策目标。
      *
@@ -151,23 +256,35 @@ public class ArticleAgentRuntime extends AbstractAgentRuntime implements AgentRu
         String pageArticleId = pageContext == null ? null : pageContext.getArticleId();
         if (pageArticleId != null && !pageArticleId.isBlank()) {
             String title = authoritativeTitle(pageArticleId);
-            sb.append("\n【页面上下文】当前文章：《")
-                    .append(title == null ? "(标题未知)" : title)
-                    .append("》(ID ").append(pageArticleId.trim()).append(")");
+            sb.append("\n【页面上下文】");
+            if ("editor-edit".equals(pageContext.getPageType())) {
+                // 编辑器页：正文来自数据库已保存版本，编辑器里未保存的修改不存在于任何地方。
+                // 不说清楚 = AI 拿着旧正文评"这篇文章"而用户以为它看的是编辑器里的当前内容。
+                sb.append("用户正在编辑器中编辑这篇文章：《")
+                        .append(title == null ? "(标题未知)" : title)
+                        .append("》(ID ").append(pageArticleId.trim()).append(")")
+                        .append("（你读到的是已保存版本，编辑器里未保存的修改你看不到；"
+                                + "基于正文给结论时必须说明这一点）");
+            } else {
+                sb.append("当前文章：《")
+                        .append(title == null ? "(标题未知)" : title)
+                        .append("》(ID ").append(pageArticleId.trim()).append(")");
+            }
         } else {
             sb.append("\n【页面上下文】当前不在文章详情页（无当前文章）");
         }
 
-        ArticleSessionAnchorService.ArticleAnchor anchor =
-                anchorService.resolve(sessionId, userId);
+        // 候选用可读语义（他人公开文章也算候选）——候选只用于让决策器知道「哪个 anchorMode 合法」，
+        // 真正能不能写由写路径的归属校验兜底，不在这里提前收窄（2026-09-10 手测修正）
+        Articles anchor = anchorService.resolveReadable(sessionId, userId);
         if (anchor != null) {
-            sb.append("\n【会话最近讨论文章】《").append(anchor.title()).append("》(ID ")
-                    .append(anchor.articleId()).append(")");
+            sb.append("\n【会话最近讨论文章】《").append(anchor.getTitle()).append("》(ID ")
+                    .append(anchor.getId()).append(")");
         } else {
             sb.append("\n【会话最近讨论文章】无");
         }
 
-        sb.append("\n（以上候选仅作定位线索，后端会校验文章存在与归属；"
+        sb.append("\n（以上候选仅作定位线索，后端会校验文章存在与可读性；"
                 + "需要定位文章的动作请输出顶层 anchorMode，不要自己填文章 ID）");
         return sb.toString();
     }
@@ -227,11 +344,16 @@ public class ArticleAgentRuntime extends AbstractAgentRuntime implements AgentRu
         }
     }
 
-    /** 会话锚解析（resolve 已校验文章存在 + 归属本人），无有效锚返回 null。 */
+    /**
+     * 会话锚解析：**可读语义**（resolveReadable 已校验会话归属 + 公开可读或本人全状态）。
+     *
+     * 2026-09-10 手测修正：原先用 owned 的 resolve，他人公开文章解析不出锚 →
+     * 在别人文章页说「刚刚那篇」会定位失败或错落到当前页。本站公开博客，
+     * 读定位对齐 QA 侧语义（V3.9 已为 QA 拆出 resolveReadable）——读能读到，写仍卡归属。
+     */
     private Long resolveSessionAnchorId(AiAgentRun run) {
-        ArticleSessionAnchorService.ArticleAnchor anchor =
-                anchorService.resolve(run.getSessionId(), run.getUserId());
-        return anchor == null ? null : anchor.articleId();
+        Articles anchor = anchorService.resolveReadable(run.getSessionId(), run.getUserId());
+        return anchor == null ? null : anchor.getId();
     }
 
     /**

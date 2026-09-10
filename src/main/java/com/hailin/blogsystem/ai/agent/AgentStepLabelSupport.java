@@ -16,7 +16,10 @@ public final class AgentStepLabelSupport {
     public static String actionLabel(String actionType) {
         return switch (actionType) {
             case "QUERY_LEARNING_DASHBOARD" -> "查询学习计划";
-            case "QUERY_ARTICLE" -> "分析当前文章";
+            // 2026-09-10 手测：原文案「分析当前文章」会让用户以为"读到了正文"，
+            // 即便实际只拿到结构摘要/聚焦片段（甚至同一段反复读）也照说不误——
+            // 改为中性描述"这次调用做了什么"，不暗示结果质量
+            case "QUERY_ARTICLE" -> "读取文章";
             case "QUERY_MEMORY" -> "查询记忆";
             case "SEARCH_RAG" -> "检索站内知识";
             case "ASK_USER" -> "向你确认信息";

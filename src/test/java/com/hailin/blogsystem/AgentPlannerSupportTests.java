@@ -10,6 +10,7 @@ import com.hailin.blogsystem.ai.planner.AgentPlannerSupport;
 import com.hailin.blogsystem.config.BlogAiProperties;
 import com.hailin.blogsystem.entity.AiSessions;
 import com.hailin.blogsystem.entity.AiWorkflowRun;
+import com.hailin.blogsystem.entity.Articles;
 import com.hailin.blogsystem.entity.dto.AgentAction;
 import com.hailin.blogsystem.entity.dto.AgentDecision;
 import com.hailin.blogsystem.entity.dto.AiIntent;
@@ -770,8 +771,11 @@ class AgentPlannerSupportTests {
     @Test
     void articleAgentOnHomePageWithSessionAnchorRoutesToAgent() {
         // V3.8 场景 A：首页（无页面上下文）说"帮我把刚刚那篇隐藏了"，会话锚命中 → 放行进文章 Agent Runtime
-        when(anchorService.resolve(10L, 1L))
-                .thenReturn(new ArticleSessionAnchorService.ArticleAnchor(12L, "Java 后端面试突围"));
+        // 2026-09-10：锚读改可读语义 resolveReadable（返回实体），他人公开文章也能放行
+        Articles anchorArticle = new Articles();
+        anchorArticle.setId(12L);
+        anchorArticle.setTitle("Java 后端面试突围");
+        when(anchorService.resolveReadable(10L, 1L)).thenReturn(anchorArticle);
 
         AiIntent intent = new AiIntent();
         intent.setIntent("ARTICLE_AGENT");

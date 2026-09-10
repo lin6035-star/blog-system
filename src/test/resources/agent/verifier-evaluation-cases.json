@@ -1,0 +1,122 @@
+[
+  {
+    "name": "结构问答有依据：SUFFICIENT",
+    "goal": "这篇文章的结构怎么样",
+    "observations": [
+      "当前文章分析：\n- 标题：《Redis 缓存设计》\n- 状态：已发布\n- 字数：约 3200 字\n- 小标题结构：\n  - ## 缓存穿透\n  - ## 缓存击穿\n  - ## 缓存雪崩"
+    ],
+    "answer": "全文按三个经典问题分节：缓存穿透、缓存击穿、缓存雪崩，结构清晰，每节独立成章。",
+    "expectedVerdict": "SUFFICIENT"
+  },
+  {
+    "name": "状态问答有依据：SUFFICIENT",
+    "goal": "这篇文章发布了吗",
+    "observations": [
+      "当前文章分析：\n- 标题：《Redis 缓存设计》\n- 状态：已发布"
+    ],
+    "answer": "这篇文章已经发布了，当前状态是已发布。",
+    "expectedVerdict": "SUFFICIENT"
+  },
+  {
+    "name": "记忆偏好问答有依据：SUFFICIENT",
+    "goal": "结合我的写作偏好看看这篇",
+    "observations": [
+      "当前文章分析：\n- 标题：《Redis 缓存设计》\n- 字数：约 3200 字",
+      "记忆摘要：\n- 情景记忆(PREFERENCE)：写作偏好先给结论再展开论证，喜欢用具体代码示例"
+    ],
+    "answer": "按你的偏好，建议把每节结论句提到小标题正下方，另外你已经用了具体例子，保持就好。",
+    "expectedVerdict": "SUFFICIENT"
+  },
+  {
+    "name": "聚焦片段支撑论断：SUFFICIENT",
+    "goal": "缓存击穿那一段写得怎么样",
+    "observations": [
+      "当前文章分析：\n- 标题：《Redis 缓存设计》\n- 小标题结构：缓存穿透/缓存击穿/缓存雪崩",
+      "聚焦片段：\n## 缓存击穿\n\n缓存击穿指热点 key 过期瞬间大量请求打到 DB。解决思路是互斥锁兜底：缓存 miss 时只允许一个线程回源，其余等待。"
+    ],
+    "answer": "缓存击穿那段把问题定义（热点 key 过期瞬间大量请求打到 DB）和互斥锁方案（缓存 miss 时只允许一个线程回源）讲清楚了。",
+    "expectedVerdict": "SUFFICIENT"
+  },
+  {
+    "name": "论断超出结构摘要：NEED_MORE(ARTICLE_CONTENT)",
+    "goal": "缓存击穿那一段写得怎么样",
+    "observations": [
+      "当前文章分析：\n- 标题：《Redis 缓存设计》\n- 字数：约 3200 字\n- 小标题结构：缓存穿透/缓存击穿/缓存雪崩\n- 正文预览：本文介绍 Redis 缓存三大问题…（预览截断）"
+    ],
+    "answer": "缓存击穿那段用了互斥锁方案，锁的超时设为 5 秒，逻辑很严谨。",
+    "expectedVerdict": "NEED_MORE",
+    "expectedMissingEvidence": "ARTICLE_CONTENT"
+  },
+  {
+    "name": "引用错文章：NEED_MORE",
+    "goal": "这篇文章讲了什么",
+    "observations": [
+      "当前文章分析：\n- 标题：《Redis 缓存设计》\n- 小标题结构：缓存穿透/缓存击穿/缓存雪崩"
+    ],
+    "answer": "这篇《MySQL 索引优化》主要讲联合索引的最左前缀原则和覆盖索引。",
+    "expectedVerdict": "NEED_MORE"
+  },
+  {
+    "name": "状态与证据矛盾：NEED_MORE",
+    "goal": "这篇文章现在是什么状态",
+    "observations": [
+      "当前文章分析：\n- 标题：《Redis 缓存设计》\n- 状态：已隐藏"
+    ],
+    "answer": "这篇文章目前是公开的已发布状态。",
+    "expectedVerdict": "NEED_MORE"
+  },
+  {
+    "name": "缺记忆偏好证据：NEED_MORE",
+    "goal": "按我平时的写作习惯点评这篇",
+    "observations": [
+      "当前文章分析：\n- 标题：《Redis 缓存设计》\n- 字数：约 3200 字"
+    ],
+    "answer": "你平时喜欢用短段落和口语化表达，这篇的风格偏正式，可以调整一下。",
+    "expectedVerdict": "NEED_MORE"
+  },
+  {
+    "name": "缺站内知识对照：NEED_MORE(RAG)",
+    "goal": "这篇的缓存击穿写法和主流文章对比怎么样",
+    "observations": [
+      "当前文章分析：\n- 标题：《Redis 缓存设计》\n- 小标题结构：缓存穿透/缓存击穿/缓存雪崩"
+    ],
+    "answer": "这篇用互斥锁方案，和站内《缓存击穿实战》那篇的推荐做法完全一致，写法很主流。",
+    "expectedVerdict": "NEED_MORE"
+  },
+  {
+    "name": "回答引用观察外文章（双候选场景错指）：NEED_MORE",
+    "goal": "分析一下这篇文章\n【页面上下文】当前文章：《JVM 调优笔记》(ID 33)\n【会话最近讨论文章】《Redis 缓存设计》(ID 12)",
+    "observations": [
+      "当前文章分析：\n- 标题：《JVM 调优笔记》\n- 字数：约 4500 字"
+    ],
+    "answer": "《Redis 缓存设计》这篇的结构很清晰…",
+    "expectedVerdict": "NEED_MORE"
+  },
+  {
+    "name": "泛评价基于摘要也有据：SUFFICIENT（2026-09-10 标尺修正）",
+    "goal": "这篇文章帮我看看",
+    "observations": [
+      "当前文章分析：\n- 标题：《Redis 缓存设计》\n- 状态：已发布\n- 小标题结构：缓存穿透/缓存击穿/缓存雪崩"
+    ],
+    "answer": "这篇写得不错。",
+    "expectedVerdict": "SUFFICIENT"
+  },
+  {
+    "name": "回答需要用户才知道的发布渠道目标：ASK_USER",
+    "goal": "这篇文章适合发出去吗",
+    "observations": [
+      "当前文章分析：\n- 标题：《Redis 缓存设计》\n- 状态：草稿\n- 字数：约 3200 字"
+    ],
+    "answer": "适合发布，内容很完整。",
+    "expectedVerdict": "ASK_USER"
+  },
+  {
+    "name": "预览截断下整体评价有依据：SUFFICIENT（2026-09-10 手测回归）",
+    "goal": "你觉得这篇文章写得怎么样",
+    "observations": [
+      "当前文章分析：\n- 标题：《Vibe Coding 入门指南》\n- 状态：已发布\n- 字数：约 4500 字\n- 小标题结构：\n  - ## 什么是 Vibe Coding\n  - ## 怎么做一次 Vibe Coding\n  - ## 常见坑与工具\n- 摘要：介绍 Vibe Coding 概念与实践\n- 正文预览：Vibe Coding 是用自然语言驱动 AI 写代码…（预览截断）"
+    ],
+    "answer": "整体结构清晰，按概念、实践、避坑三段递进，小标题概括到位；内容看起来比较充实。",
+    "expectedVerdict": "SUFFICIENT"
+  }
+]

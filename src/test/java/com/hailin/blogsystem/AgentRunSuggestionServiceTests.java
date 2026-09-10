@@ -3,6 +3,7 @@ package com.hailin.blogsystem;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hailin.blogsystem.ai.agent.AgentRunSuggestionService;
 import com.hailin.blogsystem.ai.agent.AgentRunSuggestionView;
+import com.hailin.blogsystem.ai.agent.ArticleSessionAnchorService;
 import com.hailin.blogsystem.ai.workflow.WorkflowActionIdempotency;
 import com.hailin.blogsystem.ai.workflow.WorkflowActionLock;
 import com.hailin.blogsystem.ai.workflow.WorkflowRunManager;
@@ -55,6 +56,7 @@ class AgentRunSuggestionServiceTests {
     private AiWorkflowRunService aiWorkflowRunService;
     private WorkflowRunManager workflowRunManager;
     private LearningPlansService learningPlansService;
+    private ArticleSessionAnchorService anchorService;
     private AgentRunSuggestionService service;
 
     @BeforeEach
@@ -68,6 +70,8 @@ class AgentRunSuggestionServiceTests {
         workflowRunManager = mock(WorkflowRunManager.class);
         learningPlansService = mock(LearningPlansService.class);
 
+        anchorService = mock(ArticleSessionAnchorService.class);
+
         service = new AgentRunSuggestionService(
                 runMapper,
                 mock(com.hailin.blogsystem.mapper.AiMessageMapper.class),
@@ -76,7 +80,8 @@ class AgentRunSuggestionServiceTests {
                 idempotency,
                 aiWorkflowRunService,
                 workflowRunManager,
-                learningPlansService
+                learningPlansService,
+                anchorService
         );
         UserContext.set(100L);
     }

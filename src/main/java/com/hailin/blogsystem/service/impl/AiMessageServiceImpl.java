@@ -389,7 +389,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         String extraPromptContext = buildExtraPromptContextFromIntent(intent, pageContext);
         if ((extraPromptContext == null || extraPromptContext.isBlank())
                 && qaTarget != null) {
-            extraPromptContext = buildArticleDetailContextFromQaTarget(qaTarget, sessionId);
+            extraPromptContext = buildArticleDetailContextFromQaTarget(qaTarget, sessionId, pageContext);
         }
 
         AiNavigateCommand navigateFromIntent = buildNavigateFromDecision(routeDecision, intent, pageContext);
@@ -1969,7 +1969,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 || extraPromptContext.isBlank())
                 && qaTarget != null) {
             extraPromptContext =
-                    buildArticleDetailContextFromQaTarget(qaTarget, sessionId);
+                    buildArticleDetailContextFromQaTarget(qaTarget, sessionId, pageContext);
         }
 
         appendExtraPromptContext(prompt, extraPromptContext);
@@ -2502,7 +2502,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         if ((extraPromptContext == null || extraPromptContext.isBlank())
                 && qaTarget != null) {
             // 游客流 sessionId 为 null（会话锚写点跳过）
-            extraPromptContext = buildArticleDetailContextFromQaTarget(qaTarget, null);
+            extraPromptContext = buildArticleDetailContextFromQaTarget(qaTarget, null, pageContext);
         }
 
         AiNavigateCommand navigateFromIntent = buildNavigateFromDecision(guestDecision, intent, pageContext);
@@ -2897,7 +2897,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
      * target：拼文章内容注入 + 锚写点（PAGE_QA，同 id 幂等）；promptNote：直接作为注入文案。
      * 文章已由 resolver 完成可读加载，这里不再查库（读权限与加载一致性收口在 resolver）。
      */
-    private String buildArticleDetailContextFromQaTarget(QaTarget qaTarget, Long sessionId){
+    private String buildArticleDetailContextFromQaTarget(
+            QaTarget qaTarget, Long sessionId, PageContextDTO pageContext){
         if (qaTarget == null) {
             return null;
         }
@@ -2928,6 +2929,13 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
 
         sb.append("\n请基于以上文章内容回答用户问题，不要编造文章中没有的信息。");
         sb.append("回答中的关键结论后面请使用来源编号 [1]，因为这篇文章会作为参考来源 [1] 展示。");
+
+        // 编辑器页：正文来自数据库已保存版本，编辑器里的未保存修改不存在于任何地方。
+        // 不说清楚 → 用户问「我写的那段呢」，AI 直接断言文章里没有。
+        if (pageContext != null && "editor-edit".equals(pageContext.getPageType())) {
+            sb.append("\n注意：以上正文来自已保存版本，用户在编辑器里可能还有未保存的修改——");
+            sb.append("如果用户问的内容在正文中找不到，先说明「可能是还没有保存」，不要直接断言文章里没有。");
+        }
 
         return sb.toString();
     }
@@ -3082,7 +3090,11 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         clearArticleAnchorIfSessionEmpty(sessionId);
     }
 
-    /** V3.8：会话内消息数为 0 时清空文章锚（含全部消息被逐条删除的场景）。 */
+    /**
+     * V3.8：会话内消息数为 0 时清空文章锚（含全部消息被逐条删除的场景）。
+     * V3.12：**结论锚一并清**——否则用户清空聊天记录后，系统仍会继承已删除对话里的优化建议，
+     * 与 V3.8 建立的「清空对话 = 上下文归零」语义冲突。
+     */
     private void clearArticleAnchorIfSessionEmpty(Long sessionId) {
         Long remaining = lambdaQuery()
                 .eq(AiMessages::getSessionId, sessionId)
@@ -3096,6 +3108,11 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 .set(AiSessions::getLastArticleTitle, null)
                 .set(AiSessions::getLastArticleSource, null)
                 .set(AiSessions::getLastArticleUpdatedAt, null)
+                .set(AiSessions::getLastConclusionArticleId, null)
+                .set(AiSessions::getLastConclusionText, null)
+                .set(AiSessions::getLastConclusionSourceRunId, null)
+                .set(AiSessions::getLastConclusionSourceType, null)
+                .set(AiSessions::getLastConclusionUpdatedAt, null)
                 .update();
     }
 

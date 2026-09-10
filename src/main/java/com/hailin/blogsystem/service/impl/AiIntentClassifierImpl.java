@@ -146,7 +146,9 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 区分（务必遵守）：
                                 - 无文章指代的纯概念问（“Redis 缓存是什么”“Java 怎么学”）-> GENERAL_CHAT
                                 - 找站内有没有某类文章（“有没有/推荐 XX 文章”）-> ARTICLE_SEARCH
-                                - 用具体标题/主题指一篇本对话未出现过的文章（“Redis 缓存那篇…”）-> 无法定位，不判 ARTICLE_DETAIL_QA
+                                - 用标题/主题词指某篇文章的内容问答（“Redis 缓存那篇讲了什么”）-> 仍判 ARTICLE_DETAIL_QA：
+                                后端按 页面文章 → 本会话最近聊过的文章 定位，定位不到会追问澄清，
+                                不要因为不确定目标文章就降级 GENERAL_CHAT
                                  
                                 actionType 可选：likeArticle, unlikeArticle, favoriteArticle, unfavoriteArticle, followAuthor, unfollowAuthor, copyArticleLink, scrollToComments, saveDraft, publish, fillArticle, scrollToTop。
 
@@ -430,12 +432,12 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 不要判 OPTIMIZE_ARTICLE_WORKFLOW——状态操作不涉及内容修改，不属于文章优化。
 
                                 例外（V3.8 跨页文章操作）：当用户不在文章详情页（首页/其他页），
-                                但原话里明确要对某篇文章做受控操作（改标题/改名/隐藏/公开/取消隐藏，
-                                如"帮我把刚刚那篇文章隐藏了"）时，仍判 ARTICLE_AGENT（suggestedAction=AGENT），
-                                articleId 置空不填、不要编造——后端会用本会话最近聊过的那篇文章兜底定位并校验归属，
-                                不要因为缺少 articleId 就降级 GENERAL_CHAT。
-                                但如果原话只是泛指这段对话里没出现过的文章（如"把我 Redis 那篇隐藏了"）
-                                或没有明确操作动词，维持 GENERAL_CHAT。
+                                但原话里明确要对某篇文章做受控操作（改标题/改名/隐藏/公开/取消隐藏）时，
+                                不管用近指（"帮我把刚刚那篇文章隐藏了"）还是标题/主题词指代
+                                （"把我 Redis 那篇隐藏了""把 JVM 那篇公开"），都判 ARTICLE_AGENT（suggestedAction=AGENT），
+                                articleId 置空不填、不要编造——后端用本会话最近聊过的文章兜底定位并校验归属，
+                                定位不到会追问澄清，不要因为不确定目标文章就降级 GENERAL_CHAT。
+                                只有原话没有文章操作/内容问答意图时（如"Redis 那篇写得不错"），维持 GENERAL_CHAT。
 
                                 明确优化指令（不判 ARTICLE_AGENT，判 OPTIMIZE_ARTICLE_WORKFLOW）：
                                 - "把第二段删掉" / "帮我把标题改短" / "把开头重写得更吸引人"

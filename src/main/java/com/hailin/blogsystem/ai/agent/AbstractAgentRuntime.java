@@ -140,6 +140,51 @@ public abstract class AbstractAgentRuntime {
         return false;
     }
 
+    // ==================== V3.11 证据收敛门钩子 ====================
+
+    /**
+     * V3.11：FINAL_ANSWER 前的证据收敛门（领域钩子）。
+     *
+     * 返回 null = 不验证（默认，学习/通用域原路径）；返回 Verdict：
+     * - NEED_MORE：拦截该 FINAL_ANSWER（落 FAILED step + 提示 observation），循环继续补查
+     * - ASK_USER：转问（构造新 ASK_USER decision，question 来自验证器）
+     * - SUFFICIENT：放行走原收尾
+     */
+    protected Verdict verifyBeforeFinalization(
+            AiAgentRun run,
+            AgentStepDecision decision,
+            List<String> observations,
+            List<AgentStepActionType> successfulActions
+    ) {
+        return null;
+    }
+
+    /**
+     * V3.11：maxSteps 到顶前的保守收尾门（领域钩子，默认 false = 原 summarize 收尾）。
+     * 触发条件由领域实现（如：目标文章从没成功读过 / 存在未被满足的验证拒绝），
+     * 返回 true 时走 {@link #completeWithConservativeShutdown}，不给 summarize 硬答的机会。
+     */
+    protected boolean conservativeShutdownRequired(
+            AiAgentRun run,
+            List<AgentStepActionType> successfulActions,
+            boolean hasUnresolvedVerifierRejection
+    ) {
+        return false;
+    }
+
+    /** V3.11：保守收尾文案（默认空兜底，领域 override 给用户可读解释）。 */
+    protected String conservativeShutdownMessage() {
+        return emptySummaryFallback();
+    }
+
+    /** V3.11：NEED_MORE 拦截后追加进上下文的系统提示（领域可 override 补动作指引）。 */
+    protected String verifierRejectHint(Verdict verdict) {
+        return "系统提示：你的回答依据不足（缺 " + verdict.missingEvidenceLabel()
+                + "）：" + (verdict.reason() == null || verdict.reason().isBlank()
+                ? "证据不足以支撑该回答" : verdict.reason())
+                + "。请先补充查询再回答，不要编造。";
+    }
+
     /** 决策循环步数上限（学习/文章域默认 5；通用域收紧到 3 控延迟）。 */
     protected int maxSteps() {
         return DEFAULT_MAX_STEPS;
@@ -166,6 +211,25 @@ public abstract class AbstractAgentRuntime {
             PageContextDTO pageContext
     ) {
         return null;
+    }
+
+    /**
+     * V3.12：FINAL_ANSWER 终态结论钩子（默认空实现，只有需要结论继承的域覆写）。
+     *
+     * 只挂 completeWithAnswer 一处——那是 FINAL_ANSWER 的唯一出口。**不能挂 finish()**：
+     * 它同时服务保守收尾与 maxSteps 汇总，那两种不是「结论」。
+     * SUGGEST_WORKFLOW 的结论走 confirm 时刻写（AgentRunSuggestionService），不在骨架。
+     *
+     * **调用时机**：Agent Run 已落库（finish 之后）才调——先写锚后落库会在落库失败时
+     * 留下孤儿锚（结论锚存在但 run 没成功完成）。只有 run 成功落库才允许产生结论锚。
+     *
+     * fail-open：实现方必须自行兜异常（写锚失败不能影响用户看到回答）。
+     */
+    protected void onAnswerConcluded(
+            AiAgentRun run,
+            String finalAnswer,
+            List<AgentStepActionType> successfulActions
+    ) {
     }
 
     // ==================== 公共入口 ====================
@@ -212,6 +276,12 @@ public abstract class AbstractAgentRuntime {
         log.info("Agent Run 创建: runId={}, userId={}, goal={}", run.getId(), userId, truncate(effectiveGoal, 100));
 
         List<String> observations = new ArrayList<>();
+        List<AgentStepActionType> successfulActions = new ArrayList<>();   // V3.11：结构化事实（只读动作成功列表）
+        List<Integer> successfulActionSteps = new ArrayList<>();           // V3.11：成功动作步号（到顶判据用）
+        // V3.11：最后一次验证拒绝的步号（run 局部）。到顶保守收尾判据 =
+        // 「最后一次验证拒绝之后没有再成功补查」——拦后补到新材料就不该被保守一刀切
+        // （2026-09-10 手测修正：原「拦过即保守」把「补查成功但没步数答」的场景也保守了）
+        Integer lastVerifierRejectionStep = null;
         try {
 
             while (run.getUsedSteps() < run.getMaxSteps()) {
@@ -251,9 +321,40 @@ public abstract class AbstractAgentRuntime {
 
                 // 终态：FINAL_ANSWER
                 if (decision.actionType() == AgentStepActionType.FINAL_ANSWER) {
+                    // V3.11 证据收敛门：领域钩子判定「证据是否足以支撑该回答草案」。
+                    // NEED_MORE 拦截回循环补查；ASK_USER 转问；SUFFICIENT/null（无验证器）放行。
+                    Verdict verdict = verifyBeforeFinalization(
+                            run, decision, observations, successfulActions);
+                    if (verdict != null && verdict.type() == Verdict.VerdictType.NEED_MORE) {
+                        lastVerifierRejectionStep = nextStepNo;
+                        String rejectReason = "回答证据不足（缺 " + verdict.missingEvidenceLabel()
+                                + "）：" + (verdict.reason() == null || verdict.reason().isBlank()
+                                ? "证据不足以支撑该回答" : verdict.reason());
+                        emitter.emit(nextStepNo, "FINAL_ANSWER", "FAILED",
+                                "回答被拦截：证据不足", null);
+                        recordRejectedStep(run, decision, nextStepNo, rejectReason);
+                        observations.add(verifierRejectHint(verdict));
+                        run.setCurrentStep(nextStepNo);
+                        run.setUsedSteps(nextStepNo);
+                        run.setContextJson(toJson(clipContext(observations)));
+                        run.setUpdatedAt(LocalDateTime.now());
+                        runMapper.updateById(run);
+                        continue;
+                    }
+                    if (verdict != null && verdict.type() == Verdict.VerdictType.ASK_USER) {
+                        // 转问：构造新 ASK_USER decision（question 来自验证器，verifier 侧已保证非空），
+                        // 只落一条 ASK_USER 终态 step，不保留伪造的 FINAL_ANSWER step
+                        AgentStepDecision askDecision = new AgentStepDecision(
+                                AgentStepActionType.ASK_USER,
+                                Map.of("question", verdict.question() == null ? "" : verdict.question()),
+                                null);
+                        emitter.emit(nextStepNo, "ASK_USER", "SUCCESS",
+                                "需要向你确认一个问题", null);
+                        return markWaitingUser(run, askDecision, observations);
+                    }
                     emitter.emit(nextStepNo, "FINAL_ANSWER", "SUCCESS",
                             finalAnswerSuccessMessage(), decision.thoughtSummary());
-                    return completeWithAnswer(run, decision, observations);
+                    return completeWithAnswer(run, decision, observations, successfulActions);
                 }
 
                 // 终态：ASK_USER（问题快照留 run）
@@ -291,7 +392,8 @@ public abstract class AbstractAgentRuntime {
                 // V3.8：后端预处理（决议目标并入 QUERY_ARTICLE input）
                 AgentStepDecision prepared = prepareStepDecision(run, decision);
                 String observation = executeActionAndRecordStep(
-                        run, prepared, userId, nextStepNo, emitter, pageContext
+                        run, prepared, userId, nextStepNo, emitter, pageContext,
+                        successfulActions, successfulActionSteps
                 );
                 observations.add(observation);
 
@@ -302,6 +404,18 @@ public abstract class AbstractAgentRuntime {
                 runMapper.updateById(run);
             }
 
+            // V3.11 到顶路径保守收尾门：领域判定（如目标文章从没读到 / 验证拒绝未被满足）
+            // 「未被满足」= 最后一次验证拒绝之后没有再成功补查（2026-09-10 手测修正：
+            // 拦后补到新材料的不保守——材料可能已够，交给 summarize 基于新证据收尾）
+            Integer lastSuccessfulActionStep = successfulActionSteps.isEmpty()
+                    ? null
+                    : successfulActionSteps.get(successfulActionSteps.size() - 1);
+            boolean hasUnresolvedVerifierRejection = lastVerifierRejectionStep != null
+                    && (lastSuccessfulActionStep == null
+                    || lastSuccessfulActionStep < lastVerifierRejectionStep);
+            if (conservativeShutdownRequired(run, successfulActions, hasUnresolvedVerifierRejection)) {
+                return completeWithConservativeShutdown(run, observations);
+            }
             // maxSteps 到顶：从已有 observations 汇总回答
             return completeWithSummary(run, effectiveGoal, observations);
         } catch (AgentRunTerminalException e) {
@@ -379,7 +493,8 @@ public abstract class AbstractAgentRuntime {
     /**
      * 执行动作并落 step。
      *
-     * 成功：step SUCCESS + observation 返回给循环。
+     * 成功：step SUCCESS + observation 返回给循环，动作加入 successfulActions（V3.11 结构化事实，
+     * 供证据收敛门判「某类动作是否成功执行过」，不依赖观察文本格式）。
      * 失败：step FAILED + 失败 observation（限长），循环继续，由下一轮决策收尾。
      */
     private String executeActionAndRecordStep(
@@ -388,7 +503,9 @@ public abstract class AbstractAgentRuntime {
             Long userId,
             int stepNo,
             AgentStepEmitter emitter,
-            PageContextDTO pageContext
+            PageContextDTO pageContext,
+            List<AgentStepActionType> successfulActions,
+            List<Integer> successfulActionSteps
     ) {
         long start = System.currentTimeMillis();
         AiAgentStep step = new AiAgentStep();
@@ -412,6 +529,9 @@ public abstract class AbstractAgentRuntime {
                     "已完成" + actionLabel(decision.actionType()), decision.thoughtSummary());
             // V3.8：执行成功领域回调（文章域写会话锚）
             onStepSucceeded(run, decision, observation);
+            // V3.11：成功动作进结构化列表（供证据收敛门判定；步号供到顶保守收尾判据）
+            successfulActions.add(decision.actionType());
+            successfulActionSteps.add(stepNo);
             return clipObservation(observation);
         } catch (Exception e) {
             log.warn("Agent Step 执行失败: runId={}, stepNo={}, action={}",
@@ -433,21 +553,57 @@ public abstract class AbstractAgentRuntime {
     private AgentRunResult completeWithAnswer(
             AiAgentRun run,
             AgentStepDecision decision,
+            List<String> observations,
+            List<AgentStepActionType> successfulActions
+    ) {
+        String extracted = extractFinalAnswerText(decision);
+        boolean realAnswer = extracted != null && !extracted.isBlank();
+        // V3.12：兜底文案不是「结论」——不写锚（用 realAnswer 判断，避免比较字符串是否等于 fallback 的脆弱写法）
+        String finalAnswer = realAnswer ? extracted : emptyAnswerFallback();
+        recordTerminalStep(run, decision, run.getUsedSteps() + 1);
+        AgentRunResult result = finish(run, AiAgentRunStatus.COMPLETED, finalAnswer, observations);
+        // V3.12：结论钩子在 **run 成功落库之后** 调用——先写锚后落库会在落库失败时留孤儿锚。
+        // 失败不影响回答（钩子实现自行 fail-open），用户照常看到正文。
+        if (realAnswer) {
+            onAnswerConcluded(run, finalAnswer, successfulActions);
+        }
+        return result;
+    }
+
+    /**
+     * V3.11：从 FINAL_ANSWER decision 提取最终回答正文（answer 键兼容回退——实测 2026-09-07：
+     * 模型偶发把正文写进 message 键，内容被吞成兜底文案）。
+     *
+     * completeWithAnswer 与证据收敛门（Verifier 验证对象）共用同一提取，
+     * 保证「验证了什么」与「实际输出什么」严格一致。提取不到返回 null（由调用方兜底）。
+     */
+    protected String extractFinalAnswerText(AgentStepDecision decision) {
+        if (decision == null || decision.input() == null) {
+            return null;
+        }
+        Object answer = decision.input().get("answer");
+        if (answer != null && !String.valueOf(answer).isBlank()) {
+            return String.valueOf(answer).trim();
+        }
+        Object message = decision.input().get("message");
+        if (message != null && !String.valueOf(message).isBlank()) {
+            return String.valueOf(message).trim();
+        }
+        return null;
+    }
+
+    /**
+     * V3.11 保守收尾：跳过 summarize 硬答，落领域保守文案（COMPLETED，复用 finish）。
+     * 触发原因已由 conservativeShutdownRequired 领域实现写日志。
+     */
+    private AgentRunResult completeWithConservativeShutdown(
+            AiAgentRun run,
             List<String> observations
     ) {
-        // answer 键兼容回退（实测 2026-09-07：模型偶发把正文写进 message 键，内容被吞成兜底文案）
-        Object answer = decision.input() == null ? null : decision.input().get("answer");
-        if (answer == null || String.valueOf(answer).isBlank()) {
-            Object message = decision.input() == null ? null : decision.input().get("message");
-            if (message != null && !String.valueOf(message).isBlank()) {
-                answer = message;
-            }
+        String finalAnswer = conservativeShutdownMessage();
+        if (finalAnswer == null || finalAnswer.isBlank()) {
+            finalAnswer = emptySummaryFallback();
         }
-        String finalAnswer = answer == null || String.valueOf(answer).isBlank()
-                ? emptyAnswerFallback()
-                : String.valueOf(answer);
-
-        recordTerminalStep(run, decision, run.getUsedSteps() + 1);
         return finish(run, AiAgentRunStatus.COMPLETED, finalAnswer, observations);
     }
 

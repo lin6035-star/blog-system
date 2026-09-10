@@ -114,6 +114,17 @@ CREATE TABLE IF NOT EXISTS ai_sessions (
     user_id BIGINT NOT NULL,
     title VARCHAR(100) NOT NULL DEFAULT '新对话',
     active_workflow_run_id BIGINT,
+    -- V3.8 会话文章锚（2026-09-10 补齐：此表此前漂移，缺这四列导致锚相关 H2 测试不反映真实结构）
+    last_article_id BIGINT,
+    last_article_title VARCHAR(255),
+    last_article_source VARCHAR(32),
+    last_article_updated_at TIMESTAMP,
+    -- V3.12 会话结论锚
+    last_conclusion_article_id BIGINT,
+    last_conclusion_text VARCHAR(2000),
+    last_conclusion_source_run_id BIGINT,
+    last_conclusion_source_type VARCHAR(32),
+    last_conclusion_updated_at TIMESTAMP,
     created_at TIMESTAMP,
     updated_at TIMESTAMP
 );

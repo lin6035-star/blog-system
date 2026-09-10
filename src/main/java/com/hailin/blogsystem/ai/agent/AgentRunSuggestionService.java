@@ -66,6 +66,8 @@ public class AgentRunSuggestionService {
     private final AiWorkflowRunService aiWorkflowRunService;
     private final WorkflowRunManager workflowRunManager;
     private final LearningPlansService learningPlansService;
+    /** V3.12：结论锚写点 B（用户确认时刻）。 */
+    private final ArticleSessionAnchorService anchorService;
 
     /**
      * 确认建议：校验归属/状态/冲突 → 状态 CAS 一次性消费 → 复用现有 Workflow 创建路径。
@@ -182,6 +184,14 @@ public class AgentRunSuggestionService {
         log.info("Agent 建议确认开始创建 Workflow: agentRunId={}, workflowType={}",
                 agentRunId, suggestion.workflowType());
 
+        // V3.12 写点 B：结论锚在**用户确认时刻**写，且必须在 createWorkflow 之前——
+        // ArticleOptimizeWorkflowHandler.create 会读锚，此时读到的正是本次 suggestion.reason
+        // （若放在之后，Handler 读到的是上一轮旧锚，本次确认的方向反而进不去）。
+        // 未确认/已取消的建议结构性进不了锚：写点在 confirm 成功之后，不在 run 终态。
+        // 事务：本方法由 @Transactional 的 confirm 调用，锚随确认事务一致提交/回滚——
+        // Handler.create 抛异常则整体回滚（无残留）；runInitialSteps 内部失败则事务已提交（锚保留）。
+        markConclusionIfOptimize(run, suggestion);
+
         AiWorkflowRunVO vo = createWorkflow(run, suggestion);
         markConfirmed(run, vo.getId());
         // 同步关联消息的 workflowRunId：刷新后按消息补拉 Workflow 卡（建议卡闭环）
@@ -192,6 +202,34 @@ public class AgentRunSuggestionService {
         log.info("Agent 建议已确认并启动 Workflow: agentRunId={}, workflowType={}, workflowRunId={}",
                 agentRunId, suggestion.workflowType(), vo.getId());
         return vo;
+    }
+
+    /**
+     * V3.12 写点 B：确认优化建议时写结论锚。
+     *
+     * 仅 OPTIMIZE_ARTICLE 写（其他 Workflow 类型无「文章优化方向」语义）。
+     * articleId 取 `suggestion.articleId()` 而**非** `run.getTargetArticleId()`——后者是
+     * @TableField(exist=false) 瞬态字段，confirm 时从库里重新读出的 run 没有该值；
+     * suggestion.articleId() 是 run 终态时 resolveSuggestionArticleId 的权威快照。
+     *
+     * 写失败不阻断确认（锚是增强不是依赖）：catch + log，用户仍能正常启动 Workflow。
+     */
+    private void markConclusionIfOptimize(AiAgentRun run, AgentWorkflowSuggestion suggestion) {
+        try {
+            if (!"OPTIMIZE_ARTICLE".equals(suggestion.workflowType())) {
+                return;
+            }
+            Long articleId = parseArticleId(suggestion.articleId());
+            anchorService.markConclusion(
+                    run.getSessionId(),
+                    articleId,
+                    suggestion.reason(),
+                    run.getId(),
+                    ArticleSessionAnchorService.CONCLUSION_SOURCE_WORKFLOW_CONFIRMED
+            );
+        } catch (Exception e) {
+            log.warn("确认时结论锚写入失败（不影响 Workflow 启动）: agentRunId={}", run.getId(), e);
+        }
     }
 
     /**

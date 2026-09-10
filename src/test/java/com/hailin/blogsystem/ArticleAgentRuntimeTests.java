@@ -6,6 +6,7 @@ import com.hailin.blogsystem.ai.agent.AgentStepDecision;
 import com.hailin.blogsystem.ai.agent.ArticleAgentActionExecutor;
 import com.hailin.blogsystem.ai.agent.ArticleAgentRuntime;
 import com.hailin.blogsystem.ai.agent.ArticleAgentStepDecider;
+import com.hailin.blogsystem.ai.agent.ArticleEvidenceVerifier;
 import com.hailin.blogsystem.ai.agent.ArticleSessionAnchorService;
 import com.hailin.blogsystem.ai.agent.AgentWriteProposal;
 import com.hailin.blogsystem.entity.AiAgentRun;
@@ -29,6 +30,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -82,9 +84,10 @@ class ArticleAgentRuntimeTests {
             return 1;
         });
 
+        // V3.11：mock 验证器默认返回 null = 不走收敛门（锁「默认不验证 = 原路径」回归）
         runtime = new ArticleAgentRuntime(
                 decider, executor, runMapper, stepMapper, new ObjectMapper(),
-                articlesService, anchorService
+                articlesService, anchorService, mock(ArticleEvidenceVerifier.class)
         );
     }
 
@@ -261,7 +264,7 @@ class ArticleAgentRuntimeTests {
     @Test
     void suggestWriteWithoutPageContextFailsRun() {
         // V3.8：无页面上下文且会话锚 resolve 为空（无决议目标）→ 提案 FAILED；LLM input 摘录不作数
-        when(anchorService.resolve(200L, 100L)).thenReturn(null);
+        when(anchorService.resolveReadable(200L, 100L)).thenReturn(null);
         when(decider.decide(any(), any(), anyInt(), anyInt()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
@@ -283,8 +286,9 @@ class ArticleAgentRuntimeTests {
     void homePageSessionAnchorHideProposalReachesWaitingConfirm() {
         // V3.8 场景 A（首页指代）：无页面上下文 + 会话锚 resolve 12 →
         // 首步 QUERY_ARTICLE anchorMode=SESSION_LAST 决议目标 12 → 提案 HIDE_ARTICLE(12) → WAITING_WRITE_CONFIRM
-        when(anchorService.resolve(200L, 100L))
-                .thenReturn(new ArticleSessionAnchorService.ArticleAnchor(12L, "Java 后端面试突围"));
+        // 2026-09-10：锚读改可读语义 resolveReadable（返回实体），他人公开文章也可入锚
+        when(anchorService.resolveReadable(200L, 100L))
+                .thenReturn(article(12L, 100L, "Java 后端面试突围", 1));
         when(decider.decide(any(), any(), anyInt(), anyInt()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE)
                         .withInput(Map.of("anchorMode", "SESSION_LAST")))
@@ -310,8 +314,8 @@ class ArticleAgentRuntimeTests {
     void sessionLastWinsOverPageContextForProposal() {
         // V3.8 场景 B（错位指代）：站文章 99 详情页说"刚刚那篇"（指会话锚 12）→
         // anchorMode=SESSION_LAST → 提案目标是 12（不是当前页 99，不会被页面上下文抢走）
-        when(anchorService.resolve(200L, 100L))
-                .thenReturn(new ArticleSessionAnchorService.ArticleAnchor(12L, "Java 后端面试突围"));
+        when(anchorService.resolveReadable(200L, 100L))
+                .thenReturn(article(12L, 100L, "Java 后端面试突围", 1));
         when(decider.decide(any(), any(), anyInt(), anyInt()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE)
                         .withInput(Map.of("anchorMode", "SESSION_LAST")))
@@ -429,7 +433,7 @@ class ArticleAgentRuntimeTests {
                 articleContext("12"), com.hailin.blogsystem.ai.agent.AgentStepEmitter.noop());
 
         assertThat(result.status()).isEqualTo(AiAgentRunStatus.COMPLETED);
-        assertThat(result.usedSteps()).isEqualTo(5);
+        assertThat(result.usedSteps()).isEqualTo(6);
         assertThat(result.finalAnswer()).contains("根据对这篇文章的分析");
     }
 
@@ -579,6 +583,63 @@ class ArticleAgentRuntimeTests {
         assertThat(steps.get(1).getActionType()).isEqualTo("SUGGEST_WRITE");
         assertThat(steps.get(1).getStatus()).isEqualTo("FAILED");
         assertThat(steps.get(1).getErrorMessage()).contains("已处于隐藏状态");
+    }
+
+    // ==================== V3.12 结论锚写点 A ====================
+
+    @Test
+    void finalAnswerAfterReadingArticleWritesConclusionAnchor() {
+        // 主路径：读过文章 + FINAL_ANSWER → 写结论锚（存 finalAnswer 原文）
+        when(decider.decide(any(), any(), anyInt(), anyInt()))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
+                        .withInput(Map.of("answer", "建议补充缓存击穿原理")));
+        when(executor.execute(any(), any(), any())).thenReturn("当前文章分析：\n- 标题：《Redis 缓存》");
+        when(articlesService.getById(12L)).thenReturn(article(12L, 100L, "Redis 缓存", 1));
+
+        runtime.run(100L, 200L, "分析这篇文章", articleContext("12"),
+                com.hailin.blogsystem.ai.agent.AgentStepEmitter.noop());
+
+        verify(anchorService).markConclusion(
+                200L, 12L, "建议补充缓存击穿原理", 1L,
+                ArticleSessionAnchorService.CONCLUSION_SOURCE_FINAL_ANSWER);
+    }
+
+    @Test
+    void finalAnswerWithoutReadingArticleSkipsAnchor() {
+        // 证据边界：目标文章已决议但没成功读过 → 不把无证据回答存成结论锚。
+        // （V3.11 R1 正常会拦，但验证器 fail-open 时本条件是唯一防线）
+        when(decider.decide(any(), any(), anyInt(), anyInt()))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.SEARCH_RAG)
+                        .withInput(Map.of("keyword", "缓存")))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
+                        .withInput(Map.of("answer", "这篇写得不错")));
+        when(executor.execute(any(), any(), any())).thenReturn("站内文章知识检索结果：...");
+        when(articlesService.getById(12L)).thenReturn(article(12L, 100L, "Redis 缓存", 1));
+
+        runtime.run(100L, 200L, "分析这篇文章", articleContext("12"),
+                com.hailin.blogsystem.ai.agent.AgentStepEmitter.noop());
+
+        verify(anchorService, never()).markConclusion(any(), any(), any(), any(), any());
+    }
+
+    @Test
+    void anchorWriteFailureDoesNotBreakAnswer() {
+        // fail-open：写锚抛异常不能影响用户看到回答
+        when(decider.decide(any(), any(), anyInt(), anyInt()))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
+                        .withInput(Map.of("answer", "建议补充示例")));
+        when(executor.execute(any(), any(), any())).thenReturn("当前文章分析：...");
+        when(articlesService.getById(12L)).thenReturn(article(12L, 100L, "Redis 缓存", 1));
+        org.mockito.Mockito.doThrow(new RuntimeException("DB down"))
+                .when(anchorService).markConclusion(any(), any(), any(), any(), any());
+
+        AgentRunResult result = runtime.run(100L, 200L, "分析这篇文章", articleContext("12"),
+                com.hailin.blogsystem.ai.agent.AgentStepEmitter.noop());
+
+        assertThat(result.status()).isEqualTo(AiAgentRunStatus.COMPLETED);
+        assertThat(result.finalAnswer()).isEqualTo("建议补充示例");
     }
 
     private AiAgentRun captureRun() {

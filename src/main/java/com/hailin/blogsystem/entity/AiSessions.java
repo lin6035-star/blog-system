@@ -33,6 +33,22 @@ public class AiSessions {
     private String lastArticleTitle;
     private String lastArticleSource;
     private LocalDateTime lastArticleUpdatedAt;
+
+    /**
+     * 会话结论锚（V3.12）：本会话最近一次文章域 Agent 结论。
+     *
+     * 与文章锚的区别：文章锚记「聊的是哪一篇」（定位），结论锚记「上一轮说了什么」（方向）。
+     * 写点受控（两类，都在结论被用户看到/接受的时刻）：
+     * - FINAL_ANSWER 终态（ARTICLE_AGENT_FINAL_ANSWER）
+     * - 建议卡确认成功（WORKFLOW_SUGGESTION_CONFIRMED）
+     * 单锚位覆盖：只保留最近一次结论；并发用 sourceRunId 雪花条件更新。
+     */
+    private Long lastConclusionArticleId;
+    private String lastConclusionText;
+    private Long lastConclusionSourceRunId;
+    private String lastConclusionSourceType;
+    private LocalDateTime lastConclusionUpdatedAt;
+
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
 }
