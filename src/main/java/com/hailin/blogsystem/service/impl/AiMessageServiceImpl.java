@@ -636,20 +636,43 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
          * 与 Workflow 的 Flux.create + boundedElastic 模式一致。
          */
         Flux<AiChatEventVO> agentEvents = Flux.create(sink -> {
-            AgentStepEmitter emitter = (stepNo, actionType, status, stepMessage, thoughtSummary) -> {
-                // 注意：不能用 Map.of——thoughtSummary 允许 null（V3.10 D3 空值可容忍），
-                // Map.of 遇 null value 直接抛 NPE 会让整个 Agent run FAILED
-                Map<String, Object> data = new HashMap<>();
-                data.put("stepNo", stepNo);
-                data.put("actionType", actionType);
-                data.put("status", status);
-                data.put("message", stepMessage);
-                // V3.10：思考摘要（清洗后，nullable；前端行文本优先于 message）
-                data.put("thoughtSummary", thoughtSummary);
-                emitIfOpen(sink, AiChatEventVO.builder()
-                        .eventType(AiChatEventType.AGENT_STEP.getValue())
-                        .eventData(data)
-                        .build());
+            // V3.13：改为匿名类——lambda 不能覆写默认方法，只加接口默认方法而不改这里，
+            // 计划会落库但永远不会实时展示
+            AgentStepEmitter emitter = new AgentStepEmitter() {
+                @Override
+                public void emit(int stepNo, String actionType, String status,
+                                 String stepMessage, String thoughtSummary) {
+                    // 注意：不能用 Map.of——thoughtSummary 允许 null（V3.10 D3 空值可容忍），
+                    // Map.of 遇 null value 直接抛 NPE 会让整个 Agent run FAILED
+                    Map<String, Object> data = new HashMap<>();
+                    data.put("stepNo", stepNo);
+                    data.put("actionType", actionType);
+                    data.put("status", status);
+                    data.put("message", stepMessage);
+                    // V3.10：思考摘要（清洗后，nullable；前端行文本优先于 message）
+                    data.put("thoughtSummary", thoughtSummary);
+                    emitIfOpen(sink, AiChatEventVO.builder()
+                            .eventType(AiChatEventType.AGENT_STEP.getValue())
+                            .eventData(data)
+                            .build());
+                }
+
+                /**
+                 * V3.13 Plan Preview：run 级计划事件。
+                 *
+                 * 本事件早于 STOP——那时最终消息尚未落库，前端占位消息还没有 agentRunId，
+                 * 所以前端只能按**占位消息索引**归并（按 ID 匹配会把它丢掉）。
+                 */
+                @Override
+                public void emitPlan(Long agentRunId, List<String> plan) {
+                    Map<String, Object> data = new HashMap<>();
+                    data.put("agentRunId", agentRunId == null ? null : String.valueOf(agentRunId));
+                    data.put("plan", plan);
+                    emitIfOpen(sink, AiChatEventVO.builder()
+                            .eventType(AiChatEventType.AGENT_PLAN.getValue())
+                            .eventData(data)
+                            .build());
+                }
             };
 
             Schedulers.boundedElastic().schedule(() -> {

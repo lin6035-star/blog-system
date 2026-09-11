@@ -114,6 +114,16 @@ public class ArticleAgentRuntime extends AbstractAgentRuntime implements AgentRu
         return "请补充一下你的优化诉求？";
     }
 
+    /**
+     * V3.13 Plan Preview：本域启用（学习域 / 通用域保持默认关闭）。
+     *
+     * 选文章域试点的原因：已有 Verifier + focus + 观察记录，最容易看出计划与执行的对应关系。
+     */
+    @Override
+    protected boolean supportsPlanPreview() {
+        return true;
+    }
+
     @Override
     protected String defaultWorkflowSuggestionReason(String workflowType) {
         return "根据当前文章情况，建议进入「" + workflowType + "」流程。";

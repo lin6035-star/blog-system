@@ -13,7 +13,8 @@ public enum AiChatEventType {
     WORKFLOW_ERROR(2003, "Workflow错误事件"),
     WORKFLOW_CONTENT_DELTA(2004, "Workflow内容增量事件"),
 
-    AGENT_STEP(3001, "Agent思考步骤事件");
+    AGENT_STEP(3001, "Agent思考步骤事件"),
+    AGENT_PLAN(3002, "Agent计划事件");
 
     private final Integer value;
     private final String desc;

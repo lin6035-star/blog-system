@@ -65,6 +65,16 @@ public class AiAgentRun {
     private String contextJson;
 
     /**
+     * V3.13 Plan Preview 计划（JSON 数组，仅文章域产生，可空）。
+     *
+     * run 级数据（计划是「这次 run 的计划」，不是某一步的）。
+     * 写入走单列更新（`UPDATE ai_agent_runs SET plan_json=? WHERE id=?`），
+     * **不复用 updateById**——否则计划写失败会与 run 状态写失败混成同一个故障，
+     * fail-open 形同虚设。
+     */
+    private String planJson;
+
+    /**
      * 最终回答文本（COMPLETED 时落库）。
      */
     private String finalAnswer;

@@ -1,8 +1,10 @@
 package com.hailin.blogsystem;
 
+import com.baomidou.mybatisplus.core.conditions.update.UpdateWrapper;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hailin.blogsystem.ai.agent.AgentRunResult;
 import com.hailin.blogsystem.ai.agent.AgentStepDecision;
+import com.hailin.blogsystem.ai.agent.AgentStepEmitter;
 import com.hailin.blogsystem.ai.agent.ArticleAgentActionExecutor;
 import com.hailin.blogsystem.ai.agent.ArticleAgentRuntime;
 import com.hailin.blogsystem.ai.agent.ArticleAgentStepDecider;
@@ -22,6 +24,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -640,6 +643,128 @@ class ArticleAgentRuntimeTests {
 
         assertThat(result.status()).isEqualTo(AiAgentRunStatus.COMPLETED);
         assertThat(result.finalAnswer()).isEqualTo("建议补充示例");
+    }
+
+    // ==================== V3.13 Plan Preview ====================
+
+    @Test
+    void firstStepPlanIsPersistedBySingleColumnUpdateAndEmitted() {
+        when(decider.decide(any(), any(), anyInt(), anyInt()))
+                .thenReturn(new AgentStepDecision(
+                        AgentStepActionType.QUERY_ARTICLE,
+                        Map.of("articleId", "12"),
+                        "先读文章看结构",
+                        List.of("先看整体结构", "再检查缓存击穿那一节")))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
+                        .withInput(Map.of("answer", "整体结构不错")));
+        when(executor.execute(any(), any(), any())).thenReturn("当前文章分析：\n- 标题：《Redis 缓存设计》");
+
+        List<List<String>> emitted = new ArrayList<>();
+        runtime.run(100L, 200L, "先看整体结构，再检查缓存击穿那一节",
+                articleContext("12"), planCapturingEmitter(emitted));
+
+        assertThat(emitted).hasSize(1);
+        assertThat(emitted.get(0)).containsExactly("先看整体结构", "再检查缓存击穿那一节");
+
+        // 落库走**单列更新**（不复用 updateById——否则计划写失败会与 run 状态写失败混成一个故障）
+        ArgumentCaptor<UpdateWrapper<AiAgentRun>> captor =
+                ArgumentCaptor.forClass(UpdateWrapper.class);
+        verify(runMapper, atLeastOnce()).update(any(), captor.capture());
+        assertThat(captor.getAllValues())
+                .anyMatch(w -> w.getSqlSet() != null && w.getSqlSet().contains("plan_json"));
+    }
+
+    @Test
+    void planNeverEntersObservations() {
+        // 关键隔离锁：计划一旦进 observations，Verifier 会把它当证据
+        when(decider.decide(any(), any(), anyInt(), anyInt()))
+                .thenReturn(new AgentStepDecision(
+                        AgentStepActionType.QUERY_ARTICLE,
+                        Map.of("articleId", "12"),
+                        null,
+                        List.of("先看整体结构", "再检查缓存击穿那一节")))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
+                        .withInput(Map.of("answer", "整体结构不错")));
+        when(executor.execute(any(), any(), any())).thenReturn("当前文章分析：\n- 标题：《Redis 缓存设计》");
+
+        runtime.run(100L, 200L, "先看整体结构，再检查缓存击穿那一节",
+                articleContext("12"), planCapturingEmitter(new ArrayList<>()));
+
+        AiAgentRun saved = captureRun();
+        assertThat(saved.getContextJson()).doesNotContain("先看整体结构");
+        assertThat(saved.getContextJson()).doesNotContain("缓存击穿");
+    }
+
+    @Test
+    void invalidPlanIsDroppedWithoutEmitting() {
+        // 1 项不是多目标 → 整条丢弃（零修补），不发事件、不影响流程
+        when(decider.decide(any(), any(), anyInt(), anyInt()))
+                .thenReturn(new AgentStepDecision(
+                        AgentStepActionType.QUERY_ARTICLE,
+                        Map.of("articleId", "12"),
+                        null,
+                        List.of("先看整体结构")))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
+                        .withInput(Map.of("answer", "整体结构不错")));
+        when(executor.execute(any(), any(), any())).thenReturn("当前文章分析");
+
+        List<List<String>> emitted = new ArrayList<>();
+        AgentRunResult result = runtime.run(100L, 200L, "看看这篇文章",
+                articleContext("12"), planCapturingEmitter(emitted));
+
+        assertThat(emitted).isEmpty();
+        assertThat(result.status()).isEqualTo(AiAgentRunStatus.COMPLETED);
+    }
+
+    @Test
+    void planSkippedWhenFirstStepIsTerminal() {
+        // 首步即终态/需澄清 → 没有实际执行基线，计划无法用于观测，且可能在澄清前误导用户
+        when(decider.decide(any(), any(), anyInt(), anyInt()))
+                .thenReturn(new AgentStepDecision(
+                        AgentStepActionType.ASK_USER,
+                        Map.of("question", "你指的是哪篇？"),
+                        null,
+                        List.of("先看整体结构", "再给建议")));
+
+        List<List<String>> emitted = new ArrayList<>();
+        runtime.run(100L, 200L, "这篇文章怎么样", articleContext("12"),
+                planCapturingEmitter(emitted));
+
+        assertThat(emitted).isEmpty();
+    }
+
+    @Test
+    void planFromNonFirstStepIsIgnored() {
+        // 只在首步采集；第二步即使带 plan 也忽略
+        when(decider.decide(any(), any(), anyInt(), anyInt()))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE)
+                        .withInput(Map.of("articleId", "12")))
+                .thenReturn(new AgentStepDecision(
+                        AgentStepActionType.FINAL_ANSWER,
+                        Map.of("answer", "好"),
+                        null,
+                        List.of("第二步才给的计划", "第二项")));
+        when(executor.execute(any(), any(), any())).thenReturn("当前文章分析");
+
+        List<List<String>> emitted = new ArrayList<>();
+        runtime.run(100L, 200L, "看看", articleContext("12"), planCapturingEmitter(emitted));
+
+        assertThat(emitted).isEmpty();
+    }
+
+    /** V3.13：捕获 emitPlan 的 emitter（步骤事件忽略）。 */
+    private AgentStepEmitter planCapturingEmitter(List<List<String>> sink) {
+        return new AgentStepEmitter() {
+            @Override
+            public void emit(int stepNo, String actionType, String status,
+                             String message, String thoughtSummary) {
+            }
+
+            @Override
+            public void emitPlan(Long agentRunId, List<String> plan) {
+                sink.add(plan);
+            }
+        };
     }
 
     private AiAgentRun captureRun() {

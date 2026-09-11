@@ -1,6 +1,7 @@
 package com.hailin.blogsystem.ai.agent;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.UpdateWrapper;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hailin.blogsystem.entity.AiAgentRun;
 import com.hailin.blogsystem.entity.AiAgentStep;
@@ -159,6 +160,19 @@ public abstract class AbstractAgentRuntime {
         return null;
     }
 
+    // ==================== V3.13 Plan Preview 域钩子 ====================
+
+    /**
+     * V3.13：Plan Preview 域开关。**默认 false**，仅文章域为 true。
+     *
+     * 共享骨架会触及三域（`AgentStepDecision.plan` 字段 / 决策器解析 / 采集落库发事件），
+     * 没有显式开关就意味着学习域和通用域被动吃到 plan 逻辑，且无法从代码上断言
+     * 「这两个域没变」。解析层例外（无域语义），prompt 规则与采集链路都在开关之内。
+     */
+    protected boolean supportsPlanPreview() {
+        return false;
+    }
+
     /**
      * V3.11：maxSteps 到顶前的保守收尾门（领域钩子，默认 false = 原 summarize 收尾）。
      * 触发条件由领域实现（如：目标文章从没成功读过 / 存在未被满足的验证拒绝），
@@ -303,6 +317,9 @@ public abstract class AbstractAgentRuntime {
                     emitter.emit(nextStepNo, "DECISION", "FAILED", "决策无效：" + detail, null);
                     return markFailed(run, "Agent 决策无效（" + detail + "）");
                 }
+
+                // V3.13 Plan Preview：首步采集计划（仅域开关开启；全程 fail-open）
+                collectPlanIfApplicable(run, decision, nextStepNo, emitter);
 
                 // V3.8：解析本 run 定位目标（在扩展终态与动作执行前，SUGGEST_WRITE 提案端消费 run 决议目标）
                 resolveStepTarget(run, decision, pageContext);
@@ -469,6 +486,55 @@ public abstract class AbstractAgentRuntime {
 
     private String workflowLabel(String workflowType) {
         return AgentStepLabelSupport.workflowLabel(workflowType);
+    }
+
+    /**
+     * V3.13 Plan Preview：首步采集 / 校验 / 落库 / 发事件。
+     *
+     * 时序写死：白名单校验通过 → plan 校验 → **单列更新落库** → `emitPlan` → 首个步骤事件。
+     * - **先落库再发事件**（与 V3.12 孤儿锚同一原则：事件不可先于持久化）
+     * - `AGENT_PLAN` 必须在首个 `AGENT_STEP` 事件之前发，否则前端视觉顺序会闪
+     * - 落库走**单列更新**，不复用 `updateById`——否则计划写失败会与 run 状态写失败
+     *   混成同一个故障，fail-open 形同虚设
+     *
+     * 全程 fail-open：计划是展示增强，任何失败只丢计划，不影响决策与执行。
+     */
+    private void collectPlanIfApplicable(
+            AiAgentRun run,
+            AgentStepDecision decision,
+            int stepNo,
+            AgentStepEmitter emitter
+    ) {
+        if (!supportsPlanPreview() || stepNo != 1) {
+            return;
+        }
+        // 首步即终态/需澄清动作时没有实际执行基线，计划无法用于本阶段观测，且可能在澄清前误导用户
+        if (isNonExecutableFirstStep(decision.actionType())) {
+            return;
+        }
+        try {
+            List<String> plan = AgentPlanValidator.validate(decision.plan());
+            if (plan == null || plan.isEmpty()) {
+                return;
+            }
+            String planJson = toJson(plan);
+            runMapper.update(null, new UpdateWrapper<AiAgentRun>()
+                    .eq("id", run.getId())
+                    .set("plan_json", planJson)
+                    .set("updated_at", LocalDateTime.now()));
+            run.setPlanJson(planJson);
+            emitter.emitPlan(run.getId(), plan);
+        } catch (Exception e) {
+            log.warn("Plan Preview 采集失败（不影响 Agent 流程）: runId={}", run.getId(), e);
+        }
+    }
+
+    /** 首步即无执行基线（终态 / 需澄清）→ 不采集计划。 */
+    private boolean isNonExecutableFirstStep(AgentStepActionType actionType) {
+        return actionType == AgentStepActionType.FINAL_ANSWER
+                || actionType == AgentStepActionType.ASK_USER
+                || actionType == AgentStepActionType.SUGGEST_WORKFLOW
+                || actionType == AgentStepActionType.SUGGEST_WRITE;
     }
 
     private AiAgentRun createRun(Long userId, Long sessionId, String goal) {

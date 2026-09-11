@@ -2,6 +2,7 @@ package com.hailin.blogsystem.ai.agent;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hailin.blogsystem.constants.BlogConstants;
@@ -91,10 +92,28 @@ public class AgentRunInspectionService {
         vo.setErrorMessage(run.getErrorMessage());
         vo.setCreatedAt(run.getCreatedAt());
         vo.setUpdatedAt(run.getUpdatedAt());
+        // V3.13：计划（run 级）——读取失败按空计划处理并记录日志，不影响 steps 恢复
+        vo.setPlan(parsePlan(run.getPlanJson()));
         if (AiAgentRunStatus.WAITING_WORKFLOW_CONFIRM.name().equals(run.getStatus())) {
             vo.setPendingWorkflowSuggestion(parseSuggestion(run.getContextJson()));
         }
         return vo;
+    }
+
+    /**
+     * V3.13：计划列 → 列表。读取失败按空计划处理并记录日志（计划是展示增强，不阻塞 steps 恢复）。
+     */
+    private List<String> parsePlan(String planJson) {
+        if (planJson == null || planJson.isBlank()) {
+            return null;
+        }
+        try {
+            return objectMapper.readValue(planJson, new TypeReference<List<String>>() {
+            });
+        } catch (Exception e) {
+            log.warn("Agent Run plan_json 解析失败（按空计划处理）: {}", planJson);
+            return null;
+        }
     }
 
     private AgentStepVO toStep(AiAgentStep step) {

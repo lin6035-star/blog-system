@@ -315,6 +315,7 @@ CREATE TABLE IF NOT EXISTS ai_agent_runs (
     max_steps INT NOT NULL DEFAULT 5,
     used_steps INT NOT NULL DEFAULT 0,
     context_json CLOB,
+    plan_json CLOB,
     final_answer CLOB,
     error_message VARCHAR(1000),
     created_at TIMESTAMP NOT NULL,

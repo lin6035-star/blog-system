@@ -9,7 +9,9 @@ import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.stereotype.Component;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -136,11 +138,35 @@ public class LlmAgentStepDecider implements AgentStepDecider {
             // V3.10：顶层 "thought"（LLM 侧 ReAct 术语）→ AgentThoughtSanitizer 分级闸门清洗
             // → 存入 thoughtSummary（展示副产品，非决策依据；缺失/违规 → null 全链路可容忍）。
             String thoughtSummary = AgentThoughtSanitizer.sanitize(root.path("thought").asText(""));
-            return new AgentStepDecision(actionType, input, thoughtSummary);
+            // V3.13：顶层 "plan"（Plan Preview 子目标列表）。解析层无域语义 → 三域共享；
+            // 消费由 AbstractAgentRuntime 的 supportsPlanPreview() 把关。
+            List<String> plan = parsePlan(root.path("plan"));
+            return new AgentStepDecision(actionType, input, thoughtSummary, plan);
         } catch (Exception e) {
             log.warn("Agent 决策 JSON 解析失败: {}", truncate(json, 200));
             return null;
         }
+    }
+
+    /**
+     * V3.13：解析顶层 "plan"。
+     *
+     * 只接受 JSON 数组且每项为字符串；缺失 / null / 非数组 / 含非字符串项一律返回 null
+     * （整条丢弃，不挑拣、不把对象与数字强转成字符串）。
+     * 这里只做**结构**判定——数量 / 长度 / 去重 / 机制词等业务校验在 {@link AgentPlanValidator}。
+     */
+    private List<String> parsePlan(JsonNode node) {
+        if (node == null || !node.isArray() || node.isEmpty()) {
+            return null;
+        }
+        List<String> plan = new ArrayList<>(node.size());
+        for (JsonNode item : node) {
+            if (!item.isTextual()) {
+                return null;
+            }
+            plan.add(item.asText());
+        }
+        return plan;
     }
 
     private String cleanJson(String raw) {
@@ -232,7 +258,20 @@ public class LlmAgentStepDecider implements AgentStepDecider {
                     .append("- 不要把最终答案写进 thought\n")
                     .append("- 想不出自然的说法就省略该字段（缺失不影响任何流程）\n");
         }
+        // V3.13：计划规则由领域钩子提供（默认空串 = 未启用）。领域规则不能写进基类
+        // （学习/通用域不启用本能力），也不能让文章域复制整段 prompt——基类只负责追加。
+        sb.append(planPromptSection(stepNo, repair));
         return sb.toString();
+    }
+
+    /**
+     * V3.13 Plan Preview 的 prompt 规则（领域钩子）。默认空串 = 不启用。
+     *
+     * `repair=true` 时只应返回一条短规则（提示模型在首步且请求确实多目标时保留合法 plan），
+     * 避免修复轮被长规则挤占。
+     */
+    protected String planPromptSection(int stepNo, boolean repair) {
+        return "";
     }
 
     protected String buildSummarizeSystemPrompt() {
