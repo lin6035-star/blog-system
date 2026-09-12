@@ -256,6 +256,9 @@ public class AgentRunSuggestionService {
                 AiWorkflowLearningAssistDTO dto = new AiWorkflowLearningAssistDTO();
                 dto.setConversationId(run.getSessionId());
                 dto.setRequest(suggestion.initialMessage());
+                // V4③ 第二刀：确认时直接交接 reason（不改 ai_sessions 结论锚结构）。
+                // 这是「确认时交接」——用户点了确认，reason 就是他要的方向，不需要跨 run 锚。
+                dto.setSuggestionReason(suggestion.reason());
                 applyPlanTarget(dto, run.getUserId(), suggestion.initialMessage());
                 yield aiWorkflowRunService.createLearningAssistWorkflow(dto);
             }

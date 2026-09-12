@@ -12,6 +12,7 @@ import com.hailin.blogsystem.entity.dto.PageContextDTO;
 import com.hailin.blogsystem.mapper.AiAgentRunMapper;
 import com.hailin.blogsystem.mapper.AiAgentStepMapper;
 import lombok.extern.slf4j.Slf4j;
+import org.slf4j.MDC;
 
 import java.time.LocalDateTime;
 import java.util.ArrayList;
@@ -289,6 +290,9 @@ public abstract class AbstractAgentRuntime {
         AiAgentRun run = createRun(userId, sessionId, effectiveGoal);
         log.info("Agent Run 创建: runId={}, userId={}, goal={}", run.getId(), userId, truncate(effectiveGoal, 100));
 
+        // V4⑥ 可观测性：run 期间的所有日志带上 agentRunId，与 traceId 配合做「日志 ↔ DB」互查
+        MDC.put("agentRunId", String.valueOf(run.getId()));
+
         List<String> observations = new ArrayList<>();
         List<AgentStepActionType> successfulActions = new ArrayList<>();   // V3.11：结构化事实（只读动作成功列表）
         List<Integer> successfulActionSteps = new ArrayList<>();           // V3.11：成功动作步号（到顶判据用）
@@ -401,13 +405,25 @@ public abstract class AbstractAgentRuntime {
                     return suggestWorkflow(run, decision, effectiveGoal, observations, emitter, pageContext);
                 }
 
+                // V3.8：后端预处理（决议目标并入 QUERY_ARTICLE input）。
+                // 提到事件之前，让重复检查比对的是**实际落库的 input**（含后端注入的决议目标）
+                AgentStepDecision prepared = prepareStepDecision(run, decision);
+
+                // V4 规则级重复拦截：同动作 + 同参数的查询再来一次不会有新结果
+                if (rejectDuplicatedQuery(run, prepared, nextStepNo, observations, emitter)) {
+                    run.setCurrentStep(nextStepNo);
+                    run.setUsedSteps(nextStepNo);
+                    run.setContextJson(toJson(clipContext(observations)));
+                    run.setUpdatedAt(LocalDateTime.now());
+                    runMapper.updateById(run);
+                    continue;
+                }
+
                 // 执行只读动作（执行前后推步骤事件，前端实时渲染思考过程）
                 // V3.10：RUNNING/SUCCESS 携带同一句 thoughtSummary（行文本跨状态稳定，D4），
                 // FAILED 不携带——失败时优先展示失败文案，不让动机句覆盖失败原因
                 emitter.emit(nextStepNo, decision.actionType().name(), "RUNNING",
                         "正在" + actionLabel(decision.actionType()) + "...", decision.thoughtSummary());
-                // V3.8：后端预处理（决议目标并入 QUERY_ARTICLE input）
-                AgentStepDecision prepared = prepareStepDecision(run, decision);
                 String observation = executeActionAndRecordStep(
                         run, prepared, userId, nextStepNo, emitter, pageContext,
                         successfulActions, successfulActionSteps
@@ -442,6 +458,9 @@ public abstract class AbstractAgentRuntime {
         } catch (Exception e) {
             log.error("Agent Run 执行异常: runId={}", run.getId(), e);
             return markFailed(run, "Agent 执行异常，请稍后重试");
+        } finally {
+            // 只移除本键——不能用 MDC.clear()，它会连 Spring 放的 traceId 一起清掉
+            MDC.remove("agentRunId");
         }
     }
 
@@ -491,8 +510,9 @@ public abstract class AbstractAgentRuntime {
     /**
      * V3.13 Plan Preview：首步采集 / 校验 / 落库 / 发事件。
      *
-     * 时序写死：白名单校验通过 → plan 校验 → **单列更新落库** → `emitPlan` → 首个步骤事件。
-     * - **先落库再发事件**（与 V3.12 孤儿锚同一原则：事件不可先于持久化）
+     * 时序写死：白名单校验通过 → plan 校验 → **单列更新落库（按影响行数判定）** → `emitPlan` → 首个步骤事件。
+     * - **先落库再发事件**（与 V3.12 孤儿锚同一原则：事件不可先于持久化）——
+     *   落库影响行数 ≠ 1 视为未落库，只记日志不发事件，防「实时有计划、库里没有」分叉
      * - `AGENT_PLAN` 必须在首个 `AGENT_STEP` 事件之前发，否则前端视觉顺序会闪
      * - 落库走**单列更新**，不复用 `updateById`——否则计划写失败会与 run 状态写失败
      *   混成同一个故障，fail-open 形同虚设
@@ -518,10 +538,15 @@ public abstract class AbstractAgentRuntime {
                 return;
             }
             String planJson = toJson(plan);
-            runMapper.update(null, new UpdateWrapper<AiAgentRun>()
+            int updated = runMapper.update(null, new UpdateWrapper<AiAgentRun>()
                     .eq("id", run.getId())
                     .set("plan_json", planJson)
                     .set("updated_at", LocalDateTime.now()));
+            if (updated != 1) {
+                // 落库未命中（run 行不存在等）→ 只记日志不发事件，防「实时有计划、库里没有」分叉
+                log.warn("Plan Preview 落库未命中 run 行，跳过事件: runId={}", run.getId());
+                return;
+            }
             run.setPlanJson(planJson);
             emitter.emitPlan(run.getId(), plan);
         } catch (Exception e) {
@@ -598,7 +623,7 @@ public abstract class AbstractAgentRuntime {
             // V3.11：成功动作进结构化列表（供证据收敛门判定；步号供到顶保守收尾判据）
             successfulActions.add(decision.actionType());
             successfulActionSteps.add(stepNo);
-            return clipObservation(observation);
+            return tagObservation(decision, clipObservation(observation));
         } catch (Exception e) {
             log.warn("Agent Step 执行失败: runId={}, stepNo={}, action={}",
                     run.getId(), stepNo, decision.actionType(), e);
@@ -612,8 +637,49 @@ public abstract class AbstractAgentRuntime {
             if (isTerminalFailure(e)) {
                 throw new AgentRunTerminalException(stepNo, e.getMessage());
             }
-            return "动作执行失败：" + truncate(e.getMessage(), 200);
+            return tagObservation(decision, "动作执行失败：" + truncate(e.getMessage(), 200));
         }
+    }
+
+    /**
+     * 给观察加**来源标注**：模型在下一轮决策时必须看得见「我做过什么动作、用什么参数」。
+     *
+     * V4 根因（2026-09-11 开发者面板实测）：观察里只有结果文本，模型无法确认某段内容是不是
+     * 「我要查的那个查询」的产物——于是用同一个查询反复试探（同参同果 4 次，最后一次它引用了
+     * 第 3 步的结果作答，说明信息早就够了，缺的只是「已经查过」这个事实）。
+     *
+     * 硬拦只治症状（拦得住动作，拦不住模型的不确定），标注才是治本。
+     * 两者互补：标注让模型自己看得见，硬拦兜底防它仍不确定时的空转。
+     */
+    private String tagObservation(AgentStepDecision decision, String observation) {
+        return "[" + decision.actionType().name() + queryParamLabel(decision.input()) + "]\n" + observation;
+    }
+
+    /**
+     * 只带出有语义的查询参数。
+     * 内部标识（articleId / anchorMode）不进观察——模型不需要，按规则也不该看到。
+     */
+    private String queryParamLabel(Map<String, Object> input) {
+        if (input == null || input.isEmpty()) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder();
+        appendQueryParam(sb, input, "focus");
+        appendQueryParam(sb, input, "question");
+        appendQueryParam(sb, input, "keyword");
+        return sb.toString();
+    }
+
+    private void appendQueryParam(StringBuilder sb, Map<String, Object> input, String key) {
+        Object value = input.get(key);
+        if (value == null) {
+            return;
+        }
+        String text = String.valueOf(value).trim();
+        if (text.isEmpty()) {
+            return;
+        }
+        sb.append(' ').append(key).append('=').append(truncate(text, 60));
     }
 
     private AgentRunResult completeWithAnswer(
@@ -776,6 +842,79 @@ public abstract class AbstractAgentRuntime {
                 run.getUsedSteps(),
                 suggestion
         );
+    }
+
+    /**
+     * V4 规则级重复拦截：同一动作 + 同一参数的查询重复执行，结果不会变化
+     * （同 query + 同数据 = 同结果，与「第一次有没有查全」无关），属纯空转。
+     *
+     * 实测依据（2026-09-11 开发者只读面板观测）：一次多目标请求连发 4 次
+     * `QUERY_MEMORY {"question":"写作偏好"}`，`input_json` 与 `output_json` 四次完全相同，
+     * 上下文未触发裁剪（3446 &lt; 6000），且决策器 prompt 里「一次就够 / 不要重复执行完全相同的查询」
+     * 两条软约束均未生效——模型无法可靠监控自己的动作历史，故改由 Runtime 硬拦。
+     *
+     * 边界：
+     * - **只拦原样重复**：换关键词的二次查询一律放行（那才是有效探索）
+     * - 只匹配 SUCCESS 的历史步，上次失败的重试不受影响
+     * - 拦截落 SKIPPED step 消耗步数，避免绕过 maxSteps 形成死循环；
+     *   SKIPPED 表示“系统主动省略已完成过的同参查询”，不是查询故障
+     *
+     * @return true 表示已拦截（调用方直接 continue）
+     */
+    private boolean rejectDuplicatedQuery(
+            AiAgentRun run,
+            AgentStepDecision decision,
+            int stepNo,
+            List<String> observations,
+            AgentStepEmitter emitter
+    ) {
+        AiAgentStep previous = stepMapper.selectOne(new LambdaQueryWrapper<AiAgentStep>()
+                .eq(AiAgentStep::getAgentRunId, run.getId())
+                .eq(AiAgentStep::getActionType, decision.actionType().name())
+                .eq(AiAgentStep::getStatus, AiAgentStepStatus.SUCCESS.name())
+                .eq(AiAgentStep::getInputJson, toJson(decision.input()))
+                .orderByAsc(AiAgentStep::getStepNo)
+                .last("LIMIT 1"));
+        if (previous == null) {
+            return false;
+        }
+
+        emitter.emit(stepNo, decision.actionType().name(), AiAgentStepStatus.SKIPPED.name(),
+                AgentStepLabelSupport.DUPLICATE_QUERY_SKIP_MESSAGE, null);
+        recordSkippedStep(run, decision, stepNo,
+                AgentStepLabelSupport.DUPLICATE_QUERY_SKIP_PREFIX
+                        + "：同一动作 + 同一参数在第 " + previous.getStepNo() + " 步已成功执行过");
+        observations.add(duplicateQueryHint(previous.getStepNo()));
+        return true;
+    }
+
+    /**
+     * 拦截后给决策器的观察：不光说「不许重复」，还要给出下一步能做什么
+     * （只禁不疏的话，模型会换个近义词继续空转）。
+     */
+    private String duplicateQueryHint(int previousStepNo) {
+        return "【系统提示】你重复了第 " + previousStepNo + " 步已经成功执行过的同一个查询"
+                + "（动作与参数完全相同），再执行一次也不会得到新结果。"
+                + "请换关键词或换角度查询；若确实没有更多可查的，直接基于已有观察作答。";
+    }
+
+    /** 重复查询等“主动省略”动作落 SKIPPED：保留审计与步数，但不伪装成执行失败。 */
+    protected void recordSkippedStep(
+            AiAgentRun run,
+            AgentStepDecision decision,
+            int stepNo,
+            String reason
+    ) {
+        AiAgentStep step = new AiAgentStep();
+        step.setAgentRunId(run.getId());
+        step.setStepNo(stepNo);
+        step.setActionType(decision.actionType().name());
+        step.setInputJson(toJson(decision.input()));
+        step.setStatus(AiAgentStepStatus.SKIPPED.name());
+        step.setErrorMessage(reason);
+        step.setDurationMs(0L);
+        step.setCreatedAt(LocalDateTime.now());
+        stepMapper.insert(step);
     }
 
     /**

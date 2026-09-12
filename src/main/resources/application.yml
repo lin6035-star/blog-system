@@ -6,6 +6,9 @@ server:
 
 # 连接池
 spring:
+  application:
+    name: blog-system        # 日志 correlation 与 tracing 使用
+
   datasource:
     url: jdbc:mysql://localhost:3306/blog_system?serverTimezone=Asia/Shanghai&useUnicode=true&characterEncoding=utf-8&zeroDateTimeBehavior=convertToNull&useSSL=false&allowPublicKeyRetrieval=true
     username: myRoot
@@ -34,7 +37,7 @@ spring:
       read-timeout: 60s
       chat:
         options:
-          model: ${AI_CHAT_MODEL:qwen3.5-plus-2026-04-20}
+          model: ${AI_CHAT_MODEL:qwen3.6-flash}
       embedding:
         options:
           model: text-embedding-v3
@@ -79,6 +82,30 @@ aliyun:
     bucketName: blog-system-26
     region: cn-beijing
 
+# ===== 可观测性：traceId 贯穿（V4⑥ 落地动作）=====
+# 设计稿：docs/agent/agent-observability-traceid-design.md
+management:
+  tracing:
+    sampling:
+      probability: 1.0            # 本地全采样；上生产再调低（设计稿 §3.6）
+  endpoints:
+    web:
+      exposure:
+        exclude: "*"              # 零暴露：本刀只要 traceId，不需要任何 actuator 端点
+
+logging:
+  pattern:
+    correlation: "[${spring.application.name:},%X{traceId:-},%X{spanId:-}] "
+  include-application-name: false
+  # 落文件：控制台日志会随进程结束丢失，AgentDecisionTrace / traceId 排查需要可回溯的日志
+  file:
+    name: logs/blog-system.log
+  logback:
+    rollingpolicy:
+      max-file-size: 50MB
+      max-history: 7
+      total-size-cap: 1GB
+
 blog:
   migration:
     enabled: false
@@ -110,6 +137,9 @@ blog:
         max-size: 4
         queue-capacity: 100
         thread-name-prefix: rag-sync-
+    inspection:                    # V4 第一刀：开发者只读面板（run / step 完整 inspection）
+      enabled: true
+      allowed-user-ids: [ 2085218095032741891 ]      # 按自己的 userId 调整；数据范围仍限「自己的 run」
     system-prompt: |
       你是海林Blog的智能AI助手，帮助用户浏览博客内容、理解文章、搜索资料、解决技术问题。
       你需要区分两类问题：

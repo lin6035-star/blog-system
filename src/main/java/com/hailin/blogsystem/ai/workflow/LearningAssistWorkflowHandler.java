@@ -78,6 +78,11 @@ public class LearningAssistWorkflowHandler extends AbstractWorkflowHandler {
 
         Map<String, Object> context = flowSupport.buildInitialContext("");
         workflowContextSupport.getMap(context, "input").put("request", request.trim());
+        //V4③ 第二刀：建议卡确认时的方向参考（仅 confirm 入口携带），创建时刻固化进 context。
+        // 走 confirm 的建议才带（未确认的建议结构性进不来）；不参与计划定位，只作拆解弱参考。
+        if (dto != null && !workflowContextSupport.isBlank(dto.getSuggestionReason())) {
+            context.put("handoffReason", dto.getSuggestionReason().trim());
+        }
         if (planId != null) {
             context.put("targetPlanId", planId);
         } else if (dto != null && dto.getCandidates() != null && !dto.getCandidates().isEmpty()) {
@@ -348,7 +353,7 @@ public class LearningAssistWorkflowHandler extends AbstractWorkflowHandler {
                 );
                 workflowContextSupport.getStepResults(context).put("plan", plan);
                 workflowContextSupport.getStepResults(context).put("qualityCheck",
-                        flowSupport.buildBreakdownQualityCheck(plan, getTargetStageExistingTitles(context)));
+                        flowSupport.runBreakdownQualityCheck(run, plan, getTargetStageExistingTitles(context), emitter));
 
                 return waitForConfirm(run, context,
                         AiWorkflowStatus.WAITING_LEARNING_PLAN_CONFIRM,

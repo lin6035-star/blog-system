@@ -10,7 +10,9 @@ import com.hailin.blogsystem.entity.AiAgentRun;
 import com.hailin.blogsystem.entity.AiAgentStep;
 import com.hailin.blogsystem.entity.dto.AiAgentRunStatus;
 import com.hailin.blogsystem.entity.vo.AgentRunDetailVO;
+import com.hailin.blogsystem.entity.vo.AgentRunDevDetailVO;
 import com.hailin.blogsystem.entity.vo.AgentRunSummaryVO;
+import com.hailin.blogsystem.entity.vo.AgentStepRawVO;
 import com.hailin.blogsystem.entity.vo.AgentStepVO;
 import com.hailin.blogsystem.entity.vo.PageVO;
 import com.hailin.blogsystem.exception.BusinessException;
@@ -79,6 +81,39 @@ public class AgentRunInspectionService {
         return new PageVO<>(list, pageResult.getTotal(), safePage, safeSize);
     }
 
+    /**
+     * V4 第一刀·开发者通道：完整 step 列表（含 inputJson / outputJson 原始列）。
+     *
+     * 与 {@link #listSteps(Long)} 同一数据源，区别是**不做派生、不脱敏**——仅供开发者审计，
+     * 调用方必须已过白名单门禁（见 AgentRunDevController）。数据范围仍是「自己的 run」。
+     */
+    public List<AgentStepRawVO> listRawSteps(Long agentRunId) {
+        Long userId = requireLogin();
+        getOwnedRun(agentRunId, userId);
+
+        return stepMapper.selectList(new LambdaQueryWrapper<AiAgentStep>()
+                        .eq(AiAgentStep::getAgentRunId, agentRunId)
+                        .orderByAsc(AiAgentStep::getStepNo))
+                .stream()
+                .map(this::toRawStep)
+                .toList();
+    }
+
+    /**
+     * V4 第一刀·开发者通道：安全摘要 + 原始 contextJson（observations）。
+     *
+     * 组合而非合并：摘要与原始材料字段分开摆放，避免使用者忘记哪一份可信。
+     */
+    public AgentRunDevDetailVO getDevDetail(Long agentRunId) {
+        Long userId = requireLogin();
+        AiAgentRun run = getOwnedRun(agentRunId, userId);
+
+        AgentRunDevDetailVO vo = new AgentRunDevDetailVO();
+        vo.setRun(toDetail(run));
+        vo.setContextJson(run.getContextJson());
+        return vo;
+    }
+
     private AgentRunDetailVO toDetail(AiAgentRun run) {
         AgentRunDetailVO vo = new AgentRunDetailVO();
         vo.setId(run.getId());
@@ -120,17 +155,48 @@ public class AgentRunInspectionService {
         AgentStepVO vo = new AgentStepVO();
         vo.setStepNo(step.getStepNo());
         vo.setActionType(step.getActionType());
-        vo.setStatus(step.getStatus());
+        String displayStatus = displayStatus(step);
+        vo.setStatus(displayStatus);
         vo.setErrorMessage(step.getErrorMessage());
         vo.setDurationMs(step.getDurationMs());
         // V3.10：思考摘要（与实时 AGENT_STEP 事件一致，刷新前后行文本不串味；可空）
         vo.setThoughtSummary(step.getThoughtSummary());
         // 展示文案与实时 AGENT_STEP 事件一致（刷新前后思考面板不串味）
-        vo.setMessage("SUCCESS".equals(step.getStatus())
-                ? AgentStepLabelSupport.completedMessage(
-                        step.getActionType(), step.getInputJson(), objectMapper)
-                : AgentStepLabelSupport.failedMessage(step.getActionType()));
+        vo.setMessage(switch (displayStatus) {
+            case "SUCCESS" -> AgentStepLabelSupport.completedMessage(
+                    step.getActionType(), step.getInputJson(), objectMapper);
+            case "SKIPPED" -> AgentStepLabelSupport.skippedMessage(
+                    step.getActionType(), step.getErrorMessage());
+            default -> AgentStepLabelSupport.failedMessage(step.getActionType(), step.getErrorMessage());
+        });
         vo.setSummary(parseSummary(step.getOutputJson()));
+        vo.setCreatedAt(step.getCreatedAt());
+        return vo;
+    }
+
+    /**
+     * 历史兼容：重复查询最早落成 FAILED，但语义上是系统主动跳过。
+     * 普通展示层归一为 SKIPPED；开发者 raw 接口仍暴露 DB 原值。
+     */
+    private String displayStatus(AiAgentStep step) {
+        if ("FAILED".equals(step.getStatus())
+                && step.getErrorMessage() != null
+                && step.getErrorMessage().startsWith(AgentStepLabelSupport.DUPLICATE_QUERY_SKIP_PREFIX)) {
+            return "SKIPPED";
+        }
+        return step.getStatus();
+    }
+
+    private AgentStepRawVO toRawStep(AiAgentStep step) {
+        AgentStepRawVO vo = new AgentStepRawVO();
+        vo.setStepNo(step.getStepNo());
+        vo.setActionType(step.getActionType());
+        vo.setStatus(step.getStatus());
+        vo.setErrorMessage(step.getErrorMessage());
+        vo.setDurationMs(step.getDurationMs());
+        vo.setInputJson(step.getInputJson());
+        vo.setOutputJson(step.getOutputJson());
+        vo.setThoughtSummary(step.getThoughtSummary());
         vo.setCreatedAt(step.getCreatedAt());
         return vo;
     }

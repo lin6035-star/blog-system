@@ -47,8 +47,8 @@ public class AiEpisodicMemoryExtractorServiceImpl implements
             return;
         }
 
-        boolean eventTriggered = shouldExtract(userMessage)
-                || shouldExtract(assistantReply);
+        // 只看用户消息。AI 回复中的“阶段/下一步/准备”等普通措辞不能反向触发记忆抽取。
+        boolean eventTriggered = shouldExtractUserMessage(userMessage);
 
         long messageCount = countSessionMessages(sessionId);
         boolean windowTriggered = messageCount > 0 && messageCount % WINDOW_TRIGGER_MOD == 0;
@@ -98,7 +98,7 @@ public class AiEpisodicMemoryExtractorServiceImpl implements
         return ordered;
     }
 
-    private boolean shouldExtract(String message) {
+    private boolean shouldExtractUserMessage(String message) {
         if (message == null || message.isBlank()) {
             return false;
         }
@@ -107,8 +107,9 @@ public class AiEpisodicMemoryExtractorServiceImpl implements
 
         return containsAny(text,
                 "决定",
-                "选择",
-                "最终",
+                "最终选择",
+                "选用",
+                "采用",
                 "拍板",
                 "就用",
                 "完成",
@@ -116,13 +117,17 @@ public class AiEpisodicMemoryExtractorServiceImpl implements
                 "测试通过",
                 "通过了",
                 "上线",
+                "发布",
                 "部署",
                 "里程碑",
-                "阶段",
-                "进度",
-                "下一步",
-                "准备",
-                "进入"
+                "后面再做",
+                "先不做",
+                "暂缓",
+                "准备做",
+                "计划做",
+                "下一步做",
+                "继续推进",
+                "进入下一阶段"
         );
     }
 
@@ -151,7 +156,9 @@ public class AiEpisodicMemoryExtractorServiceImpl implements
                         重要来源规则：
                         - 只要是用户明确表达过的项目阶段、事件、里程碑、决定、确认、确定、计划、完成情况，都可以保存。
                         - AI 单方面提出的建议、方案、分析、总结，不要保存。
-                        - 如果只有 AI 建议，没有用户确认，但如果用户后面明确采纳了，有用户“可以 / 就这样 / 按这个做 / 最终决定 / 我来改 / 继续 / 好，那就用这个”，就可以保存最终版本
+                        - 如果只有 AI 建议，没有用户确认，不要保存。
+                        - 只有用户在来源消息中明确采纳或确认（如“可以 / 就这样 / 按这个做 / 最终决定 / 我来改”）时，才可以保存最终版本。
+                        - 不得把用户继续提问、没有反驳、执行其他不相关操作，推断为确认。
                         - 阶段推进、完成节点，优先记为 MILESTONE。
                         - 当前状态、进行中的事项，优先记为 EVENT。
                         - 后续要做的事，记为 PLAN。

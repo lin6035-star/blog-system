@@ -308,9 +308,11 @@ class ArticleAgentActionExecutorTests {
         // 动作 SUCCESS 但证据为空，验证器据此反复判 NEED_MORE，6 步空转到顶。
         Articles article = article(12L, 100L);
         article.setTitle("Vibe Coding 入门指南：让编程随感觉流动");
+        // 只让一个 ## 命中焦点词：H1 行也命中但会被跳过——若它参与，就会与小节并列从而走降级，
+        // 这条测试就测不到「跳过纯标题节 + 返回正文」的本意了
         article.setContent("# Vibe Coding 入门指南：让编程随感觉流动\n\n"
                 + "## 什么是 Vibe Coding？\n\n它是一种以直觉和情绪驱动的编程方式。\n\n"
-                + "## 怎么做一次 Vibe Coding？\n\n### 准备：调出你的创作氛围\n\n播放一首 Lo-fi，泡杯咖啡。\n\n"
+                + "## 怎么开始？\n\n### 准备：调出你的创作氛围\n\n播放一首 Lo-fi，泡杯咖啡。\n\n"
                 + "## 现在就开始吧\n\n今晚就打开编辑器。");
         when(articlesService.getById(12L)).thenReturn(article);
 
@@ -322,14 +324,13 @@ class ArticleAgentActionExecutorTests {
         );
 
         assertThat(observation).contains("聚焦片段");
-        // 必须带出正文，不能只回标题行
-        assertThat(observation).contains("播放一首 Lo-fi");
-        assertThat(observation).contains("## 怎么做一次 Vibe Coding？");
+        // 必须带出该节的正文，而不是那个只有标题的 H1 节
+        assertThat(observation).contains("它是一种以直觉和情绪驱动的编程方式");
     }
 
     @Test
     void focusFallsBackToStructureSummaryWhenHeadingsTie() {
-        // 焦点词同时命中多个小节且正文含量也分不出高下 → 降级返回结构摘要。
+        // 焦点词同时命中多个小节且正文含量也分不出高下 → 明说「无法确定」+ 结构摘要。
         // 不能返回「候选清单」：那不是正文，语义闸永远判不了证据充足，只会继续空转到顶。
         Articles article = article(12L, 100L);
         article.setContent("# 笔记\n\n## Vibe Coding 实践\n\n用自然语言驱动 AI 写代码\n\n"
@@ -343,8 +344,10 @@ class ArticleAgentActionExecutorTests {
                 articleContext("12")
         );
 
-        // 降级到结构摘要：至少给出小标题结构，LLM 可据此判断或追问
-        assertThat(observation).contains("聚焦片段");
+        // 必须**明说无法确定**（2026-09-11 实测教训：静默回退 + 「聚焦片段：」前缀会让模型
+        // 以为拿到了那节内容 → 凭空评价 → 被证据门拦 → 重试同一 focus → 步数用满），
+        // 再附结构摘要供它换一个更精确的定位词
+        assertThat(observation).contains("未能确定");
         assertThat(observation).contains("小标题结构");
         assertThat(observation).contains("## Vibe Coding 实践");
         assertThat(observation).contains("## Vibe Coding 的坑");
@@ -382,6 +385,41 @@ class ArticleAgentActionExecutorTests {
 
         assertThat(observation).contains("未能从这篇文章中找到");
         assertThat(observation).contains("缓存雪崩");
+    }
+
+    @Test
+    void structuralFocusReturnsStructureSummaryInsteadOfMiss() {
+        // 用户问「结合偏好看文章整体」时，LLM 容易把结构/小标题/摘要放进 focus。
+        // 这些不是正文小节名，应该返回结构摘要，否则 verifier 会因缺少文章证据正确拦截。
+        when(articlesService.getById(12L)).thenReturn(article(12L, 100L));
+
+        String observation = executor.execute(
+                AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE)
+                        .withInput(Map.of("articleId", "12", "focus", "文章结构、小标题和摘要部分")),
+                100L,
+                articleContext("12")
+        );
+
+        assertThat(observation).contains("当前文章分析");
+        assertThat(observation).contains("- 小标题结构：");
+        assertThat(observation).contains("- 摘要：缓存穿透与击穿的区别");
+        assertThat(observation).doesNotContain("未能从这篇文章中找到");
+    }
+
+    @Test
+    void summaryFocusReturnsStructureSummaryInsteadOfMiss() {
+        when(articlesService.getById(12L)).thenReturn(article(12L, 100L));
+
+        String observation = executor.execute(
+                AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE)
+                        .withInput(Map.of("articleId", "12", "focus", "摘要部分")),
+                100L,
+                articleContext("12")
+        );
+
+        assertThat(observation).contains("当前文章分析");
+        assertThat(observation).contains("- 摘要：缓存穿透与击穿的区别");
+        assertThat(observation).doesNotContain("未能从这篇文章中找到");
     }
 
     @Test

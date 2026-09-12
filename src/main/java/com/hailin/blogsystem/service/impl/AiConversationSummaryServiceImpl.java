@@ -6,9 +6,11 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hailin.blogsystem.entity.AiConversationSummaries;
 import com.hailin.blogsystem.entity.AiMessages;
+import com.hailin.blogsystem.entity.AiSessions;
 import com.hailin.blogsystem.entity.vo.AiConversationSummaryStatusVO;
 import com.hailin.blogsystem.mapper.AiConversationSummaryMapper;
 import com.hailin.blogsystem.mapper.AiMessageMapper;
+import com.hailin.blogsystem.mapper.AiSessionMapper;
 import com.hailin.blogsystem.service.AiConversationSummaryService;
 import com.hailin.blogsystem.utils.UserContext;
 import lombok.RequiredArgsConstructor;
@@ -33,6 +35,7 @@ public class AiConversationSummaryServiceImpl extends ServiceImpl<AiConversation
     private static final int MESSAGE_TEXT_LIMIT = 500;
 
     private final AiMessageMapper aiMessageMapper;
+    private final AiSessionMapper aiSessionMapper;
     private final ChatClient.Builder chatClientBuilder;
     private final ObjectMapper objectMapper;
 
@@ -173,7 +176,20 @@ public class AiConversationSummaryServiceImpl extends ServiceImpl<AiConversation
     public AiConversationSummaryStatusVO getSummaryStatus(Long sessionId) {
         Long userId = UserContext.get();
         if (userId == null || sessionId == null) {
-            return new AiConversationSummaryStatusVO(false, null, 0);
+            return new AiConversationSummaryStatusVO(false, null, 0, false);
+        }
+
+        AiSessions session = aiSessionMapper.selectOne(new LambdaQueryWrapper<AiSessions>()
+                .eq(AiSessions::getId, sessionId)
+                .eq(AiSessions::getUserId, userId));
+        if (session == null) {
+            return new AiConversationSummaryStatusVO(false, null, 0, false);
+        }
+
+        // 会话未达到压缩窗口时，不查询摘要行，也不让前端进入无意义轮询。
+        long messageCount = countSessionMessages(sessionId);
+        if (messageCount < RECENT_WINDOW) {
+            return new AiConversationSummaryStatusVO(false, null, 0, false);
         }
 
         AiConversationSummaries summary = lambdaQuery()
@@ -182,13 +198,14 @@ public class AiConversationSummaryServiceImpl extends ServiceImpl<AiConversation
                 .one();
 
         if (summary == null) {
-            return new AiConversationSummaryStatusVO(false, null, 0);
+            return new AiConversationSummaryStatusVO(false, null, 0, true);
         }
 
         return new AiConversationSummaryStatusVO(
                 Boolean.TRUE.equals(summary.getCompressing()),
                 summary.getLastCompressedAt(),
-                summary.getCoveredMessageCount() == null ? 0 : summary.getCoveredMessageCount()
+                summary.getCoveredMessageCount() == null ? 0 : summary.getCoveredMessageCount(),
+                true
         );
     }
 
@@ -197,6 +214,11 @@ public class AiConversationSummaryServiceImpl extends ServiceImpl<AiConversation
         return lambdaQuery()
                 .eq(AiConversationSummaries::getSessionId, sessionId)
                 .one();
+    }
+
+    private long countSessionMessages(Long sessionId) {
+        return aiMessageMapper.selectCount(new LambdaQueryWrapper<AiMessages>()
+                .eq(AiMessages::getSessionId, sessionId));
     }
 
     @Override

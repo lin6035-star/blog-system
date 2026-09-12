@@ -141,6 +141,7 @@ public class ArticleOptimizeWorkflowHandler extends AbstractWorkflowHandler {
         Map<String, Object> stepResults = workflowContextSupport.getStepResults(context);
 
         //1. LOAD_ARTICLE：加载文章并校验作者（业务 Handler 允许依赖业务服务）
+        run.setCurrentStep(AiWorkflowStep.LOAD_ARTICLE.name());
         Map<String, Object> articleInfo = workflowStepRunner.run(
                 run.getId(),
                 AiWorkflowStep.LOAD_ARTICLE,
@@ -149,8 +150,10 @@ public class ArticleOptimizeWorkflowHandler extends AbstractWorkflowHandler {
                 safeEmitter
         );
         stepResults.put("article", articleInfo);
+        run.setContextJson(workflowContextSupport.toJson(context));
 
         //2. ANALYZE_ARTICLE：只分析，不改内容
+        run.setCurrentStep(AiWorkflowStep.ANALYZE_ARTICLE.name());
         Map<String, Object> analysis = workflowStepRunner.run(
                 run.getId(),
                 AiWorkflowStep.ANALYZE_ARTICLE,
@@ -159,8 +162,10 @@ public class ArticleOptimizeWorkflowHandler extends AbstractWorkflowHandler {
                 safeEmitter
         );
         stepResults.put("analysis", analysis);
+        run.setContextJson(workflowContextSupport.toJson(context));
 
         //3. MEMORY_RETRIEVE：读取用户长期记忆
+        run.setCurrentStep(AiWorkflowStep.MEMORY_RETRIEVE.name());
         String memoryContext = workflowStepRunner.run(
                 run.getId(),
                 AiWorkflowStep.MEMORY_RETRIEVE,
@@ -169,8 +174,10 @@ public class ArticleOptimizeWorkflowHandler extends AbstractWorkflowHandler {
                 safeEmitter
         );
         context.put("memoryContext", memoryContext);
+        run.setContextJson(workflowContextSupport.toJson(context));
 
         //4. RAG_SEARCH：以文章主题检索站内相关文章
+        run.setCurrentStep(AiWorkflowStep.RAG_SEARCH.name());
         List<Map<String, Object>> ragReferences = workflowStepRunner.run(
                 run.getId(),
                 AiWorkflowStep.RAG_SEARCH,
@@ -179,13 +186,20 @@ public class ArticleOptimizeWorkflowHandler extends AbstractWorkflowHandler {
                 safeEmitter
         );
         context.put("ragContext", Map.of("references", ragReferences));
+        run.setContextJson(workflowContextSupport.toJson(context));
 
         //5. GENERATE_OPTIMIZATION_PLAN：只生成方案，不生成最终文章
-        String plan = workflowStepRunner.run(
-                run.getId(),
-                AiWorkflowStep.GENERATE_OPTIMIZATION_PLAN,
+        run.setCurrentStep(AiWorkflowStep.GENERATE_OPTIMIZATION_PLAN.name());
+        String plan = buildOptimizationPlanWithRetry(
+                run,
+                articleInfo,
+                getInputInstruction(context),
+                memoryContext,
+                ragReferences,
+                null,
+                suggestedDirectionOf(run),
                 "正在生成优化方案...",
-                () -> buildOptimizationPlan(run, articleInfo, getInputInstruction(context), memoryContext, ragReferences, safeEmitter),
+                "方案生成返回空内容，正在重新生成...",
                 safeEmitter
         );
         stepResults.put("optimizationPlan", plan);
@@ -217,6 +231,7 @@ public class ArticleOptimizeWorkflowHandler extends AbstractWorkflowHandler {
     ) {
         switch (status) {
             case WAITING_PLAN_CONFIRM -> {
+                run.setCurrentStep(AiWorkflowStep.REWRITE_ARTICLE.name());
                 String optimizedContent = workflowStepRunner.run(
                         run.getId(),
                         AiWorkflowStep.REWRITE_ARTICLE,
@@ -225,7 +240,9 @@ public class ArticleOptimizeWorkflowHandler extends AbstractWorkflowHandler {
                         emitter
                 );
                 stepResults.put("optimizedContent", optimizedContent);
+                run.setContextJson(workflowContextSupport.toJson(context));
 
+                run.setCurrentStep(AiWorkflowStep.CONTENT_CHECK.name());
                 Map<String, Object> contentCheck = workflowStepRunner.run(
                         run.getId(),
                         AiWorkflowStep.CONTENT_CHECK,
@@ -234,6 +251,7 @@ public class ArticleOptimizeWorkflowHandler extends AbstractWorkflowHandler {
                         emitter
                 );
                 stepResults.put("contentCheck", contentCheck);
+                run.setContextJson(workflowContextSupport.toJson(context));
 
                 // 第一次不合格 → 把检查问题喂回模型，自动重写一次
                 if (Boolean.FALSE.equals(contentCheck.get("passed"))) {
@@ -245,7 +263,9 @@ public class ArticleOptimizeWorkflowHandler extends AbstractWorkflowHandler {
                             AiWorkflowStatus.RUNNING.name(),
                             systemFeedback
                     );
+                    run.setContextJson(workflowContextSupport.toJson(context));
 
+                    run.setCurrentStep(AiWorkflowStep.REWRITE_ARTICLE.name());
                     String retriedContent = workflowStepRunner.run(
                             run.getId(),
                             AiWorkflowStep.REWRITE_ARTICLE,
@@ -254,7 +274,9 @@ public class ArticleOptimizeWorkflowHandler extends AbstractWorkflowHandler {
                             emitter
                     );
                     stepResults.put("optimizedContent", retriedContent);
+                    run.setContextJson(workflowContextSupport.toJson(context));
 
+                    run.setCurrentStep(AiWorkflowStep.CONTENT_CHECK.name());
                     contentCheck = workflowStepRunner.run(
                             run.getId(),
                             AiWorkflowStep.CONTENT_CHECK,
@@ -263,6 +285,7 @@ public class ArticleOptimizeWorkflowHandler extends AbstractWorkflowHandler {
                             emitter
                     );
                     stepResults.put("contentCheck", contentCheck);
+                    run.setContextJson(workflowContextSupport.toJson(context));
                 }
 
                 return waitForConfirm(run, context,
@@ -271,6 +294,7 @@ public class ArticleOptimizeWorkflowHandler extends AbstractWorkflowHandler {
                         AiWorkflowConfirmationType.DRAFT);
             }
             case WAITING_DRAFT_CONFIRM -> {
+                run.setCurrentStep(AiWorkflowStep.FILL_ARTICLE.name());
                 AiEditorCommand editorAction = workflowStepRunner.run(
                         run.getId(),
                         AiWorkflowStep.FILL_ARTICLE,
@@ -301,23 +325,21 @@ public class ArticleOptimizeWorkflowHandler extends AbstractWorkflowHandler {
     ) {
         switch (status) {
             case WAITING_PLAN_CONFIRM -> {
-                String plan = workflowStepRunner.run(
-                        run.getId(),
-                        AiWorkflowStep.GENERATE_OPTIMIZATION_PLAN,
+                run.setCurrentStep(AiWorkflowStep.GENERATE_OPTIMIZATION_PLAN.name());
+                String plan = buildOptimizationPlanWithRetry(
+                        run,
+                        workflowContextSupport.getMap(stepResults, "article"),
+                        getInputInstruction(context),
+                        String.valueOf(context.getOrDefault("memoryContext", "")),
+                        getRagReferences(context),
+                        feedback,
+                        null,   // V3.12：有 feedback 时不注入上轮方向（feedback 是更强的明确信号）
                         "正在按意见重新生成优化方案...",
-                        () -> buildOptimizationPlan(
-                                run,
-                                workflowContextSupport.getMap(stepResults, "article"),
-                                getInputInstruction(context),
-                                String.valueOf(context.getOrDefault("memoryContext", "")),
-                                getRagReferences(context),
-                                feedback,
-                                null,   // V3.12：有 feedback 时不注入上轮方向（feedback 是更强的明确信号）
-                                emitter
-                        ),
+                        "方案生成返回空内容，正在重新生成...",
                         emitter
                 );
                 stepResults.put("optimizationPlan", plan);
+                run.setContextJson(workflowContextSupport.toJson(context));
 
                 return waitForConfirm(run, context,
                         AiWorkflowStatus.WAITING_PLAN_CONFIRM,
@@ -325,6 +347,7 @@ public class ArticleOptimizeWorkflowHandler extends AbstractWorkflowHandler {
                         AiWorkflowConfirmationType.PLAN);
             }
             case WAITING_DRAFT_CONFIRM -> {
+                run.setCurrentStep(AiWorkflowStep.REWRITE_ARTICLE.name());
                 String optimizedContent = workflowStepRunner.run(
                         run.getId(),
                         AiWorkflowStep.REWRITE_ARTICLE,
@@ -333,7 +356,9 @@ public class ArticleOptimizeWorkflowHandler extends AbstractWorkflowHandler {
                         emitter
                 );
                 stepResults.put("optimizedContent", optimizedContent);
+                run.setContextJson(workflowContextSupport.toJson(context));
 
+                run.setCurrentStep(AiWorkflowStep.CONTENT_CHECK.name());
                 Map<String, Object> contentCheck = workflowStepRunner.run(
                         run.getId(),
                         AiWorkflowStep.CONTENT_CHECK,
@@ -342,6 +367,7 @@ public class ArticleOptimizeWorkflowHandler extends AbstractWorkflowHandler {
                         emitter
                 );
                 stepResults.put("contentCheck", contentCheck);
+                run.setContextJson(workflowContextSupport.toJson(context));
 
                 return waitForConfirm(run, context,
                         AiWorkflowStatus.WAITING_DRAFT_CONFIRM,
@@ -371,6 +397,7 @@ public class ArticleOptimizeWorkflowHandler extends AbstractWorkflowHandler {
                 return runInitialSteps(run, emitter);
             }
             case REWRITE_ARTICLE, CONTENT_CHECK -> {
+                run.setCurrentStep(AiWorkflowStep.REWRITE_ARTICLE.name());
                 String optimizedContent = workflowStepRunner.run(
                         run.getId(),
                         AiWorkflowStep.REWRITE_ARTICLE,
@@ -379,7 +406,9 @@ public class ArticleOptimizeWorkflowHandler extends AbstractWorkflowHandler {
                         emitter
                 );
                 stepResults.put("optimizedContent", optimizedContent);
+                run.setContextJson(workflowContextSupport.toJson(context));
 
+                run.setCurrentStep(AiWorkflowStep.CONTENT_CHECK.name());
                 Map<String, Object> contentCheck = workflowStepRunner.run(
                         run.getId(),
                         AiWorkflowStep.CONTENT_CHECK,
@@ -388,6 +417,7 @@ public class ArticleOptimizeWorkflowHandler extends AbstractWorkflowHandler {
                         emitter
                 );
                 stepResults.put("contentCheck", contentCheck);
+                run.setContextJson(workflowContextSupport.toJson(context));
 
                 return waitForConfirm(run, context,
                         AiWorkflowStatus.WAITING_DRAFT_CONFIRM,
@@ -395,6 +425,7 @@ public class ArticleOptimizeWorkflowHandler extends AbstractWorkflowHandler {
                         AiWorkflowConfirmationType.DRAFT);
             }
             case FILL_ARTICLE -> {
+                run.setCurrentStep(AiWorkflowStep.FILL_ARTICLE.name());
                 AiEditorCommand editorAction = buildEditorAction(context);
 
                 return finish(run, context, AiWorkflowStep.FILL_ARTICLE, editorAction);
@@ -491,6 +522,54 @@ public class ArticleOptimizeWorkflowHandler extends AbstractWorkflowHandler {
     private String suggestedDirectionOf(AiWorkflowRun run) {
         Map<String, Object> context = workflowContextSupport.parseContext(run.getContextJson());
         return getHandoffDirection(context);
+    }
+
+    /**
+     * 文章优化方案生成补一次异常级兜底：DashScope / Spring AI 流式调用偶发正常结束但无文本 chunk，
+     * 此时 LlmStreamCaller 会抛「模型返回空内容」。这类失败没有向前端输出任何方案 delta，立即重试不会
+     * 造成内容拼接；其他异常保持原失败语义，避免半截流式内容后自动重放。
+     */
+    private String buildOptimizationPlanWithRetry(
+            AiWorkflowRun run,
+            Map<String, Object> articleInfo,
+            String instruction,
+            String memoryContext,
+            List<Map<String, Object>> ragReferences,
+            String feedback,
+            String suggestedDirection,
+            String runningMessage,
+            String retryMessage,
+            AiWorkflowStepEmitter emitter
+    ) {
+        try {
+            return workflowStepRunner.run(
+                    run.getId(),
+                    AiWorkflowStep.GENERATE_OPTIMIZATION_PLAN,
+                    runningMessage,
+                    () -> buildOptimizationPlan(run, articleInfo, instruction, memoryContext,
+                            ragReferences, feedback, suggestedDirection, emitter),
+                    emitter
+            );
+        } catch (RuntimeException e) {
+            if (!isEmptyOptimizationPlanResult(e)) {
+                throw e;
+            }
+            return workflowStepRunner.run(
+                    run.getId(),
+                    AiWorkflowStep.GENERATE_OPTIMIZATION_PLAN,
+                    retryMessage,
+                    () -> buildOptimizationPlan(run, articleInfo, instruction, memoryContext,
+                            ragReferences, feedback, suggestedDirection, emitter),
+                    emitter
+            );
+        }
+    }
+
+    private boolean isEmptyOptimizationPlanResult(RuntimeException e) {
+        String message = e.getMessage();
+        return message != null
+                && message.startsWith("优化方案生成失败：")
+                && message.contains("模型返回空内容");
     }
 
     private String buildOptimizationPlan(

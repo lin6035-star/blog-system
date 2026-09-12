@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hailin.blogsystem.ai.agent.AgentRunResult;
 import com.hailin.blogsystem.ai.agent.AgentStepDecision;
 import com.hailin.blogsystem.ai.agent.AgentStepEmitter;
+import com.hailin.blogsystem.ai.agent.AgentStepLabelSupport;
 import com.hailin.blogsystem.ai.agent.ArticleAgentActionExecutor;
 import com.hailin.blogsystem.ai.agent.ArticleAgentRuntime;
 import com.hailin.blogsystem.ai.agent.ArticleAgentStepDecider;
@@ -34,6 +35,7 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -86,6 +88,9 @@ class ArticleAgentRuntimeTests {
             run.setId(1L);
             return 1;
         });
+
+        // V3.13：计划落库按影响行数=1 判定成功，默认按命中
+        when(runMapper.update(any(), any())).thenReturn(1);
 
         // V3.11：mock 验证器默认返回 null = 不走收敛门（锁「默认不验证 = 原路径」回归）
         runtime = new ArticleAgentRuntime(
@@ -750,6 +755,110 @@ class ArticleAgentRuntimeTests {
         runtime.run(100L, 200L, "看看", articleContext("12"), planCapturingEmitter(emitted));
 
         assertThat(emitted).isEmpty();
+    }
+
+    @Test
+    void planNotEmittedWhenPersistMissesRunRow() {
+        // 落库影响行数≠1 → 只记日志不发事件（防「实时有计划、库里没有」分叉），且不影响流程
+        when(decider.decide(any(), any(), anyInt(), anyInt()))
+                .thenReturn(new AgentStepDecision(
+                        AgentStepActionType.QUERY_ARTICLE,
+                        Map.of("articleId", "12"),
+                        null,
+                        List.of("先看整体结构", "再给建议")))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
+                        .withInput(Map.of("answer", "结论")));
+        when(executor.execute(any(), any(), any())).thenReturn("当前文章分析");
+        when(runMapper.update(any(), any())).thenReturn(0);
+
+        List<List<String>> emitted = new ArrayList<>();
+        AgentRunResult result = runtime.run(100L, 200L, "先看整体结构，再给建议",
+                articleContext("12"), planCapturingEmitter(emitted));
+
+        assertThat(emitted).isEmpty();
+        assertThat(result.status()).isEqualTo(AiAgentRunStatus.COMPLETED);
+    }
+
+    // ==================== V4 规则级重复拦截 ====================
+
+    @Test
+    void duplicatedQueryIsRejectedWithoutExecuting() {
+        // 同一动作 + 同一参数第二次出现 → 不执行、落 SKIPPED step、观察带可执行的下一步
+        when(decider.decide(any(), any(), anyInt(), anyInt()))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_MEMORY)
+                        .withInput(Map.of("question", "写作偏好")))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_MEMORY)
+                        .withInput(Map.of("question", "写作偏好")))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
+                        .withInput(Map.of("answer", "结论")));
+        when(executor.execute(any(), any(), any())).thenReturn("记忆摘要：用户喜欢简洁 UI");
+
+        // 首次决策时库里还没有该查询（放行），第二次时第 1 步已成功执行过同参查询（拦截）
+        AiAgentStep executed = new AiAgentStep();
+        executed.setStepNo(1);
+        when(stepMapper.selectOne(any())).thenReturn(null, executed);
+
+        List<String> emitted = new ArrayList<>();
+        AgentRunResult result = runtime.run(100L, 200L, "先看整体结构，再结合写作偏好给建议",
+                articleContext("12"), (stepNo, actionType, status, message, thoughtSummary) ->
+                        emitted.add(stepNo + ":" + status + ":" + message));
+
+        // 核心：第二次没有真的执行（省掉一次无意义调用）
+        verify(executor, times(1)).execute(any(), any(), any());
+        // 拦截仍落 step（消耗步数，防绕过 maxSteps 死循环）
+        ArgumentCaptor<AiAgentStep> stepCaptor = ArgumentCaptor.forClass(AiAgentStep.class);
+        verify(stepMapper, atLeastOnce()).insert(stepCaptor.capture());
+        assertThat(stepCaptor.getAllValues())
+                .anyMatch(step -> step.getErrorMessage() != null
+                        && step.getErrorMessage().startsWith(AgentStepLabelSupport.DUPLICATE_QUERY_SKIP_PREFIX)
+                        && "SKIPPED".equals(step.getStatus()));
+        assertThat(emitted).contains("2:SKIPPED:" + AgentStepLabelSupport.DUPLICATE_QUERY_SKIP_MESSAGE);
+        // 提示要给出下一步能做什么，而不是单纯禁止
+        assertThat(captureRun().getContextJson()).contains("重复了第 1 步");
+        assertThat(result.status()).isEqualTo(AiAgentRunStatus.COMPLETED);
+    }
+
+    @Test
+    void duplicateCheckRunsBeforeEachActionButNotForTerminal() {
+        // 重复检查在只读动作执行前各跑一次；终态动作（FINAL_ANSWER）不跑——
+        // 终态不可能"重复执行"，多查一次是纯浪费。
+        //
+        // 注意：判据里的「动作 + 参数 + 曾成功」由 SQL WHERE 完成，纯单测环境无法回放
+        // （mock 只能验证"检查发生过"）。参数匹配的正确性靠手测覆盖。
+        when(decider.decide(any(), any(), anyInt(), anyInt()))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE)
+                        .withInput(Map.of("articleId", "12")))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
+                        .withInput(Map.of("answer", "结论")));
+        when(executor.execute(any(), any(), any())).thenReturn("当前文章分析");
+        when(stepMapper.selectOne(any())).thenReturn(null);
+
+        AgentRunResult result = runtime.run(100L, 200L, "看看这篇文章", articleContext("12"),
+                planCapturingEmitter(new ArrayList<>()));
+
+        verify(stepMapper, times(1)).selectOne(any());
+        assertThat(result.status()).isEqualTo(AiAgentRunStatus.COMPLETED);
+    }
+
+    @Test
+    void observationsCarrySourceTagWithoutInternalIds() {
+        // 治本契约：模型必须看得见「做过什么动作、用什么参数」——
+        // 否则它无法确认某段结果是不是「我要查的那个查询」的产物，只能用重复查询试探。
+        when(decider.decide(any(), any(), anyInt(), anyInt()))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE)
+                        .withInput(Map.of("articleId", "2085208555163787287", "focus", "缓存击穿")))
+                .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
+                        .withInput(Map.of("answer", "结论")));
+        when(executor.execute(any(), any(), any())).thenReturn("【聚焦片段】…");
+        when(stepMapper.selectOne(any())).thenReturn(null);
+
+        runtime.run(100L, 200L, "检查缓存击穿那一节",
+                articleContext("2085208555163787287"), planCapturingEmitter(new ArrayList<>()));
+
+        String contextJson = captureRun().getContextJson();
+        assertThat(contextJson).contains("[QUERY_ARTICLE focus=缓存击穿]");
+        // 内部标识不进观察（模型不需要，按规则也不该看到）
+        assertThat(contextJson).doesNotContain("2085208555163787287");
     }
 
     /** V3.13：捕获 emitPlan 的 emitter（步骤事件忽略）。 */

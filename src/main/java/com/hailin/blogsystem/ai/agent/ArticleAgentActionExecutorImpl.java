@@ -102,6 +102,9 @@ public class ArticleAgentActionExecutorImpl implements ArticleAgentActionExecuto
         // 无 focus → 原结构摘要。
         String focus = text(decision.input(), "focus");
         if (focus != null && !focus.isBlank()) {
+            if (isStructureOverviewFocus(focus)) {
+                return buildStructureSummary(article) + ownershipNote(owned);
+            }
             String snippet = extractFocusSnippet(article, focus);
             if (snippet != null) {
                 return appendOwnershipNote(snippet, owned);
@@ -182,9 +185,10 @@ public class ArticleAgentActionExecutorImpl implements ArticleAgentActionExecuto
             if (bodyResolved.size() == 1) {
                 return focusSnippet(bodyResolved.get(0));
             }
-            // 仍并列 → 返回结构摘要（至少给出小标题，LLM 可据结构自行判断/追问），
-            // 不返回永远无法被证据支撑的「候选清单」
-            return "聚焦片段：\n" + buildStructureSummary(article);
+            // 仍并列 → 明说「无法确定指哪一处」+ 结构摘要（LLM 可据小标题换更精确的词）。
+            // 不返回永远无法被证据支撑的「候选清单」（V3.13 定），也不静默回退结构摘要
+            // ——静默回退会让模型以为拿到了那节内容 → 凭空评价 → 被证据门拦 → 空转
+            return focusAmbiguous(focus, article);
         }
 
         // 2) 段落级命中（无小标题或节内未命中时逐段查，带上下文一段）
@@ -199,8 +203,8 @@ public class ArticleAgentActionExecutorImpl implements ArticleAgentActionExecuto
             return null;
         }
         if (paragraphHits.size() > 1) {
-            // 多段并列且无法进一步区分 → 返回结构摘要降级（同小节分支：不返回无法被证据支撑的候选清单）
-            return "聚焦片段：\n" + buildStructureSummary(article);
+            // 多段并列且无法进一步区分 → 同小节分支：明说无法确定 + 结构摘要
+            return focusAmbiguous(focus, article);
         }
         int bestIndex = paragraphs.indexOf(paragraphHits.get(0));
 
@@ -217,6 +221,40 @@ public class ArticleAgentActionExecutorImpl implements ArticleAgentActionExecuto
             return snippet;
         }
         return snippet.substring(0, FOCUS_SNIPPET_MAX);
+    }
+
+    /**
+     * 结构/摘要/小标题这类 focus 不是正文定位词，而是结构摘要已有能力。
+     * 若继续走精确片段匹配，会因为正文里没有“摘要部分”这几个字而误报未找到。
+     */
+    private boolean isStructureOverviewFocus(String focus) {
+        for (String token : focusTokens(focus)) {
+            String normalized = token.replaceAll("\\s+", "");
+            if (normalized.equals("摘要")
+                    || normalized.equals("导语")
+                    || normalized.equals("开头")
+                    || normalized.equals("标题")
+                    || normalized.equals("小标题")
+                    || normalized.equals("大纲")
+                    || normalized.equals("目录")
+                    || normalized.equals("层次")) {
+                return true;
+            }
+            if ((normalized.contains("文章") || normalized.contains("整体"))
+                    && (normalized.contains("结构")
+                    || normalized.contains("布局")
+                    || normalized.contains("层次"))) {
+                return true;
+            }
+            if (normalized.contains("小标题") || normalized.contains("标题结构")) {
+                return true;
+            }
+            if (normalized.contains("段落")
+                    && (normalized.contains("结构") || normalized.contains("数量") || normalized.equals("段落"))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** 净化 focus → 切残余 token（≥2 字）。净化后为空 → 空列表（调用方放弃聚焦）。 */
@@ -280,6 +318,24 @@ public class ArticleAgentActionExecutorImpl implements ArticleAgentActionExecuto
             }
         }
         return sb.toString();
+    }
+
+    /**
+     * 聚焦并列、无法定位到唯一目标时的返回：**明说「无法确定指哪一处」**，再附结构摘要。
+     *
+     * 为什么不静默回退结构摘要（2026-09-11 实测教训）：静默回退 + 「聚焦片段：」前缀会让模型
+     * 以为拿到了那节内容，于是凭空评价 → 被证据收敛门拦 → 重试同一个 focus → 被重复拦截 →
+     * 步数用满。实测用户问的「缓存穿透」这一节文章里根本没有，系统走了 6 步才放弃、
+     * 且全程没告诉任何人「没这一节」。
+     *
+     * 仍不返回候选清单（V3.13 定：候选清单不是正文，证据闸永远判不了）——
+     * 结构摘要的作用是让模型看见小标题，从而换一个更精确的定位词。
+     */
+    private String focusAmbiguous(String focus, Articles article) {
+        return "未能确定「" + limit(focus, 40) + "」指的是文章中的哪一处（有多个位置都提到了它）。"
+                + "如需读取具体内容，请用更精确的定位词（例如某个小标题的原话）；"
+                + "若文章确实没有这部分内容，直接说明即可。\n"
+                + buildStructureSummary(article);
     }
 
     /** 单节聚焦输出（限长）。 */

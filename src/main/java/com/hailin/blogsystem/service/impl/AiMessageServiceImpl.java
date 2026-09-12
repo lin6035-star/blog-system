@@ -38,9 +38,12 @@ import com.hailin.blogsystem.mapper.AiSessionMapper;
 import com.hailin.blogsystem.mapper.AiWorkflowRunMapper;
 import com.hailin.blogsystem.mapper.AiWorkflowStepLogMapper;
 import com.hailin.blogsystem.service.*;
+import com.hailin.blogsystem.utils.MdcContext;
 import com.hailin.blogsystem.utils.UserContext;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import io.micrometer.tracing.Tracer;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import reactor.core.publisher.Flux;
@@ -90,6 +93,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
     private final AgentRuntimeRouteRegistry agentRuntimeRouteRegistry;
     private final ArticleSessionAnchorService articleSessionAnchorService;
     private final ArticleQaTargetResolver articleQaTargetResolver;
+    private final ObjectProvider<Tracer> tracerProvider;
 
     private static final String ROLE_USER = "user";
     private static final String ROLE_ASSISTANT = "assistant";
@@ -182,14 +186,23 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             throw new IllegalArgumentException("消息内容不能为空");
         }
 
+        /*
+         * V4⑥ 可观测性：Flux 是惰性的——本方法体在请求线程执行（UserContext 有值可证），
+         * 但返回的 Flux 由 Spring MVC 在异步线程订阅，那里没有 MDC，导致其后的
+         * Agent / 工具 / 记忆召回全程丢 traceId（实测：分类器有，Agent Run 创建之后全空）。
+         * 在请求线程先抓快照，订阅和自家 boundedElastic 异步边界都用这份快照显式恢复。
+         * 空快照也覆盖，避免池化线程残留上一条请求的上下文。
+         */
+        Map<String, String> mdcSnapshot = MdcContext.capture();
+
         Long userId = UserContext.get();
         String rawPageContextJson = toJson(aiChatDTO.getPageContext());
 
-        if (userId == null) {
-            return streamGuestChat(message, aiChatDTO.getPageContext());
-        }
+        Flux<AiChatEventVO> events = userId == null
+                ? streamGuestChat(message, aiChatDTO.getPageContext())
+                : streamUserChat(aiChatDTO, message, aiChatDTO.getPageContext(), rawPageContextJson, userId, mdcSnapshot);
 
-        return streamUserChat(aiChatDTO, message, aiChatDTO.getPageContext(), rawPageContextJson, userId);
+        return events.doOnSubscribe(subscription -> MdcContext.restore(mdcSnapshot));
     }
     //登录用户流式逻辑
     private Flux<AiChatEventVO> streamUserChat(
@@ -197,10 +210,10 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             String message,
             PageContextDTO pageContext,
             String rawPageContextJson,
-            Long userId
+            Long userId,
+            Map<String, String> mdcSnapshot
     ) {
         Long sessionId;
-        AtomicBoolean assistantSaved = new AtomicBoolean(false);
 
         if (aiChatDTO.getSessionId() == null || aiChatDTO.getSessionId().trim().isEmpty()) {
             AiCreateSessionDTO createSessionDTO = new AiCreateSessionDTO();
@@ -224,7 +237,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                     pageContext,
                     rawPageContextJson,
                     userId,
-                    session
+                    session,
+                    mdcSnapshot
             );
         }
 
@@ -367,12 +381,96 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
          */
         if (routeDecision.getAction() == AgentAction.AGENT) {
             // V3.5：按意图查路由注册表分发领域 Runtime（intent → runtime + 兜底文案单点登记）
+            MdcContext.LogContext agentLogContext = captureAgentLogContext(mdcSnapshot);
             return dispatchAgentRuntime(
                     intent, message, pageContext, rawPageContextJson,
-                    userId, sessionId, session, requestId
+                    userId, sessionId, session, requestId, agentLogContext
             );
         }
 
+        /*
+         * V4.5：普通聊天 / QA 的轻量过程提示。
+         *
+         * 必须 concat 在慢操作之前——下面 streamNormalChatFlow 里的 QA 目标决议、
+         * prompt 拼装、站内检索都是同步阻塞，若在其后才发状态，前端收到时早已结束。
+         * 用 Flux.defer 让整段慢操作推迟到订阅时执行，状态事件才真正「提前」。
+         */
+        return Flux.concat(
+                buildChatStatusFlux(routeDecision),
+                Flux.defer(() -> streamNormalChatFlow(
+                        message, pageContext, rawPageContextJson, userId,
+                        sessionId, session, routeDecision, intent, requestId
+                ))
+        );
+    }
+
+    /**
+     * V4.5：构造首字前的过程状态事件（**只依赖 routeDecision**，不依赖任何慢操作结果）。
+     *
+     * 文案按**意图级**给，不承诺结果：事件发出时 QaTarget 尚未决议，最终可能是
+     * 追问态 / 说明态（并没真正读到文章）——所以 CURRENT_ARTICLE 只能说
+     * 「正在确认文章范围」，不能写「正在读取当前文章」。
+     *
+     * 无检索意图（普通闲聊）返回空流：不打搅原有打字动效，不为了「全局」强行加状态。
+     */
+    private Flux<AiChatEventVO> buildChatStatusFlux(AgentDecision routeDecision) {
+        if (routeDecision == null) {
+            return Flux.empty();
+        }
+
+        String statusType;
+        String retrievalMode;
+        String text;
+        // 判定顺序与下方实际检索分支保持一致（CURRENT_ARTICLE 优先）
+        if (routeDecision.usesRetrieval("CURRENT_ARTICLE")) {
+            statusType = "CURRENT_ARTICLE_RESOLVING";
+            retrievalMode = "CURRENT_ARTICLE";
+            text = "正在确认文章范围...";
+        } else if (routeDecision.usesRetrieval("ARTICLE_SEARCH")) {
+            statusType = "ARTICLE_SEARCHING";
+            retrievalMode = "ARTICLE_SEARCH";
+            text = "正在检索站内文章...";
+        } else {
+            return Flux.empty();
+        }
+
+        // 载荷只带展示所需字段：不带 articleId / 分数 / ES 参数 / prompt / trace
+        return Flux.just(AiChatEventVO.builder()
+                .eventType(AiChatEventType.CHAT_STATUS.getValue())
+                .eventData(Map.of(
+                        "statusType", statusType,
+                        "retrievalMode", retrievalMode,
+                        "message", text
+                ))
+                .build());
+    }
+
+    /**
+     * V4.5：普通聊天 / QA 的实际流程（惰性执行——先让前端拿到过程状态）。
+     *
+     * 由 {@link #streamUserChat} 用 {@code Flux.defer} 包住调用；
+     * 方法体是原「默认聊天 + QA」路径的全部逻辑，未做行为改动。
+     */
+    private Flux<AiChatEventVO> streamNormalChatFlow(
+            String message,
+            PageContextDTO pageContext,
+            String rawPageContextJson,
+            Long userId,
+            Long sessionId,
+            AiSessions session,
+            AgentDecision routeDecision,
+            AiIntent intent,
+            String requestId
+    ) {
+
+
+        // V4.5：随流构建一起搬进本方法（原在 streamUserChat 里，doFinally 的取消兜底要用它）
+        AtomicBoolean assistantSaved = new AtomicBoolean(false);
+
+        // V4.5 §4.0：首字前耗时测量——先量 resolve / buildPrompt / ragSearch / totalBeforeData，
+        // 再判断前端 250ms 防抖阈值是否合理（量完可降级 debug 或移除）
+        long flowStart = System.currentTimeMillis();
+        long[] timings = new long[3];
 
         AiArticleActionCommand articleActionFromIntent = buildArticleActionFromDecision(routeDecision, intent, pageContext);
         // V3.8：页面 ACTION（点赞/收藏等明确围绕当前文章的操作）→ 会话锚写点（PAGE_ACTION）
@@ -382,9 +480,11 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
          * V3.9：QA 目标单点决议（每请求一次，正文注入与来源卡共用同一决议，永不分叉）。
          * 决议含可读加载（页面文章 / 会话锚 / 追问态 / 说明态），只读不写。
          */
+        long resolveStart = System.currentTimeMillis();
         QaTarget qaTarget = routeDecision.usesRetrieval("CURRENT_ARTICLE")
                 ? articleQaTargetResolver.resolve(message, pageContext, sessionId, userId)
                 : null;
+        timings[0] = System.currentTimeMillis() - resolveStart;
 
         String extraPromptContext = buildExtraPromptContextFromIntent(intent, pageContext);
         if ((extraPromptContext == null || extraPromptContext.isBlank())
@@ -396,7 +496,9 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         AiEditorCommand editorActionFromIntent = buildEditorActionFromDecision(routeDecision, intent);
 
         // 拼完整 prompt（含历史记忆 + 页面上下文 + 当前问题）
+        long promptStart = System.currentTimeMillis();
         AiPrompt prompt = aiPromptService.buildPrompt(message, pageContext, sessionId);
+        timings[1] = System.currentTimeMillis() - promptStart;
         prompt.setArticleToolsEnabled(shouldEnableArticleTools(routeDecision));
         prompt.setSessionId(sessionId);
         prompt.setLearningDashboardToolEnabled(routeDecision.isTool("getLearningDashboard"));
@@ -416,7 +518,9 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         if (currentArticleRetrieval) {
             ragContexts = currentArticleReference == null ? List.of() : List.of(currentArticleReference);
         } else if (articleSearchRetrieval) {
+            long ragStart = System.currentTimeMillis();
             ArticleRagSearchResult ragSearchResult = articleRagSearchService.search(message, intent);
+            timings[2] = System.currentTimeMillis() - ragStart;
             ragContexts = ragSearchResult.contexts();
 
             appendRagContextToPrompt(prompt, ragContexts);
@@ -443,8 +547,18 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 .build();
 
         TokenUsageAccumulator usage = new TokenUsageAccumulator();
+        AtomicBoolean timingLogged = new AtomicBoolean(false);
         Flux<AiChatEventVO> dataEvents = aiModelService.streamChat(prompt,requestId,usage)
-                .doOnNext(fullReply::append)
+                .doOnNext(chunk -> {
+                    if (timingLogged.compareAndSet(false, true)) {
+                        // §4.0 的量测目的已达成（防抖 250ms 判定合理、记忆召回串行问题已定位并修复），
+                        // 降级 debug 避免每次对话刷屏；后续查「首 token 慢」时临时开 debug 即可
+                        log.debug("V4.5 首字前耗时: resolve={}ms buildPrompt={}ms ragSearch={}ms totalBeforeData={}ms",
+                                timings[0], timings[1], timings[2],
+                                System.currentTimeMillis() - flowStart);
+                    }
+                    fullReply.append(chunk);
+                })
                 .map(chunk -> AiChatEventVO.builder()
                         .eventType(AiChatEventType.DATA.getValue())
                         .eventData(chunk)
@@ -576,7 +690,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             Long userId,
             Long sessionId,
             AiSessions session,
-            String requestId
+            String requestId,
+            MdcContext.LogContext logContext
     ) {
         String intentName = intent == null ? null : intent.getIntent();
         AgentRuntime runtime = agentRuntimeRouteRegistry.resolve(intentName);
@@ -598,8 +713,17 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 sessionId,
                 session,
                 requestId,
-                fallbackReply
+                fallbackReply,
+                logContext
         );
+    }
+
+    private MdcContext.LogContext captureAgentLogContext(Map<String, String> fallback) {
+        return MdcContext.captureWithTrace(tracerProvider.getIfAvailable(), fallback);
+    }
+
+    private Runnable wrapAgentLogContext(MdcContext.LogContext logContext, Runnable runnable) {
+        return MdcContext.wrap(tracerProvider.getIfAvailable(), logContext, runnable);
     }
 
     private Flux<AiChatEventVO> streamAgentReply(
@@ -611,7 +735,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             Long sessionId,
             AiSessions session,
             String requestId,
-            String fallbackReply
+            String fallbackReply,
+            MdcContext.LogContext logContext
     ) {
         // 用户消息落库（同步，立即可见）
         AiMessages userMessage = new AiMessages();
@@ -675,7 +800,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 }
             };
 
-            Schedulers.boundedElastic().schedule(() -> {
+            Schedulers.boundedElastic().schedule(wrapAgentLogContext(logContext, () -> {
                 UserContext.set(userId);
                 try {
                     AgentRunResult result = runtime.run(
@@ -760,7 +885,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 } finally {
                     UserContext.clear();
                 }
-            });
+            }));
         });
 
         return Flux.concat(
@@ -836,6 +961,10 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             Long userId,
             Long sessionId
     ) {
+        // V4⑥ 可观测性：Flux 惰性——boundedElastic 的提交发生在订阅线程，那里没有 MDC。
+        // 在请求线程先抓日志上下文，执行线程恢复（与 streamAgentReply 同模式）。
+        MdcContext.LogContext workflowLogContext = captureAgentLogContext(MdcContext.capture());
+
         AiMessages userMessage = new AiMessages();
         userMessage.setSessionId(sessionId);
         userMessage.setRole(ROLE_USER);
@@ -859,7 +988,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 .build();
 
         Flux<AiChatEventVO> workflowEvents = Flux.create(sink ->
-                Schedulers.boundedElastic().schedule(() -> {
+                Schedulers.boundedElastic().schedule(wrapAgentLogContext(workflowLogContext, () -> {
                     UserContext.set(userId);
                     try {
                         AtomicReference<Long> workflowRunId = new AtomicReference<>();
@@ -937,7 +1066,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                     } finally {
                         UserContext.clear();
                     }
-                })
+                }))
         );
 
         return Flux.concat(Flux.just(paramEvent), workflowEvents);
@@ -1156,6 +1285,9 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         // 主题是否明确交给 CreateArticleWorkflowHandler.isRequirementUnclear 确定性规则判断（LLM 判断意图，规则判断参数）
         String requirement = message;
 
+        // V4⑥ 可观测性：boundedElastic 的提交发生在订阅线程（无 MDC），
+        // 在请求线程先抓日志上下文，执行线程恢复（与 streamAgentReply 同模式）
+        MdcContext.LogContext workflowLogContext = captureAgentLogContext(MdcContext.capture());
         AiWorkflowCreateArticleDTO workflowDTO = new AiWorkflowCreateArticleDTO();
         workflowDTO.setConversationId(sessionId);
         workflowDTO.setRequirement(requirement);
@@ -1180,7 +1312,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 .build();
 
         Flux<AiChatEventVO> workflowEvents = Flux.create(sink ->
-                Schedulers.boundedElastic().schedule(() -> {
+                Schedulers.boundedElastic().schedule(wrapAgentLogContext(workflowLogContext, () -> {
                     UserContext.set(userId);
                     try {
                         AtomicReference<Long> workflowRunId = new AtomicReference<>();
@@ -1259,7 +1391,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                     } finally {
                         UserContext.clear();
                     }
-                })
+                }))
         );
 
         return Flux.concat(Flux.just(paramEvent), workflowEvents);
@@ -1283,6 +1415,9 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         userMessage.setCreatedAt(LocalDateTime.now());
         save(userMessage);
 
+        // V4⑥ 可观测性：boundedElastic 的提交发生在订阅线程（无 MDC），
+        // 在请求线程先抓日志上下文，执行线程恢复（与 streamAgentReply 同模式）
+        MdcContext.LogContext workflowLogContext = captureAgentLogContext(MdcContext.capture());
         AiWorkflowLearningPlanDTO workflowDTO = new AiWorkflowLearningPlanDTO();
         workflowDTO.setConversationId(sessionId);
         workflowDTO.setGoal(message);
@@ -1296,7 +1431,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 .build();
 
         Flux<AiChatEventVO> workflowEvents = Flux.create(sink ->
-                Schedulers.boundedElastic().schedule(() -> {
+                Schedulers.boundedElastic().schedule(wrapAgentLogContext(workflowLogContext, () -> {
                     UserContext.set(userId);
                     try {
                         AiWorkflowStepEmitter emitter = buildLearningWorkflowEmitter(AiWorkflowType.LEARNING_PLAN, sink);
@@ -1333,7 +1468,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                     } finally {
                         UserContext.clear();
                     }
-                })
+                }))
         );
 
         return Flux.concat(Flux.just(paramEvent), workflowEvents);
@@ -1400,6 +1535,9 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         userMessage.setCreatedAt(LocalDateTime.now());
         save(userMessage);
 
+        // V4⑥ 可观测性：boundedElastic 的提交发生在订阅线程（无 MDC），
+        // 在请求线程先抓日志上下文，执行线程恢复（与 streamAgentReply 同模式）
+        MdcContext.LogContext workflowLogContext = captureAgentLogContext(MdcContext.capture());
         AiWorkflowLearningProgressDTO workflowDTO = new AiWorkflowLearningProgressDTO();
         workflowDTO.setConversationId(sessionId);
         workflowDTO.setPlanId(targetPlan == null ? null : targetPlan.getId());
@@ -1415,7 +1553,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 .build();
 
         Flux<AiChatEventVO> workflowEvents = Flux.create(sink ->
-                Schedulers.boundedElastic().schedule(() -> {
+                Schedulers.boundedElastic().schedule(wrapAgentLogContext(workflowLogContext, () -> {
                     UserContext.set(userId);
                     try {
                         AiWorkflowStepEmitter emitter = buildLearningWorkflowEmitter(AiWorkflowType.LEARNING_PROGRESS, sink);
@@ -1452,7 +1590,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                     } finally {
                         UserContext.clear();
                     }
-                })
+                }))
         );
 
         return Flux.concat(Flux.just(paramEvent), workflowEvents);
@@ -1477,6 +1615,9 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         userMessage.setCreatedAt(LocalDateTime.now());
         save(userMessage);
 
+        // V4⑥ 可观测性：boundedElastic 的提交发生在订阅线程（无 MDC），
+        // 在请求线程先抓日志上下文，执行线程恢复（与 streamAgentReply 同模式）
+        MdcContext.LogContext workflowLogContext = captureAgentLogContext(MdcContext.capture());
         AiWorkflowLearningAssistDTO workflowDTO = new AiWorkflowLearningAssistDTO();
         workflowDTO.setConversationId(sessionId);
         workflowDTO.setPlanId(targetPlan == null ? null : targetPlan.getId());
@@ -1492,7 +1633,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 .build();
 
         Flux<AiChatEventVO> workflowEvents = Flux.create(sink ->
-                Schedulers.boundedElastic().schedule(() -> {
+                Schedulers.boundedElastic().schedule(wrapAgentLogContext(workflowLogContext, () -> {
                     UserContext.set(userId);
                     try {
                         AiWorkflowStepEmitter emitter = buildLearningWorkflowEmitter(AiWorkflowType.LEARNING_ASSIST, sink);
@@ -1529,7 +1670,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                     } finally {
                         UserContext.clear();
                     }
-                })
+                }))
         );
 
         return Flux.concat(Flux.just(paramEvent), workflowEvents);
@@ -1673,7 +1814,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             PageContextDTO pageContext,
             String rawPageContextJson,
             Long userId,
-            AiSessions session
+            AiSessions session,
+            Map<String, String> mdcSnapshot
     ) {
         Long sessionId = session.getId();
         Long workflowRunId = session.getActiveWorkflowRunId();
@@ -1694,13 +1836,13 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             // Workflow 不存在或无权访问 → 清空绑定，回普通聊天
             clearSessionActiveWorkflow(session);
             return fallbackToNormalChatAfterWorkflowGone(
-                    message, pageContext, rawPageContextJson, userId, sessionId, userMessage);
+                    message, pageContext, rawPageContextJson, userId, sessionId, userMessage, mdcSnapshot);
         }
 
         if (workflow == null) {
             clearSessionActiveWorkflow(session);
             return fallbackToNormalChatAfterWorkflowGone(
-                    message, pageContext, rawPageContextJson, userId, sessionId, userMessage);
+                    message, pageContext, rawPageContextJson, userId, sessionId, userMessage, mdcSnapshot);
         }
 
         AiWorkflowStatus status;
@@ -1709,7 +1851,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         } catch (Exception e) {
             clearSessionActiveWorkflow(session);
             return fallbackToNormalChatAfterWorkflowGone(
-                    message, pageContext, rawPageContextJson, userId, sessionId, userMessage);
+                    message, pageContext, rawPageContextJson, userId, sessionId, userMessage, mdcSnapshot);
         }
 
         // 已结束的状态 → 清空绑定，回普通聊天
@@ -1718,7 +1860,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 || status == AiWorkflowStatus.FAILED) {
             clearSessionActiveWorkflow(session);
             return fallbackToNormalChatAfterWorkflowGone(
-                    message, pageContext, rawPageContextJson, userId, sessionId, userMessage);
+                    message, pageContext, rawPageContextJson, userId, sessionId, userMessage, mdcSnapshot);
         }
 
         // WAITING_REQUIREMENT_CONFIRM：用户输入当作补充需求，走 reject 流程
@@ -1759,7 +1901,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             String rawPageContextJson,
             Long userId,
             Long sessionId,
-            AiMessages userMessage
+            AiMessages userMessage,
+            Map<String, String> mdcSnapshot
     ) {
         AiSessions session = getOwnedSession(sessionId, userId);
 
@@ -1817,7 +1960,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             // V3.5：与主分发同一注册表分发（intent → runtime + 兜底文案单点）
             return dispatchAgentRuntime(
                     intent, message, pageContext, rawPageContextJson,
-                    userId, sessionId, session, requestId
+                    userId, sessionId, session, requestId, captureAgentLogContext(mdcSnapshot)
             );
         }
 
@@ -1947,6 +2090,34 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
 
         // CHAT / TOOL 继续走普通 SSE。下面沿用原来的普通聊天逻辑。
         // 否则走普通 SSE 聊天（复用流式逻辑，但 userMessage 已经保存了）
+        //
+        // V4.5：过程状态必须先于慢操作 concat——回退路径与主入口共用同一 helper，
+        // 否则「回退到普通聊天」这条出口依然是无语义等待。
+        return Flux.concat(
+                buildChatStatusFlux(routeDecision),
+                Flux.defer(() -> streamFallbackChatFlow(
+                        message, pageContext, rawPageContextJson, userId, sessionId,
+                        routeDecision, intent, requestId, userMessage
+                ))
+        );
+    }
+
+    /**
+     * V4.5：Workflow 回退后的普通聊天 / QA 流程（惰性执行——先让前端拿到过程状态）。
+     *
+     * 方法体是原回退路径的普通聊天逻辑，未做行为改动。
+     */
+    private Flux<AiChatEventVO> streamFallbackChatFlow(
+            String message,
+            PageContextDTO pageContext,
+            String rawPageContextJson,
+            Long userId,
+            Long sessionId,
+            AgentDecision routeDecision,
+            AiIntent intent,
+            String requestId,
+            AiMessages userMessage
+    ) {
         AiPrompt prompt = aiPromptService.buildPrompt(message, pageContext, sessionId);
         prompt.setArticleToolsEnabled(shouldEnableArticleTools(routeDecision));
         prompt.setSessionId(sessionId);
@@ -2515,6 +2686,33 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             );
         }
 
+        // V4.5：游客路径同样先发过程状态——三处出口共用同一 helper，避免「游客无提示」
+        return Flux.concat(
+                buildChatStatusFlux(guestDecision),
+                Flux.defer(() -> streamGuestChatFlow(
+                        message, pageContext, intent, guestDecision,
+                        fullReply, now, guestSession, userMessage, requestId
+                ))
+        );
+    }
+
+    /**
+     * V4.5：游客普通聊天 / QA 流程（惰性执行——先让前端拿到过程状态）。
+     *
+     * 游客不落库，过程状态同样是瞬态的（不持久化）。
+     * 方法体是原游客普通聊天逻辑，未做行为改动。
+     */
+    private Flux<AiChatEventVO> streamGuestChatFlow(
+            String message,
+            PageContextDTO pageContext,
+            AiIntent intent,
+            AgentDecision guestDecision,
+            StringBuilder fullReply,
+            String now,
+            AiSessionVO guestSession,
+            AiMessageVO userMessage,
+            String requestId
+    ) {
         AiArticleActionCommand articleActionFromIntent = buildArticleActionFromDecision(guestDecision, intent, pageContext);
 
         // V3.9：游客无归属会话（sessionId/userId null）→ 无会话锚，QA 决议只剩页面候选或说明态

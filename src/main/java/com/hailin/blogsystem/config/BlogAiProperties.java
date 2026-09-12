@@ -14,6 +14,7 @@ public class BlogAiProperties {
     private Rag rag = new Rag();
     private Agent agent = new Agent();
     private RateLimit rateLimit = new RateLimit();
+    private Inspection inspection = new Inspection();
 
     @Data
     public static class Memory{
@@ -99,6 +100,18 @@ public class BlogAiProperties {
             this.limit = limit;
             this.windowSeconds = windowSeconds;
         }
+    }
+
+    /**
+     * V4 第一刀：开发者只读面板（run / step 完整 inspection）的访问控制。
+     *
+     * 项目无角色体系，沿用 {@link Rag.Rebuild} 的范式：开关 + userId 白名单。
+     * 数据范围仍限「当前用户自己的 run」（Service 层归属校验不动）。
+     */
+    @Data
+    public static class Inspection {
+        private boolean enabled = true;
+        private List<Long> allowedUserIds = List.of();
     }
 
 }

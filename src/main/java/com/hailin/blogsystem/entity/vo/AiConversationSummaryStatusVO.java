@@ -8,6 +8,7 @@ import java.time.LocalDateTime;
 public record AiConversationSummaryStatusVO(
         boolean compressing,
         LocalDateTime lastCompressedAt,
-        int coveredMessageCount
+        int coveredMessageCount,
+        boolean eligible
 ) {
 }

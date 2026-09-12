@@ -5,6 +5,7 @@ import com.hailin.blogsystem.entity.AiWorkflowRun;
 import com.hailin.blogsystem.entity.dto.AiWorkflowConfirmationType;
 import com.hailin.blogsystem.entity.dto.AiWorkflowStatus;
 import com.hailin.blogsystem.entity.dto.AiWorkflowStep;
+import org.slf4j.MDC;
 
 import java.util.Map;
 
@@ -43,7 +44,14 @@ public abstract class AbstractWorkflowHandler implements WorkflowHandler {
         AiWorkflowStatus status = workflowStatusSupport.parseStatus(run.getStatus());
         Map<String, Object> context = workflowContextSupport.parseContext(run.getContextJson());
         Map<String, Object> stepResults = workflowContextSupport.getStepResults(context);
-        return doApprove(run, status, context, stepResults, safeEmitter);
+
+        // V4⑥ 可观测性：本次操作期间所有日志带上 workflowRunId
+        MDC.put("workflowRunId", String.valueOf(run.getId()));
+        try {
+            return doApprove(run, status, context, stepResults, safeEmitter);
+        } finally {
+            MDC.remove("workflowRunId");
+        }
     }
 
     /** 业务分支：按当前状态推进，非法状态抛"当前状态不允许同意操作" */
@@ -63,7 +71,14 @@ public abstract class AbstractWorkflowHandler implements WorkflowHandler {
         Map<String, Object> context = workflowContextSupport.parseContext(run.getContextJson());
         Map<String, Object> stepResults = workflowContextSupport.getStepResults(context);
         workflowContextSupport.appendFeedback(context, run.getCurrentStep(), run.getStatus(), normalizedFeedback);
-        return doReject(run, status, context, stepResults, normalizedFeedback, safeEmitter);
+
+        // V4⑥ 可观测性：本次操作期间所有日志带上 workflowRunId
+        MDC.put("workflowRunId", String.valueOf(run.getId()));
+        try {
+            return doReject(run, status, context, stepResults, normalizedFeedback, safeEmitter);
+        } finally {
+            MDC.remove("workflowRunId");
+        }
     }
 
     /** 业务分支：带用户反馈重做当前阶段，非法状态抛"当前状态不允许提交修改意见" */
@@ -82,7 +97,14 @@ public abstract class AbstractWorkflowHandler implements WorkflowHandler {
         AiWorkflowStep step = workflowStatusSupport.parseStep(run.getCurrentStep());
         Map<String, Object> context = workflowContextSupport.parseContext(run.getContextJson());
         Map<String, Object> stepResults = workflowContextSupport.getStepResults(context);
-        return doRetry(run, step, context, stepResults, safeEmitter);
+
+        // V4⑥ 可观测性：本次操作期间所有日志带上 workflowRunId
+        MDC.put("workflowRunId", String.valueOf(run.getId()));
+        try {
+            return doRetry(run, step, context, stepResults, safeEmitter);
+        } finally {
+            MDC.remove("workflowRunId");
+        }
     }
 
     /** 业务分支：从失败步骤原地恢复，非法步骤抛"当前步骤不支持重试" */

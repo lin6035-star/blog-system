@@ -157,6 +157,16 @@
             <version>8.15.5</version>
         </dependency>
 
+        <!-- 可观测性：traceId 贯穿（V4⑥ 落地动作）。actuator 只作为 tracing 自动配置的依赖，
+             web 端点零暴露；版本由 Spring Boot BOM 管理，不自行 pin。 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-tracing-bridge-otel</artifactId>
+        </dependency>
 
     </dependencies>
 

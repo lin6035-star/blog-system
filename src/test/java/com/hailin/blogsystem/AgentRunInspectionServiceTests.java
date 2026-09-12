@@ -3,6 +3,7 @@ package com.hailin.blogsystem;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hailin.blogsystem.ai.agent.AgentRunInspectionService;
+import com.hailin.blogsystem.ai.agent.AgentStepLabelSupport;
 import com.hailin.blogsystem.entity.AiAgentRun;
 import com.hailin.blogsystem.entity.AiAgentStep;
 import com.hailin.blogsystem.entity.vo.AgentRunDetailVO;
@@ -111,6 +112,22 @@ class AgentRunInspectionServiceTests {
         // message 与实时 AGENT_STEP 事件一致（刷新前后思考面板不串味）
         assertThat(steps.get(0).getMessage()).isEqualTo("已完成查询学习计划");
         assertThat(steps.get(1).getMessage()).isEqualTo("建议启动「调整学习进度」流程");
+    }
+
+    @Test
+    void listStepsNormalizesLegacyDuplicateFailureToSkipped() {
+        when(runMapper.selectById(1L)).thenReturn(run(1L, 100L, "COMPLETED", null));
+        AiAgentStep legacy = step(2, "QUERY_ARTICLE", null);
+        legacy.setStatus("FAILED");
+        legacy.setErrorMessage(AgentStepLabelSupport.DUPLICATE_QUERY_SKIP_PREFIX
+                + "：同一动作 + 同一参数在第 1 步已成功执行过");
+        when(stepMapper.selectList(any())).thenReturn(List.of(legacy));
+
+        List<AgentStepVO> steps = service.listSteps(1L);
+
+        assertThat(steps).hasSize(1);
+        assertThat(steps.get(0).getStatus()).isEqualTo("SKIPPED");
+        assertThat(steps.get(0).getMessage()).isEqualTo(AgentStepLabelSupport.DUPLICATE_QUERY_SKIP_MESSAGE);
     }
 
     @Test

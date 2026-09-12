@@ -10,6 +10,11 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  */
 public final class AgentStepLabelSupport {
 
+    /** V4 规则级重复拦截：实时事件与历史补拉共用的展示文案。 */
+    public static final String DUPLICATE_QUERY_SKIP_MESSAGE = "已跳过重复查询";
+    /** 落库 errorMessage 前缀（历史补拉据此识别该场景）。 */
+    public static final String DUPLICATE_QUERY_SKIP_PREFIX = "重复查询已跳过";
+
     private AgentStepLabelSupport() {
     }
 
@@ -62,6 +67,27 @@ public final class AgentStepLabelSupport {
             return "建议被拒绝";
         }
         return actionLabel(actionType) + "失败";
+    }
+
+    /**
+     * 带原因前缀的失败文案：V4 规则级重复拦截**不是失败，是系统主动跳过**——
+     * 用「查询记忆失败」会让用户以为出了故障。
+     *
+     * 实时事件与历史补拉（AgentRunInspectionService）共用本方法，保证刷新前后一致；
+     * 前缀不匹配时行为与 {@link #failedMessage(String)} 完全相同。
+     */
+    public static String failedMessage(String actionType, String errorMessage) {
+        if (errorMessage != null && errorMessage.startsWith(DUPLICATE_QUERY_SKIP_PREFIX)) {
+            return DUPLICATE_QUERY_SKIP_MESSAGE;
+        }
+        return failedMessage(actionType);
+    }
+
+    public static String skippedMessage(String actionType, String errorMessage) {
+        if (errorMessage != null && errorMessage.startsWith(DUPLICATE_QUERY_SKIP_PREFIX)) {
+            return DUPLICATE_QUERY_SKIP_MESSAGE;
+        }
+        return "已跳过" + actionLabel(actionType);
     }
 
     private static String parseWorkflowType(String inputJson, ObjectMapper objectMapper) {

@@ -128,10 +128,14 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                 
                                 当 pageType 是 article-detail，且用户要求点赞、取消点赞、收藏、取消收藏、关注作者、取消关注作者、分享、复制链接、跳到评论区时，输出 ARTICLE_ACTION，并填写 actionType。
                                 当 pageType 是 article-detail，且用户询问“这篇文章讲了什么”“总结这篇文章”“这篇文章重点是什么”“这篇文章里的某个内容是什么意思”“分析当前文章”时，输出 ARTICLE_DETAIL_QA。
-                                当 pageType 是 article-detail，且用户要求回到顶部、回到文章开头、滚动到顶部时，输出 ARTICLE_ACTION，actionType=scrollToTop。       
+                                当 pageType 是 article-detail，且用户要求回到顶部、回到文章开头、滚动到顶部时，输出 ARTICLE_ACTION，actionType=scrollToTop。
+                                注意区分：“看看开头”“先看开头再看结尾”是**阅读文章内容**，不是滚动动作；
+                                只有明确要求“回到 / 滚到顶部或开头”才是 scrollToTop。阅读请求按内容意图判
+                                （单个目标 -> ARTICLE_DETAIL_QA，多个目标 -> ARTICLE_AGENT）。
                                 
-                                ARTICLE_DETAIL_QA = 对一篇具体文章的内容问答
-                                （讲了什么 / 总结 / 文中概念解释 / 追问文中观点），不需要 actionType。
+                                ARTICLE_DETAIL_QA = 对一篇具体文章的内容问答、评价或比较
+                                （讲了什么 / 总结 / 文中概念解释 / 追问文中观点 /
+                                某一节写得好不好 / 对比某两节的写法），不需要 actionType。
                                 判定不依赖页面（V3.9 跨页指代）：在任意页面或无页面上下文的对话里，
                                 用户明确近指一篇本对话中已出现/刚聊过的文章问内容
                                 （“这篇文章”“那篇”“刚刚那篇”“你刚才说的那篇”）时，
@@ -149,6 +153,16 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 - 用标题/主题词指某篇文章的内容问答（“Redis 缓存那篇讲了什么”）-> 仍判 ARTICLE_DETAIL_QA：
                                 后端按 页面文章 → 本会话最近聊过的文章 定位，定位不到会追问澄清，
                                 不要因为不确定目标文章就降级 GENERAL_CHAT
+                                - 评价 / 比较文章已有内容（“这一节写得怎么样”“这两节哪个写得好”
+                                  “检查一下某一节”）-> 仍判 ARTICLE_DETAIL_QA：
+                                这是对已有内容的评价，不是要你改动它；
+                                不要因为出现“怎么样 / 检查 / 分析”这类词就升级为 ARTICLE_AGENT
+                                - 一句话里包含两个或以上不同的处理动作 / 分析角度 / 待办项
+                                  （“先…再…”“从 A 和 B 两方面”“分别看 X 和 Y”）
+                                  -> ARTICLE_AGENT。
+                                  这条**优先于**上面的“分析 / 总结 / 评价当前文章 -> ARTICLE_DETAIL_QA”：
+                                  只要句子里有多个并列的子目标，即使每个子目标单独看都像 QA，也判 ARTICLE_AGENT
+                                - 明确要求结合长期记忆 / 写作偏好 -> ARTICLE_AGENT
                                  
                                 actionType 可选：likeArticle, unlikeArticle, favoriteArticle, unfavoriteArticle, followAuthor, unfollowAuthor, copyArticleLink, scrollToComments, saveDraft, publish, fillArticle, scrollToTop。
 
@@ -267,6 +281,9 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
 
                                 - 明确要求优化、润色、改写、重写当前文章：
                                   WORKFLOW，suggestedWorkflowType=OPTIMIZE_ARTICLE
+                                  注意：只要求“对某几节 / 某几处提改进建议”，或“改进”只是
+                                  多个子目标之一（如“先总结，再挑一段讲讲怎么改进”）-> ARTICLE_AGENT，
+                                  不要升级为 OPTIMIZE_ARTICLE
 
                                 - 明确制定学习计划：
                                   WORKFLOW，suggestedWorkflowType=LEARNING_PLAN
@@ -291,6 +308,8 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
 
                                 - 文章页对当前文章的模糊优化诉求（无明确指令）：
                                   AGENT（intent=ARTICLE_AGENT）
+                                  注意：单纯评价 / 比较已有内容（“这一节写得怎么样”“对比这两节”）
+                                  是 ARTICLE_DETAIL_QA，不是优化诉求
 
                                 - 需求模糊、可能需要用户进一步说明：
                                   CTA

@@ -7,9 +7,12 @@ import com.hailin.blogsystem.entity.vo.AiWorkflowRunVO;
 import com.hailin.blogsystem.entity.vo.AiWorkflowStepLogVO;
 import com.hailin.blogsystem.service.AiWorkflowRunService;
 import com.hailin.blogsystem.service.AiWorkflowStreamService;
+import com.hailin.blogsystem.utils.MdcContext;
 import com.hailin.blogsystem.utils.UserContext;
+import io.micrometer.tracing.Tracer;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.FluxSink;
@@ -30,6 +33,7 @@ import java.util.function.Function;
 public class AiWorkflowStreamServiceImpl implements AiWorkflowStreamService {
 
     private final AiWorkflowRunService aiWorkflowRunService;
+    private final ObjectProvider<Tracer> tracerProvider;
 
 
     @Override
@@ -104,6 +108,12 @@ public class AiWorkflowStreamServiceImpl implements AiWorkflowStreamService {
     ) {
         Long userId = UserContext.get();
 
+        // V4⑥ 可观测性：boundedElastic 的提交发生在订阅线程（无 MDC），
+        // 在请求线程先抓日志上下文，执行线程恢复（与 Agent / Workflow 创建路径同模式）。
+        // 这里必须同时恢复 Micrometer TraceContext；只恢复 MDC 会在后续 tracing scope 切换时丢 traceId。
+        MdcContext.LogContext logContext =
+                MdcContext.captureWithTrace(tracerProvider.getIfAvailable(), MdcContext.capture());
+
         return Flux.create(sink -> {
             long subscribeAt = System.currentTimeMillis();
             sink.onCancel(() -> log.info(
@@ -118,7 +128,10 @@ public class AiWorkflowStreamServiceImpl implements AiWorkflowStreamService {
                     action
             );
 
-            Schedulers.boundedElastic().schedule(() -> {
+            Schedulers.boundedElastic().schedule(MdcContext.wrap(
+                    tracerProvider.getIfAvailable(),
+                    logContext,
+                    () -> {
                 long workerStart = System.currentTimeMillis();
 
                 log.info(
@@ -201,7 +214,7 @@ public class AiWorkflowStreamServiceImpl implements AiWorkflowStreamService {
                 } finally {
                     UserContext.clear();
                 }
-            });
+            }));
         });
     }
 

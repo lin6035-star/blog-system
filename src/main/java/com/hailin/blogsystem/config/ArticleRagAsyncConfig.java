@@ -3,6 +3,7 @@ package com.hailin.blogsystem.config;
 import lombok.RequiredArgsConstructor;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.task.support.ContextPropagatingTaskDecorator;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
 import java.util.concurrent.Executor;
@@ -25,6 +26,8 @@ public class ArticleRagAsyncConfig {
         executor.setThreadNamePrefix(async.getThreadNamePrefix());
 
         executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        // V4⑥ 可观测性：进池时复制 MDC，否则日志 traceId 一进线程池就断
+        executor.setTaskDecorator(new ContextPropagatingTaskDecorator());
         executor.initialize();
 
         return executor;
