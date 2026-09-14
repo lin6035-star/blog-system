@@ -1,0 +1,18 @@
+# 本地私有配置模板
+#
+# 用法：复制成同目录下的 application.yml 再填值
+#   cp config/application.example.yml config/application.yml
+# （config/application.yml 已被 .gitignore 忽略，不会进版本库）
+#
+# 为什么需要它：src/main/resources/application.yml 里的开发默认值足够跑起本地环境，
+# 唯一给不了的是**真实密钥**——GitHub client-secret 是真实凭据，不保留任何默认值。
+# 本地要用 GitHub 登录，就在这里放一份自己的。
+#
+# 优先级：file:./config/application.yml > classpath:application.yml，
+# 且它位于项目目录而非 src/main/resources，不会被打进 jar。
+#
+# 不填也能启动：GitHub 登录相关接口会失败，其余功能不受影响。
+
+github:
+  oauth:
+    client-secret: your-github-oauth-client-secret

@@ -1,0 +1,30 @@
+# Blog System systemd 服务
+# 服务器上放至：/etc/systemd/system/blog-system.service
+#
+# 启动：systemctl start blog-system
+# 开机自启：systemctl enable blog-system
+# 查看状态：systemctl status blog-system
+# 查看日志：journalctl -u blog-system -f
+
+[Unit]
+Description=Blog System Backend
+After=network.target mysql.service
+
+[Service]
+Type=simple
+User=blog
+WorkingDirectory=/opt/blog
+ExecStart=/usr/bin/java -jar /opt/blog/blog-system.jar --spring.profiles.active=prod
+Restart=always
+RestartSec=5
+
+# 环境变量文件，服务器上创建：/etc/blog-system/blog-system.env
+EnvironmentFile=/etc/blog-system/blog-system.env
+
+# 日志
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=blog-system
+
+[Install]
+WantedBy=multi-user.target

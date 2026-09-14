@@ -1,3 +1,14 @@
+# ===== 敏感配置分级（2026-09-14 工程化第一刀）=====
+# 设计稿：docs/security/sensitive-config-externalization-design.md
+#
+# 规则一：本地开发密码保留默认值（123456 / 01star / *-dev-* 这类）。它们只对本机有效，
+#         泄露无实际危害，换来"克隆即可启动"；生产由 application-prod.yml 覆盖成
+#         无默认值的 ${VAR}，缺失即启动失败——所以不存在"开发值静默上线"。
+# 规则二：唯一的真实密钥（GitHub client-secret）不保留任何默认值，本地要用就设
+#         GITHUB_OAUTH_CLIENT_SECRET 环境变量，或用 config/application.yml（不进版本库）。
+# 规则三：启动时 SensitiveConfigStartupValidator 打印每项的实际来源，并在 prod 下
+#         拒绝任何仍是开发默认值的敏感项。
+
 # server
 server:
   port: 8080
@@ -12,14 +23,17 @@ spring:
   datasource:
     url: jdbc:mysql://localhost:3306/blog_system?serverTimezone=Asia/Shanghai&useUnicode=true&characterEncoding=utf-8&zeroDateTimeBehavior=convertToNull&useSSL=false&allowPublicKeyRetrieval=true
     username: myRoot
-    password: 123456
+    # 本地默认值；生产由 application-prod.yml 覆盖为 ${DB_PASSWORD}（无默认值，缺失即失败）
+    password: ${DB_PASSWORD:123456}
     driver-class-name: com.mysql.cj.jdbc.Driver
 
   data:
     redis:
       host: localhost
       port: 6379
-      password: 01star
+      # 本地默认值；生产覆盖为 ${REDIS_PASSWORD:}——空值是合法状态（无密码 Redis 不发 AUTH），
+      # 所以这一项不 fail-fast
+      password: ${REDIS_PASSWORD:01star}
       database: 1
   servlet:
     multipart:
@@ -37,7 +51,7 @@ spring:
       read-timeout: 60s
       chat:
         options:
-          model: ${AI_CHAT_MODEL:qwen3.6-flash}
+          model: ${AI_CHAT_MODEL:qwen3.7-flash}
       embedding:
         options:
           model: text-embedding-v3
@@ -62,18 +76,23 @@ mybatis-plus:
 
 # JWT
 jwt:
-  secret: blog-system-dev-secret-change-later
+  # 开发专用值（名字里带 dev）。生产覆盖为 ${JWT_SECRET}（无默认值，缺失即启动失败）。
+  # 启动校验要求 ≥32 字符：HS256 的安全性完全取决于这个值的熵，短 secret 可被离线爆破，
+  # 一旦算出就能伪造任意用户的 token（攻破的是整个身份体系，不只是某个密码）
+  secret: ${JWT_SECRET:blog-system-dev-secret-change-later}
 
 # GitHub OAuth
 github:
   oauth:
-    client-id: Ov23liAK8jSJ1Omz1MTI
-    client-secret: 7fed3fa95a98677ddac04f1573a671071a044902
-    redirect-uri: http://localhost:8080/api/auth/github/callback
+    # client-id 是公开信息（授权 URL 里明文携带），保留默认值方便本地
+    client-id: ${GITHUB_OAUTH_CLIENT_ID:Ov23liAK8jSJ1Omz1MTI}
+    # 真实密钥：不保留任何默认值。本地要用请设 GITHUB_OAUTH_CLIENT_SECRET 或写 config/application.yml
+    client-secret: ${GITHUB_OAUTH_CLIENT_SECRET:}
+    redirect-uri: ${GITHUB_OAUTH_REDIRECT_URI:http://localhost:8080/api/auth/github/callback}
 
-# 前端地址
+# 前端地址（GitHub OAuth 回调后跳回这里——生产必须覆盖，否则会把用户跳到 localhost）
 app:
-  frontend-url: http://localhost:5173
+  frontend-url: ${APP_FRONTEND_URL:http://localhost:5173}
 
 # 阿里云OSS
 aliyun:
@@ -111,6 +130,9 @@ blog:
     enabled: false
   ai:
     project-key: global
+    # 判断链模型（分类器 / Agent 决策器 / 证据验证器）：这些环节判错会让整条路走偏，
+    # 建议绑一个稳的模型；留空则跟随 spring.ai.openai.chat.options.model（生成链模型）。
+    judge-model: ${AI_JUDGE_MODEL:qwen3.6-plus}
     memory:
       enabled: true
       max-messages: 40
