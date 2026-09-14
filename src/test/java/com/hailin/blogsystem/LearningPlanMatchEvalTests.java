@@ -210,7 +210,7 @@ class LearningPlanMatchEvalTests {
         switch (c.target()) {
             case "PLAN_MATCH" -> {
                 List<LearningPlans> matched = learningPlansService
-                        .matchActivePlansByMessage(callerUserId, c.message());
+                        .matchPlansByMessage(callerUserId, c.message());
                 assertMatchResult(caseName, c.expected(),
                         matched.size(),
                         matched.stream().map(LearningPlans::getTitle).toList());

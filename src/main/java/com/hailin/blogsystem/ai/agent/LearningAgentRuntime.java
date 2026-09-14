@@ -52,6 +52,7 @@ public class LearningAgentRuntime extends AbstractAgentRuntime implements AgentR
 
     private final AgentStepDecider decider;
     private final LearningPlansService learningPlansService;
+    private final LearningPlanAnchorService learningPlanAnchorService;
 
     public LearningAgentRuntime(
             @org.springframework.beans.factory.annotation.Qualifier("llmAgentStepDecider")
@@ -60,11 +61,43 @@ public class LearningAgentRuntime extends AbstractAgentRuntime implements AgentR
             AiAgentRunMapper runMapper,
             AiAgentStepMapper stepMapper,
             ObjectMapper objectMapper,
-            LearningPlansService learningPlansService
+            LearningPlansService learningPlansService,
+            LearningPlanAnchorService learningPlanAnchorService
     ) {
         super(executor, runMapper, stepMapper, objectMapper);
         this.decider = decider;
         this.learningPlansService = learningPlansService;
+        this.learningPlanAnchorService = learningPlanAnchorService;
+    }
+
+    /**
+     * 注入会话学习计划锚（V4.x 补口）。
+     *
+     * **解决什么**：分类器只吃当前这一条消息，用户第二轮省略主语时（"帮我看看我的计划怎么样"），
+     * 决策器手里没有任何"刚才聊的是哪个计划"的依据 → 只能列一串候选反问"是哪个"，
+     * 哪怕上一轮刚聊过。锚本来是给工作流路径用的（`LearningPlanAnchorService.resolve`
+     * 的消费点原先只有两个 route 方法的兜底链），**Agent Runtime 路径不读**。
+     *
+     * 与文章域 `ArticleAgentRuntime.effectiveGoal` 同构：锚只作**定位线索**注入 goal，
+     * 不替决策器做选择——决策器把它填进 `input.planRef`，执行器仍按字符串匹配定位
+     * （用户原话点名了别的计划时以原话为准，不会被这条线索带偏）。
+     */
+    @Override
+    protected String effectiveGoal(String goal, Long userId, Long sessionId, PageContextDTO pageContext) {
+        StringBuilder sb = new StringBuilder(goal);
+
+        LearningPlans anchor = learningPlanAnchorService.resolve(sessionId, userId);
+        if (anchor != null) {
+            sb.append("\n【会话最近讨论的学习计划】《").append(anchor.getTitle())
+                    .append("》(ID ").append(anchor.getId()).append(")");
+        } else {
+            sb.append("\n【会话最近讨论的学习计划】无");
+        }
+
+        sb.append("\n（以上只是定位线索：用户省略主语、说\"这个计划 / 它\"时很可能就是指它——"
+                + "需要读计划内容时，在 QUERY_LEARNING_DASHBOARD 的 input.planRef 填该计划标题；"
+                + "用户原话明确点了别的计划时以原话为准，不要被这条线索带偏）");
+        return sb.toString();
     }
 
     // ==================== 领域钩子 ====================
@@ -316,7 +349,7 @@ public class LearningAgentRuntime extends AbstractAgentRuntime implements AgentR
             }
             LearningPlans plan;
             if (planRef != null && !planRef.isBlank()) {
-                List<LearningPlans> matched = learningPlansService.matchActivePlansByMessage(userId, planRef);
+                List<LearningPlans> matched = learningPlansService.matchPlansByMessage(userId, planRef);
                 if (matched.size() != 1) {
                     return false;
                 }
@@ -365,7 +398,7 @@ public class LearningAgentRuntime extends AbstractAgentRuntime implements AgentR
             }
             LearningPlans plan;
             if (planRef != null && !planRef.isBlank()) {
-                List<LearningPlans> matched = learningPlansService.matchActivePlansByMessage(userId, planRef);
+                List<LearningPlans> matched = learningPlansService.matchPlansByMessage(userId, planRef);
                 if (matched.size() != 1) {
                     return false;
                 }

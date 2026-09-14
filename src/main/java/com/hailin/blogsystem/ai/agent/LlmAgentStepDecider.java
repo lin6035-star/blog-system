@@ -2,6 +2,7 @@ package com.hailin.blogsystem.ai.agent;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.hailin.blogsystem.ai.AiJudgeModelSupport;
 import com.hailin.blogsystem.entity.dto.AgentStepActionType;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -34,6 +35,7 @@ public class LlmAgentStepDecider implements AgentStepDecider {
 
     private final ChatClient.Builder chatClientBuilder;
     private final ObjectMapper objectMapper;
+    private final AiJudgeModelSupport aiJudgeModelSupport;
 
     @Override
     public AgentStepDecision decide(
@@ -92,8 +94,9 @@ public class LlmAgentStepDecider implements AgentStepDecider {
                     .prompt()
                     .system(buildSystemPrompt(repair))
                     .user(buildUserPrompt(goal, clippedContext, stepNo, maxSteps, repair))
-                    .options(OpenAiChatOptions.builder()
-                            .temperature(TEMPERATURE)
+                    //判断链：决策器决定"下一步走哪条路"，判错整条路都偏——配了 judge-model 就用强模型
+                    .options(aiJudgeModelSupport.applyTo(OpenAiChatOptions.builder()
+                            .temperature(TEMPERATURE))
                             .build())
                     .call()
                     .content();

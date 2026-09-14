@@ -1,5 +1,6 @@
 package com.hailin.blogsystem.ai.workflow;
 
+import com.hailin.blogsystem.ai.agent.LearningPlanAnchorService;
 import com.hailin.blogsystem.entity.AiWorkflowRun;
 import com.hailin.blogsystem.entity.LearningPlans;
 import com.hailin.blogsystem.entity.LearningStages;
@@ -24,24 +25,32 @@ import java.util.regex.Pattern;
 @Component
 public class LearningAssistWorkflowHandler extends AbstractWorkflowHandler {
 
+    private static final int HANDOFF_INJECT_MAX = 500;
+    private static final String HANDOFF_SOURCE_WORKFLOW_CONFIRMED = "WORKFLOW_SUGGESTION_CONFIRMED";
+
     //否定反馈："算了/不用了..." → 取消 workflow 而不是继续生成
-    private static final Pattern NEGATIVE_FEEDBACK = Pattern.compile("(不想改|不改了|不用改|不用了|算了|算了吧|不需要|取消)");
+    //V4.x：移除「取消」——它是动作词而非终止语（"把第二阶段取消掉"/"取消勾选"会被误判成终止流程，
+    //而取消不可逆）；真要终止，需求确认面板有「取消工作流」按钮兜底。
+    private static final Pattern NEGATIVE_FEEDBACK = Pattern.compile("(不想改|不改了|不用改|不用了|算了|算了吧|不需要)");
     //选计划/选阶段反馈里的序号："第2个" / "第二个" / "2"
     private static final Pattern INDEX_PATTERN = Pattern.compile("第?\\s*([一二三四五六七八九十\\d]+)\\s*个?");
 
     private final LearningPlanFlowSupport flowSupport;
     private final LearningPlansService learningPlansService;
+    private final LearningPlanAnchorService learningPlanAnchorService;
 
     public LearningAssistWorkflowHandler(
             WorkflowContextSupport workflowContextSupport,
             WorkflowStatusSupport workflowStatusSupport,
             WorkflowStepRunner workflowStepRunner,
             LearningPlanFlowSupport flowSupport,
-            LearningPlansService learningPlansService
+            LearningPlansService learningPlansService,
+            LearningPlanAnchorService learningPlanAnchorService
     ) {
         super(workflowContextSupport, workflowStatusSupport, workflowStepRunner);
         this.flowSupport = flowSupport;
         this.learningPlansService = learningPlansService;
+        this.learningPlanAnchorService = learningPlanAnchorService;
     }
 
     @Override
@@ -79,9 +88,13 @@ public class LearningAssistWorkflowHandler extends AbstractWorkflowHandler {
         Map<String, Object> context = flowSupport.buildInitialContext("");
         workflowContextSupport.getMap(context, "input").put("request", request.trim());
         //V4③ 第二刀：建议卡确认时的方向参考（仅 confirm 入口携带），创建时刻固化进 context。
-        // 走 confirm 的建议才带（未确认的建议结构性进不来）；不参与计划定位，只作拆解弱参考。
-        if (dto != null && !workflowContextSupport.isBlank(dto.getSuggestionReason())) {
-            context.put("handoffReason", dto.getSuggestionReason().trim());
+        // 走 confirm 的建议才带（未确认的建议结构性进不来）；只在 planId 已确定时注入，防候选计划串目标。
+        if (planId != null && dto != null && !workflowContextSupport.isBlank(dto.getHandoffReason())) {
+            context.put("handoff", Map.of(
+                    "sourceType", HANDOFF_SOURCE_WORKFLOW_CONFIRMED,
+                    "targetPlanId", planId,
+                    "suggestedDirection", truncateHandoff(dto.getHandoffReason())
+            ));
         }
         if (planId != null) {
             context.put("targetPlanId", planId);
@@ -114,6 +127,14 @@ public class LearningAssistWorkflowHandler extends AbstractWorkflowHandler {
         run.setUpdatedAt(now);
 
         return AiWorkflowAdvanceResult.of(run);
+    }
+
+    private String truncateHandoff(String value) {
+        if (value == null) {
+            return "";
+        }
+        String trimmed = value.trim();
+        return trimmed.length() <= HANDOFF_INJECT_MAX ? trimmed : trimmed.substring(0, HANDOFF_INJECT_MAX);
     }
 
     // ==================== runInitialSteps ====================
@@ -301,6 +322,9 @@ public class LearningAssistWorkflowHandler extends AbstractWorkflowHandler {
                     if (selectedPlanId != null) {
                         context.put("targetPlanId", selectedPlanId);
                         context.remove("awaitingPlanSelection");
+                        // V4.x：用户在候选卡里亲手选定的计划——比任何推断都权威，记进会话锚
+                        learningPlanAnchorService.mark(run.getConversationId(), selectedPlanId,
+                                LearningPlanAnchorService.SOURCE_USER_SELECTION);
                         //定位反馈（"第二个"/计划名）不是生成意见，不进生成 prompt
                         context.put("feedbackHistory", new ArrayList<>());
                         run.setContextJson(workflowContextSupport.toJson(context));
@@ -469,7 +493,7 @@ public class LearningAssistWorkflowHandler extends AbstractWorkflowHandler {
             }
         }
         //计划名打分匹配（最高分并列列表）与候选交集，唯一才确认
-        List<LearningPlans> scored = learningPlansService.matchActivePlansByMessage(run.getUserId(), feedback);
+        List<LearningPlans> scored = learningPlansService.matchPlansByMessage(run.getUserId(), feedback);
         List<Long> hits = new ArrayList<>();
         for (Object candidate : candidates) {
             if (!(candidate instanceof Map<?, ?> c)) {

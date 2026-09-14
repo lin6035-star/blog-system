@@ -1,6 +1,7 @@
 package com.hailin.blogsystem.ai.agent;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.hailin.blogsystem.ai.AiJudgeModelSupport;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.stereotype.Component;
 
@@ -15,8 +16,9 @@ import org.springframework.stereotype.Component;
 @Component
 public class GeneralAgentStepDecider extends LlmAgentStepDecider {
 
-    public GeneralAgentStepDecider(ChatClient.Builder chatClientBuilder, ObjectMapper objectMapper) {
-        super(chatClientBuilder, objectMapper);
+    public GeneralAgentStepDecider(ChatClient.Builder chatClientBuilder, ObjectMapper objectMapper,
+                                   AiJudgeModelSupport aiJudgeModelSupport) {
+        super(chatClientBuilder, objectMapper, aiJudgeModelSupport);
     }
 
     @Override

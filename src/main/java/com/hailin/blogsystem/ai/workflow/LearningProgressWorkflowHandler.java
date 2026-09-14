@@ -1,5 +1,6 @@
 package com.hailin.blogsystem.ai.workflow;
 
+import com.hailin.blogsystem.ai.agent.LearningPlanAnchorService;
 import com.hailin.blogsystem.entity.AiWorkflowRun;
 import com.hailin.blogsystem.entity.LearningPlans;
 import com.hailin.blogsystem.entity.dto.*;
@@ -23,25 +24,32 @@ import java.util.regex.Pattern;
 @Component
 public class LearningProgressWorkflowHandler extends AbstractWorkflowHandler {
 
+    private static final int HANDOFF_INJECT_MAX = 500;
+    private static final String HANDOFF_SOURCE_LEARNING_AGENT_FINAL_ANSWER = "LEARNING_AGENT_FINAL_ANSWER";
     //否定反馈："算了/不用了/不想改了..." → 取消 workflow 而不是继续生成
-    private static final Pattern NEGATIVE_FEEDBACK = Pattern.compile("(不想改|不改了|不用改|不用了|算了|算了吧|不需要|取消)");
+    //V4.x：移除「取消」——它是动作词而非终止语（"把第二阶段取消掉"/"取消勾选"会被误判成终止流程，
+    //而取消不可逆）；真要终止，需求确认面板有「取消工作流」按钮兜底。
+    private static final Pattern NEGATIVE_FEEDBACK = Pattern.compile("(不想改|不改了|不用改|不用了|算了|算了吧|不需要)");
     //选计划反馈里的序号："第2个" / "第二个" / "2"
     private static final Pattern INDEX_PATTERN = Pattern.compile("第?\\s*([一二三四五六七八九十\\d]+)\\s*个?");
     private static final String CHANGE_QUESTION = "你想怎么调整？例如：加个阶段、压缩周期、替换某些任务";
 
     private final LearningPlanFlowSupport flowSupport;
     private final LearningPlansService learningPlansService;
+    private final LearningPlanAnchorService learningPlanAnchorService;
 
     public LearningProgressWorkflowHandler(
             WorkflowContextSupport workflowContextSupport,
             WorkflowStatusSupport workflowStatusSupport,
             WorkflowStepRunner workflowStepRunner,
             LearningPlanFlowSupport flowSupport,
-            LearningPlansService learningPlansService
+            LearningPlansService learningPlansService,
+            LearningPlanAnchorService learningPlanAnchorService
     ) {
         super(workflowContextSupport, workflowStatusSupport, workflowStepRunner);
         this.flowSupport = flowSupport;
         this.learningPlansService = learningPlansService;
+        this.learningPlanAnchorService = learningPlanAnchorService;
     }
 
     @Override
@@ -80,6 +88,16 @@ public class LearningProgressWorkflowHandler extends AbstractWorkflowHandler {
         workflowContextSupport.getMap(context, "input").put("request", request.trim());
         if (planId != null) {
             context.put("targetPlanId", planId);
+            if (dto != null && !workflowContextSupport.isBlank(dto.getHandoffReason())) {
+                Map<String, Object> handoff = new HashMap<>();
+                handoff.put("sourceType", HANDOFF_SOURCE_LEARNING_AGENT_FINAL_ANSWER);
+                handoff.put("targetPlanId", planId);
+                handoff.put("suggestedDirection", truncateHandoff(dto.getHandoffReason()));
+                if (dto.getHandoffSourceAgentRunId() != null) {
+                    handoff.put("sourceAgentRunId", dto.getHandoffSourceAgentRunId());
+                }
+                context.put("handoff", handoff);
+            }
         } else if (dto != null && dto.getCandidates() != null && !dto.getCandidates().isEmpty()) {
             //入口点名命中多个计划 → 候选进 context，runInitialSteps 先停确认让用户选
             context.put("planCandidates", dto.getCandidates().stream()
@@ -109,6 +127,14 @@ public class LearningProgressWorkflowHandler extends AbstractWorkflowHandler {
         run.setUpdatedAt(now);
 
         return AiWorkflowAdvanceResult.of(run);
+    }
+
+    private String truncateHandoff(String value) {
+        if (value == null) {
+            return "";
+        }
+        String trimmed = value.trim();
+        return trimmed.length() <= HANDOFF_INJECT_MAX ? trimmed : trimmed.substring(0, HANDOFF_INJECT_MAX);
     }
 
     // ==================== runInitialSteps ====================
@@ -267,6 +293,10 @@ public class LearningProgressWorkflowHandler extends AbstractWorkflowHandler {
                     if (selectedPlanId != null) {
                         context.put("targetPlanId", selectedPlanId);
                         context.remove("awaitingPlanSelection");
+                        // V4.x：用户在候选卡里亲手选定了计划——比任何推断都权威，记进会话锚，
+                        // 下一句省略主语（"再帮我改改"）时就能续上，不会再弹一次候选卡
+                        learningPlanAnchorService.mark(run.getConversationId(), selectedPlanId,
+                                LearningPlanAnchorService.SOURCE_USER_SELECTION);
                         run.setContextJson(workflowContextSupport.toJson(context));
                         return runInitialSteps(run, emitter);
                     }
@@ -395,7 +425,7 @@ public class LearningProgressWorkflowHandler extends AbstractWorkflowHandler {
             }
         }
         //计划名打分匹配（最高分并列列表）与候选交集，唯一才确认
-        List<LearningPlans> scored = learningPlansService.matchActivePlansByMessage(run.getUserId(), feedback);
+        List<LearningPlans> scored = learningPlansService.matchPlansByMessage(run.getUserId(), feedback);
         List<Long> hits = new ArrayList<>();
         for (Object candidate : candidates) {
             if (!(candidate instanceof Map<?, ?> c)) {

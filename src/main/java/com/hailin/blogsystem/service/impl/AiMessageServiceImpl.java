@@ -5,6 +5,7 @@ import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hailin.blogsystem.ai.TokenUsageAccumulator;
+import com.hailin.blogsystem.ai.agent.AgentFollowUpResolver;
 import com.hailin.blogsystem.ai.agent.AgentRunResult;
 import com.hailin.blogsystem.ai.agent.AgentRuntime;
 import com.hailin.blogsystem.ai.agent.AgentStepEmitter;
@@ -12,6 +13,7 @@ import com.hailin.blogsystem.ai.agent.AgentWorkflowSuggestion;
 import com.hailin.blogsystem.ai.agent.AgentWriteProposal;
 import com.hailin.blogsystem.ai.agent.AgentRuntimeRouteRegistry;
 import com.hailin.blogsystem.ai.agent.ArticleSessionAnchorService;
+import com.hailin.blogsystem.ai.agent.LearningPlanAnchorService;
 import com.hailin.blogsystem.ai.agent.ArticleAgentRuntime;
 import com.hailin.blogsystem.ai.agent.GeneralAgentRuntime;
 import com.hailin.blogsystem.ai.agent.LearningAgentRuntime;
@@ -21,6 +23,7 @@ import com.hailin.blogsystem.ai.qa.ArticleQaTargetResolver.QaTarget;
 import com.hailin.blogsystem.ai.trace.AgentDecisionTrace;
 import com.hailin.blogsystem.ai.trace.AgentDecisionTraceSink;
 import com.hailin.blogsystem.ai.workflow.CreateArticleWorkflowHandler;
+import com.hailin.blogsystem.ai.workflow.LearningProgressHandoffResolver;
 import com.hailin.blogsystem.ai.workflow.WorkflowContextSupport;
 import com.hailin.blogsystem.ai.workflow.WorkflowHandlerRegistry;
 import com.hailin.blogsystem.entity.dto.AiWorkflowLearningPlanDTO;
@@ -92,6 +95,9 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
     private final GeneralAgentRuntime generalAgentRuntime;
     private final AgentRuntimeRouteRegistry agentRuntimeRouteRegistry;
     private final ArticleSessionAnchorService articleSessionAnchorService;
+    private final LearningPlanAnchorService learningPlanAnchorService;
+    private final AgentFollowUpResolver agentFollowUpResolver;
+    private final LearningProgressHandoffResolver learningProgressHandoffResolver;
     private final ArticleQaTargetResolver articleQaTargetResolver;
     private final ObjectProvider<Tracer> tracerProvider;
 
@@ -242,10 +248,23 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             );
         }
 
+        // V4.x 追问续答：上一轮 Agent 在等用户回答（ASK_USER → WAITING_USER）时，这一句优先当"回答追问"
+        // ——直接拿去定位计划，唯一命中就沿用原诉求继续，**不重新走分类器**
+        // （分类器无状态，实测把「Java后端学习路线啊，不是Agent」判成新建计划工作流）。
+        // 不满足条件返回 null，下面照常分类，行为与改动前一致。
+        AgentFollowUpResolver.Resolution followUp = agentFollowUpResolver.resolve(sessionId, userId, message);
+
         // 统一使用 LLM 分类结果 + Agent Planner 决策。
         // 这一轮开始，文章创作、文章优化、学习 Workflow
         // 都先经过同一个 AgentDecision。
-        AiIntent intent = aiIntentClassifier.classify(message, pageContext);
+        AiIntent intent = followUp != null
+                ? followUp.intent()
+                : aiIntentClassifier.classify(message, pageContext, userId);
+
+        // 命中续答：Agent 的 goal 用"原诉求 + 本句回答"的合并文本。
+        // **不能重新赋值 message**——下面的 Flux.defer lambda 捕获它，重新赋值会破坏 effectively final；
+        // Planner / 锚写入仍按用户本句原话走，不掺合成文本（它们的判据本来就只看 intent）。
+        final String agentGoal = followUp != null ? followUp.message() : message;
 
         AgentDecision routeDecision = agentPlannerSupport.decide(
                 message,
@@ -266,6 +285,11 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 routeDecision
         );
 
+        // V4.x 会话学习计划锚：这一轮用户点名了某个计划 → 记下来，下一轮省略主语时它就是兜底依据。
+        // 放在分发之前的总入口——原先写在两个 route 方法里，Agent 路径（LEARNING_AGENT）漏在外面：
+        // 实测「帮我分析我的c++学习计划」走 Agent，锚没写，下一句「那就按你说的建议改」便定位不到。
+        markLearningPlanAnchorIfMentioned(sessionId, userId, intent);
+
         // CTA 不创建 Workflow，不绑定 activeWorkflowRunId。
         if (routeDecision.getAction() == AgentAction.CTA) {
             return streamCtaMessage(
@@ -279,29 +303,41 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
 
         // 统一处理 Workflow。
         if (routeDecision.getAction() == AgentAction.WORKFLOW) {
+            /*
+             * V4.x 工作流启动前的「理解展示」：先把"AI 理解成了什么"说出来，再开跑。
+             * 以前是判完直接启动，用户只看到确认卡突然弹出来（实测反馈："不是说开启工作流之前会思考，
+             * 还是像之前一样直接开启工作流？"）。
+             *
+             * 这里只能给意图级信息——真正的目标定位发生在工作流内部；用会话锚兜底时，
+             * route 内部会再发一条更具体的（"按你刚才提到的《X》"），前端状态是单值，后发的覆盖这条。
+             *
+             * 降级 CTA / 转新建计划的分支**不发**：那些分支的实际动作与"我理解你要调整…"对不上，说了反而误导。
+             */
+            Flux<AiChatEventVO> understanding =
+                    buildWorkflowUnderstandingStatusFlux(intent, routeDecision);
 
             // 文章创作 Workflow
             if (routeDecision.isWorkflow(AiWorkflowType.CREATE_ARTICLE)) {
-                return streamCreateArticleWorkflowFromIntent(
+                return Flux.concat(understanding, streamCreateArticleWorkflowFromIntent(
                         message,
                         intent,
                         pageContext,
                         rawPageContextJson,
                         userId,
                         sessionId
-                );
+                ));
             }
 
             // 文章优化 Workflow
             if (routeDecision.isWorkflow(AiWorkflowType.OPTIMIZE_ARTICLE)) {
-                return streamArticleOptimizeWorkflowFromIntent(
+                return Flux.concat(understanding, streamArticleOptimizeWorkflowFromIntent(
                         message,
                         intent,
                         pageContext,
                         rawPageContextJson,
                         userId,
                         sessionId
-                );
+                ));
             }
 
             // 学习难点攻坚 Workflow
@@ -309,7 +345,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 Optional<Flux<AiChatEventVO>> routed =
                         routeLearningAssistWorkflow(
                                 message,
-                                intent == null ? null : intent.getLearningPlanRef(),
+                                intent,
                                 pageContext,
                                 rawPageContextJson,
                                 userId,
@@ -318,10 +354,10 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                         );
 
                 if (routed.isPresent()) {
-                    return routed.get();
+                    return Flux.concat(understanding, routed.get());
                 }
 
-                // 计划定位失败时降级 CTA。
+                // 计划定位失败时降级 CTA（不发理解状态——CTA 的语义是"我还不确定"）。
                 return streamCtaMessage(
                         sessionId,
                         userId,
@@ -336,7 +372,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 Optional<Flux<AiChatEventVO>> routed =
                         routeLearningProgressWorkflow(
                                 message,
-                                intent == null ? null : intent.getLearningPlanRef(),
+                                intent,
                                 pageContext,
                                 rawPageContextJson,
                                 userId,
@@ -345,11 +381,12 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                         );
 
                 if (routed.isPresent()) {
-                    return routed.get();
+                    return Flux.concat(understanding, routed.get());
                 }
 
                 // 没有可调整的 ACTIVE 计划时，
                 // 沿用当前行为：进入学习规划 Workflow 创建新计划。
+                // 这里不发理解状态：实际动作是"新建"，与分类器判的"调整"对不上，说了反而误导。
                 return streamLearningPlanWorkflowFromIntent(
                         message,
                         intent,
@@ -363,7 +400,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
 
             // 学习规划 Workflow
             if (routeDecision.isWorkflow(AiWorkflowType.LEARNING_PLAN)) {
-                return streamLearningPlanWorkflowFromIntent(
+                return Flux.concat(understanding, streamLearningPlanWorkflowFromIntent(
                         message,
                         intent,
                         pageContext,
@@ -371,7 +408,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                         userId,
                         sessionId,
                         requestId
-                );
+                ));
             }
         }
 
@@ -383,7 +420,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             // V3.5：按意图查路由注册表分发领域 Runtime（intent → runtime + 兜底文案单点登记）
             MdcContext.LogContext agentLogContext = captureAgentLogContext(mdcSnapshot);
             return dispatchAgentRuntime(
-                    intent, message, pageContext, rawPageContextJson,
+                    intent, message, agentGoal, pageContext, rawPageContextJson,
                     userId, sessionId, session, requestId, agentLogContext
             );
         }
@@ -396,7 +433,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
          * 用 Flux.defer 让整段慢操作推迟到订阅时执行，状态事件才真正「提前」。
          */
         return Flux.concat(
-                buildChatStatusFlux(routeDecision),
+                buildChatStatusFlux(routeDecision, intent),
                 Flux.defer(() -> streamNormalChatFlow(
                         message, pageContext, rawPageContextJson, userId,
                         sessionId, session, routeDecision, intent, requestId
@@ -405,15 +442,32 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
     }
 
     /**
-     * V4.5：构造首字前的过程状态事件（**只依赖 routeDecision**，不依赖任何慢操作结果）。
+     * 分类器是否降级（调用失败 → 强制 GENERAL_CHAT）。
+     *
+     * 判据：{@code generalChat()} 兜底构造的 confidence 固定为 0.0——正常分类不会给 0 分。
+     * 之所以要显式告诉用户：降级是**静默**的，用户看到的是"AI 突然不认我说话了"，
+     * 而不是"这次是系统故障"——两者对用户的意义完全不同（前者让人怀疑产品，后者只是重试一次）。
+     */
+    private boolean isClassifierDegraded(AiIntent intent) {
+        return intent != null
+                && Double.valueOf(0.0).equals(intent.getConfidence());
+    }
+
+    /**
+     * V4.5：构造首字前的过程状态事件（**只依赖 routeDecision + intent**，不依赖任何慢操作结果）。
      *
      * 文案按**意图级**给，不承诺结果：事件发出时 QaTarget 尚未决议，最终可能是
      * 追问态 / 说明态（并没真正读到文章）——所以 CURRENT_ARTICLE 只能说
      * 「正在确认文章范围」，不能写「正在读取当前文章」。
      *
      * 无检索意图（普通闲聊）返回空流：不打搅原有打字动效，不为了「全局」强行加状态。
+     *
+     * V4.x 补两路，都是"用户会干等、之前却没有任何提示"的场景：
+     * - **学习计划查询**（dashboard 读工具）：查库 + 拼上下文 + 生成全程无提示，
+     *   用户只看到干等几秒后突然冒出一大段（实测原话："我前端根本看不到他在干嘛突然就全部发出来了"）
+     * - **分类器降级**：失败后静默走普通聊天，用户看到的是"AI 突然不认我的话了"而不是"系统故障"
      */
-    private Flux<AiChatEventVO> buildChatStatusFlux(AgentDecision routeDecision) {
+    private Flux<AiChatEventVO> buildChatStatusFlux(AgentDecision routeDecision, AiIntent intent) {
         if (routeDecision == null) {
             return Flux.empty();
         }
@@ -430,6 +484,14 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             statusType = "ARTICLE_SEARCHING";
             retrievalMode = "ARTICLE_SEARCH";
             text = "正在检索站内文章...";
+        } else if (routeDecision.isTool("getLearningDashboard")) {
+            statusType = "LEARNING_DASHBOARD_READING";
+            retrievalMode = "NONE";
+            text = "正在查看你的学习计划...";
+        } else if (isClassifierDegraded(intent)) {
+            statusType = "CLASSIFIER_DEGRADED";
+            retrievalMode = "NONE";
+            text = "这次没理解准，先按普通回答处理...";
         } else {
             return Flux.empty();
         }
@@ -685,6 +747,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
     private Flux<AiChatEventVO> dispatchAgentRuntime(
             AiIntent intent,
             String message,
+            String agentGoal,
             PageContextDTO pageContext,
             String rawPageContextJson,
             Long userId,
@@ -707,6 +770,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         return streamAgentReply(
                 runtime,
                 message,
+                agentGoal,
                 pageContext,
                 rawPageContextJson,
                 userId,
@@ -728,7 +792,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
 
     private Flux<AiChatEventVO> streamAgentReply(
             AgentRuntime runtime,
-            String message,
+            String message,        // 用户**原话**：落库 + 回传前端，必须原样（不能是续答合成文本）
+            String agentGoal,      // Agent 的目标：续答时是"原诉求 + 本句回答"，其余情况等于 message
             PageContextDTO pageContext,
             String rawPageContextJson,
             Long userId,
@@ -738,7 +803,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             String fallbackReply,
             MdcContext.LogContext logContext
     ) {
-        // 用户消息落库（同步，立即可见）
+        // 用户消息落库（同步，立即可见）——用原话，用户发的什么就存什么、显示什么
         AiMessages userMessage = new AiMessages();
         userMessage.setSessionId(sessionId);
         userMessage.setRole(ROLE_USER);
@@ -804,7 +869,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 UserContext.set(userId);
                 try {
                     AgentRunResult result = runtime.run(
-                            userId, sessionId, message, pageContext, emitter
+                            userId, sessionId, agentGoal, pageContext, emitter
                     );
 
                     String reply = result.finalAnswer() == null
@@ -1138,14 +1203,30 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
 
     private Optional<Flux<AiChatEventVO>> routeLearningAssistWorkflow(
             String message,
-            String learningPlanRef,
+            AiIntent intent,
             PageContextDTO pageContext,
             String rawPageContextJson,
             Long userId,
             Long sessionId,
             String requestId
     ) {
-        List<LearningPlans> mentioned = resolveMentionedActivePlans(userId, learningPlanRef, message);
+        // 分类器在理解阶段就从「该用户真实计划列表」里选定了目标（learningPlanId 为后端映射所得，
+        // 越界已在分类器内丢弃）。命中即直达，不再做字符串匹配——这是「说了 c++ 却被反问选哪个」的修复点。
+        LearningPlans authoritative = loadAuthoritativePlan(userId, intent);
+        if (authoritative != null) {
+            return Optional.of(streamLearningAssistWorkflowFromIntent(
+                    message,
+                    authoritative,
+                    List.of(),
+                    pageContext,
+                    rawPageContextJson,
+                    userId,
+                    sessionId,
+                    requestId
+            ));
+        }
+
+        List<LearningPlans> mentioned = resolveMentionedActivePlans(userId, learningPlanRefOf(intent));
         if (mentioned.size() == 1) {
             return Optional.of(streamLearningAssistWorkflowFromIntent(
                     message,
@@ -1156,6 +1237,24 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                     userId,
                     sessionId,
                     requestId
+            ));
+        }
+
+        // V4.x 会话学习计划锚兜底（同 routeLearningProgressWorkflow，位置与理由一致）
+        LearningPlans anchored = learningPlanAnchorService.resolve(sessionId, userId);
+        if (anchored != null) {
+            return Optional.of(Flux.concat(
+                    buildAnchorUsedStatusFlux(anchored),
+                    streamLearningAssistWorkflowFromIntent(
+                            message,
+                            anchored,
+                            List.of(),
+                            pageContext,
+                            rawPageContextJson,
+                            userId,
+                            sessionId,
+                            requestId
+                    )
             ));
         }
 
@@ -1194,14 +1293,29 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
 
     private Optional<Flux<AiChatEventVO>> routeLearningProgressWorkflow(
             String message,
-            String learningPlanRef,
+            AiIntent intent,
             PageContextDTO pageContext,
             String rawPageContextJson,
             Long userId,
             Long sessionId,
             String requestId
     ) {
-        List<LearningPlans> mentioned = resolveMentionedActivePlans(userId, learningPlanRef, message);
+        // 同 routeLearningAssistWorkflow：分类器选定的权威计划优先，命中即直达，不再做字符串匹配
+        LearningPlans authoritative = loadAuthoritativePlan(userId, intent);
+        if (authoritative != null) {
+            return Optional.of(streamLearningProgressWorkflowFromIntent(
+                    message,
+                    authoritative,
+                    List.of(),
+                    pageContext,
+                    rawPageContextJson,
+                    userId,
+                    sessionId,
+                    requestId
+            ));
+        }
+
+        List<LearningPlans> mentioned = resolveMentionedActivePlans(userId, learningPlanRefOf(intent));
         if (mentioned.size() == 1) {
             return Optional.of(streamLearningProgressWorkflowFromIntent(
                     message,
@@ -1212,6 +1326,33 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                     userId,
                     sessionId,
                     requestId
+            ));
+        }
+
+        /*
+         * V4.x 会话学习计划锚兜底：这一句里没有计划名（多轮对话省略主语，如
+         * 「我是要应对学校课程，你会怎么改」）时，用本会话最近一次**真实定位到**的计划。
+         *
+         * 位置：在"原话匹配"之后、"只剩一个 ACTIVE 计划"之前——
+         * 「用户这次说了什么」永远优先于「上次聊的是哪个」，而锚比"只剩一个计划"的隐含推断更可靠。
+         *
+         * 用了锚**必须报出来**（见 buildAnchorUsedStatusFlux）：那是合理的猜测而非确定，
+         * 猜错了用户得有机会纠正——沉默地改错计划是最坏结果。
+         */
+        LearningPlans anchored = learningPlanAnchorService.resolve(sessionId, userId);
+        if (anchored != null) {
+            return Optional.of(Flux.concat(
+                    buildAnchorUsedStatusFlux(anchored),
+                    streamLearningProgressWorkflowFromIntent(
+                            message,
+                            anchored,
+                            List.of(),
+                            pageContext,
+                            rawPageContextJson,
+                            userId,
+                            sessionId,
+                            requestId
+                    )
             ));
         }
 
@@ -1248,15 +1389,145 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         return Optional.empty();
     }
 
-    private List<LearningPlans> resolveMentionedActivePlans(Long userId, String learningPlanRef, String message) {
-        String reference = learningPlanRef == null || learningPlanRef.isBlank()
-                ? message
-                : learningPlanRef;
-        List<LearningPlans> mentioned = learningPlansService.matchActivePlansByMessage(userId, reference);
-        if (mentioned.isEmpty() && !Objects.equals(reference, message)) {
-            return learningPlansService.matchActivePlansByMessage(userId, message);
+    /**
+     * V4.x：用了会话学习计划锚兜底时的过程状态。
+     *
+     * 「按你刚才提到的《X》来处理」——作用是让**猜测可见**：锚是"上一轮聊过"的推断，
+     * 不是用户这一句说的。报了用户才知道系统理解成了哪个，猜错能当场纠正。
+     */
+    private Flux<AiChatEventVO> buildAnchorUsedStatusFlux(LearningPlans plan) {
+        if (plan == null || plan.getTitle() == null || plan.getTitle().isBlank()) {
+            return Flux.empty();
         }
-        return mentioned;
+        return Flux.just(AiChatEventVO.builder()
+                .eventType(AiChatEventType.CHAT_STATUS.getValue())
+                .eventData(Map.of(
+                        "statusType", "SESSION_PLAN_ANCHOR_USED",
+                        "retrievalMode", "NONE",
+                        "message", "按你刚才提到的《" + plan.getTitle() + "》来处理..."
+                ))
+                .build());
+    }
+
+    /**
+     * V4.x：工作流启动前的「理解展示」。
+     *
+     * 工作流以前是"判完直接开跑"——用户只看到确认卡突然弹出来，中间没有"它理解成了什么"这一步
+     * （实测反馈："不是说开启工作流之前会思考，还是像之前一样直接开启工作流？"）。
+     *
+     * 文案只能用**意图级信息 + 用户原话里的计划名**：真正的目标定位发生在工作流内部，这里还拿不到。
+     * 用会话锚兜底时 route 内部会再发一条更具体的（"按你刚才提到的《X》"），
+     * 前端状态是单值、后发的覆盖先发的，所以两条连着发不会打架。
+     */
+    private Flux<AiChatEventVO> buildWorkflowUnderstandingStatusFlux(AiIntent intent, AgentDecision decision) {
+        if (decision == null || decision.getWorkflowType() == null) {
+            return Flux.empty();
+        }
+        String planRef = learningPlanRefOf(intent);
+        String planPart = planRef == null || planRef.isBlank() ? "" : "《" + planRef + "》";
+
+        String text = switch (decision.getWorkflowType()) {
+            case LEARNING_PROGRESS -> "我理解你要调整学习计划" + planPart + "，正在准备...";
+            case LEARNING_ASSIST -> "我理解你要拆解学习难点" + planPart + "，正在准备...";
+            case LEARNING_PLAN -> "我理解你想制定学习计划，正在准备...";
+            case CREATE_ARTICLE -> "我理解你想写一篇新文章，正在准备...";
+            case OPTIMIZE_ARTICLE -> "我理解你想优化当前文章，正在准备...";
+        };
+
+        return Flux.just(AiChatEventVO.builder()
+                .eventType(AiChatEventType.CHAT_STATUS.getValue())
+                .eventData(Map.of(
+                        "statusType", "WORKFLOW_UNDERSTANDING",
+                        "retrievalMode", "NONE",
+                        "message", text
+                ))
+                .build());
+    }
+
+    /**
+     * V4.x 会话学习计划锚的**唯一写点**：用户这一轮点名了某个计划，且能唯一定位到 → 记下来。
+     *
+     * 为什么放在总入口而不是各个 route 方法里：路由出口有多条（工作流 / Agent / 聊天），
+     * 只在工作流两处写会漏掉 Agent——实测「帮我分析我的c++学习计划」走 Agent 路径，
+     * 锚没写，下一句「那就按你说的建议改」就定位不到（会话不同也会不命中，那是锚固有的会话边界）。
+     *
+     * 只对「操作已有计划」的意图写：新建计划（LEARNING_PLAN）语境里出现的计划名，
+     * 多半是"要创建的那个"而不是"已有的某个"，写进锚会误导下一轮。
+     *
+     * 定位优先用分类器的权威 ID，否则按原话匹配——**不唯一就不写**（宁可不猜）。
+     */
+    private void markLearningPlanAnchorIfMentioned(Long sessionId, Long userId, AiIntent intent) {
+        if (sessionId == null || userId == null || intent == null) {
+            return;
+        }
+        String intentName = intent.getIntent();
+        if (!"LEARNING_PROGRESS".equals(intentName)
+                && !"LEARNING_ASSIST".equals(intentName)
+                && !"LEARNING_AGENT".equals(intentName)) {
+            return;
+        }
+        String planRef = learningPlanRefOf(intent);
+        if (planRef == null || planRef.isBlank()) {
+            // 这一轮没点名计划——没有新信息，不动锚（保留会话里已有的那个）
+            return;
+        }
+
+        LearningPlans plan = loadAuthoritativePlan(userId, intent);
+        String source = LearningPlanAnchorService.SOURCE_CLASSIFIER;
+        if (plan == null) {
+            List<LearningPlans> matched = resolveMentionedActivePlans(userId, planRef);
+            if (matched.size() != 1) {
+                return;
+            }
+            plan = matched.get(0);
+            source = LearningPlanAnchorService.SOURCE_BACKEND_MATCH;
+        }
+        learningPlanAnchorService.mark(sessionId, plan.getId(), source);
+    }
+
+    /**
+     * 分类器选定的权威计划（V4.x）：模型从注入的真实列表里选序号，后端映射成 ID，越界已在上游丢弃。
+     * 这里再校验一次存在 + ACTIVE + 归属（防御纵深：ID 虽由后端写入，仍不无条件信任）。
+     * 任一不满足返回 null，由调用方落回关键词匹配兜底。
+     */
+    private LearningPlans loadAuthoritativePlan(Long userId, AiIntent intent) {
+        if (intent == null || intent.getLearningPlanId() == null) {
+            return null;
+        }
+        try {
+            LearningPlans plan = learningPlansService.getById(Long.valueOf(intent.getLearningPlanId()));
+            if (plan == null || !userId.equals(plan.getUserId())
+                    || !LearningPlans.STATUS_ACTIVE.equals(plan.getStatus())) {
+                return null;
+            }
+            return plan;
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    //分类器摘录的计划名——仅作关键词匹配的输入（权威 ID 缺失时的兜底路径）
+    private String learningPlanRefOf(AiIntent intent) {
+        return intent == null ? null : intent.getLearningPlanRef();
+    }
+
+    /**
+     * 按「用户点名的计划」匹配——**只认分类器摘录的 planRef**。
+     *
+     * V4.x 修正：原先 planRef 为空时退回用**整句 message** 去匹配，后果是：
+     * 「行，那就按照你说的优化建议，帮我优化一下这个计划」靠"优化""计划"两个通用词
+     * 命中了《Redis 核心原理与工程化实战计划（结构优化版）》（标题含"优化"），
+     * 而 C++ 计划标题只含"计划"——Redis 得分更高成为唯一最高分，被当成**点名成功**，
+     * 于是锚兜底整条路被跳过，用户以为是 C++ 却改了 Redis（实测踩中）。
+     *
+     * 判据：**分类器摘出 planRef = 用户点名了计划**——它判"用户提到哪个计划"比字符串匹配可靠得多。
+     * planRef 为空就是**没点名**：交给会话锚去推断，而不是在这里用整句话碰运气。
+     */
+    private List<LearningPlans> resolveMentionedActivePlans(Long userId, String learningPlanRef) {
+        if (learningPlanRef == null || learningPlanRef.isBlank()) {
+            return List.of();
+        }
+        return learningPlansService.matchPlansByMessage(userId, learningPlanRef);
     }
 
     private List<LearningPlans> activeLearningPlans(Long userId) {
@@ -1543,6 +1814,13 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         workflowDTO.setPlanId(targetPlan == null ? null : targetPlan.getId());
         workflowDTO.setCandidates(candidates == null || candidates.isEmpty() ? null : candidates);
         workflowDTO.setRequest(message);
+        if (targetPlan != null) {
+            learningProgressHandoffResolver.resolve(sessionId, userId, message)
+                    .ifPresent(handoff -> {
+                        workflowDTO.setHandoffReason(handoff.suggestedDirection());
+                        workflowDTO.setHandoffSourceAgentRunId(handoff.sourceAgentRunId());
+                    });
+        }
 
         AiChatEventVO paramEvent = AiChatEventVO.builder()
                 .eventType(AiChatEventType.PARAM.getValue())
@@ -1914,7 +2192,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
 
         AiIntent intent = aiIntentClassifier.classify(
                 message,
-                pageContext
+                pageContext,
+                userId
         );
 
         AgentDecision routeDecision = agentPlannerSupport.decide(
@@ -1958,8 +2237,9 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             removeById(userMessage.getId());
 
             // V3.5：与主分发同一注册表分发（intent → runtime + 兜底文案单点）
+            // 这条是 Workflow 回退路径，不经过追问续答 → 目标就是用户原话（两个参数相同）
             return dispatchAgentRuntime(
-                    intent, message, pageContext, rawPageContextJson,
+                    intent, message, message, pageContext, rawPageContextJson,
                     userId, sessionId, session, requestId, captureAgentLogContext(mdcSnapshot)
             );
         }
@@ -2006,9 +2286,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 Optional<Flux<AiChatEventVO>> routed =
                         routeLearningAssistWorkflow(
                                 message,
-                                intent == null
-                                        ? null
-                                        : intent.getLearningPlanRef(),
+                                intent,
                                 pageContext,
                                 rawPageContextJson,
                                 userId,
@@ -2040,9 +2318,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 Optional<Flux<AiChatEventVO>> routed =
                         routeLearningProgressWorkflow(
                                 message,
-                                intent == null
-                                        ? null
-                                        : intent.getLearningPlanRef(),
+                                intent,
                                 pageContext,
                                 rawPageContextJson,
                                 userId,
@@ -2094,7 +2370,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         // V4.5：过程状态必须先于慢操作 concat——回退路径与主入口共用同一 helper，
         // 否则「回退到普通聊天」这条出口依然是无语义等待。
         return Flux.concat(
-                buildChatStatusFlux(routeDecision),
+                buildChatStatusFlux(routeDecision, intent),
                 Flux.defer(() -> streamFallbackChatFlow(
                         message, pageContext, rawPageContextJson, userId, sessionId,
                         routeDecision, intent, requestId, userMessage
@@ -2257,16 +2533,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             AiMessages userMessage,
             AgentDecision decision
     ) {
-        String reason = decision == null
-                || decision.getReason() == null
-                || decision.getReason().isBlank()
-                ? "当前需求还不够明确。"
-                : decision.getReason();
-
-        String content = buildPlannerCtaContent(
-                decision,
-                reason
-        );
+        String content = buildPlannerCtaContent(decision);
 
         AiMessages assistantMessage = saveStreamAssistantMessage(
                 sessionId,
@@ -2300,11 +2567,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         userMessage.setCreatedAt(LocalDateTime.now());
         save(userMessage);
 
-        String reason = decision == null || decision.getReason() == null || decision.getReason().isBlank()
-                ? "当前学习需求还不够明确。"
-                : decision.getReason();
-
-        String content = buildPlannerCtaContent(decision, reason);
+        String content = buildPlannerCtaContent(decision);
 
         AiMessages assistantMessage = saveStreamAssistantMessage(
                 sessionId,
@@ -2317,40 +2580,62 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
     }
 
     /**
-     * 根据最终决策类型生成 CTA 文案。
+     * CTA 文案（V4.x 重写）。
+     *
+     * 旧版把 decision.reason（开发者诊断串）直接拼进用户可见文案——「分类器置信度不足，降级 CTA」
+     * 「LLM 建议启动 Workflow，但后端规则未命中」这类内部术语会被用户读到，而且用户无法据此行动；
+     * 副作用是改 reason 措辞会静默改掉用户看到的字。
+     * 现在按 decision.ctaKind 分类说话：用户能行动的给具体指引，用户做不了的原因
+     * （系统自身不确定 / 配额）只给中性引导，不解释内部机制。
+     * 诊断信息仍在 reason 与 AgentDecisionTrace 中，不进用户文案。
      *
      * CTA 只保存普通消息：
      * - 不创建 Workflow Run
      * - 不绑定 activeWorkflowRunId
      */
-    private String buildPlannerCtaContent(
-            AgentDecision decision,
-            String reason
-    ) {
+    private String buildPlannerCtaContent(AgentDecision decision) {
+        CtaKind kind = decision == null || decision.getCtaKind() == null
+                ? CtaKind.SYSTEM_UNCERTAIN
+                : decision.getCtaKind();
+
+        return switch (kind) {
+            case MISSING_ARTICLE_CONTEXT -> "你说的这篇文章我这边还没有出现过。\n\n"
+                    + "打开那篇文章的详情页，再对我说\"把这篇…\"，我就能直接帮你处理。";
+            case PAGE_CONTEXT_MISMATCH -> "这个操作要在对应的页面上做才行。\n\n"
+                    + "先打开那篇文章的详情页（或文章编辑器），再跟我说一次。";
+            case AMBIGUOUS_REQUEST -> "我还不太确定你想做什么，能再说一句吗？\n\n"
+                    + "比如告诉我是想调整学习计划、写一篇新文章，还是优化已有的文章。";
+            case QUOTA_REACHED -> "这个会话里我已经自动帮你启动过几次流程了。\n\n"
+                    + "这次请你明确说一句要做什么，我再开始。";
+            case SYSTEM_UNCERTAIN -> systemUncertainCtaContent(decision);
+        };
+    }
+
+    /**
+     * 「系统不确定」的 CTA 文案：按 intent 给一句确认式引导。
+     *
+     * 置信度不足 / 风险偏高 / 分类器字段不一致这些都是系统内部状态——用户既看不懂也无从改进，
+     * 所以不说这些，改说"我猜你是想做 X，对吗"，用户用一句话就能确认或纠正。
+     */
+    private String systemUncertainCtaContent(AgentDecision decision) {
         String intent = decision == null ? null : decision.getIntent();
 
-        if ("OPTIMIZE_ARTICLE_WORKFLOW".equals(intent)) {
-            return "我可以帮你优化文章，但当前还缺少明确的文章上下文。\n\n"
-                    + "当前判断：" + reason + "\n"
-                    + "请从文章详情页发起优化，或者明确告诉我需要优化哪篇文章。";
-        }
-
         if ("CREATE_ARTICLE_WORKFLOW".equals(intent)) {
-            return "我可以帮你创建文章，但还需要确认文章主题或具体要求。\n\n"
-                    + "当前判断：" + reason + "\n"
-                    + "请告诉我想写什么主题，例如：Redis 缓存、Kafka 消息队列、RAG 检索增强。";
+            return "你是想让我帮你写文章吗？告诉我主题就行，例如：Redis 缓存、Kafka 消息队列。";
         }
-
+        if ("OPTIMIZE_ARTICLE_WORKFLOW".equals(intent)) {
+            return "你是想优化某篇文章吗？打开那篇文章的详情页，再跟我说一次就行。";
+        }
         if ("ARTICLE_DETAIL_QA".equals(intent)) {
-            return "我可以回答当前文章的问题，但当前没有拿到有效的文章上下文。\n\n"
-                    + "当前判断：" + reason + "\n"
-                    + "请在文章详情页继续提问。";
+            return "你是想问某篇文章的问题吗？打开那篇文章再问我。";
         }
-
-        return "我可以继续普通讲解，也可以为你启动对应的学习流程。\n\n"
-                + "当前判断：" + reason + "\n"
-                + "如果只是想聊天或解释概念，可以直接继续问；"
-                + "如果要进入学习流程，请明确告诉我。";
+        if ("LEARNING_PLAN".equals(intent)
+                || "LEARNING_PROGRESS".equals(intent)
+                || "LEARNING_ASSIST".equals(intent)) {
+            return "你是想调整学习计划吗？告诉我是哪个计划、想怎么改，我来帮你处理。";
+        }
+        return "我还不太确定你想让我做什么。\n\n"
+                + "你可以直接说具体一点，比如想调整学习计划、写新文章，或者优化已有的文章。";
     }
 
     /**
@@ -2423,25 +2708,21 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
     }
 
     /**
-     * 游客 CTA 文案。
+     * 游客 CTA 文案（V4.x：与登录路径同源，不再拼 reason）。
      *
-     * 游客没有持久化 session，
-     * 所以这里只返回一次性提示，不保存消息。
+     * 游客没有持久化 session，所以这里只返回一次性提示，不保存消息。
+     * 游客的 CTA 绝大多数是「这个操作要登录」（游客进不了 Workflow / Tool），
+     * 只有分类器主动建议澄清时才需要追问一句。
      */
     private String buildGuestCtaContent(
             AgentDecision decision
     ) {
-        String reason = decision == null
-                ? "当前需求还不够明确。"
-                : decision.getReason();
-
-        if (reason == null || reason.isBlank()) {
-            reason = "当前需求还不够明确。";
+        if (decision != null && decision.getCtaKind() == CtaKind.AMBIGUOUS_REQUEST) {
+            return "我还不太确定你想做什么，能再说一句吗？";
         }
 
-        return "我还需要你补充一点信息，才能判断下一步怎么处理。\n\n"
-                + "当前判断：" + reason + "\n"
-                + "你可以继续描述具体问题，或者登录后使用完整的 Workflow 和学习计划能力。";
+        return "这个操作需要登录后才能使用。\n\n"
+                + "登录后我就能帮你制定学习计划、写文章和优化文章了。";
     }
 
     /** 构建带 workflow 的 STOP Flux（无流式内容） */
@@ -2574,9 +2855,11 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
 
         // 游客也先经过统一 Planner。
         // 但游客不能真正执行 Workflow 或学习查询 Tool。
+        // userId 传 null：游客没有学习计划列表，分类器不注入、learningPlanIndex 无意义
         AiIntent intent = aiIntentClassifier.classify(
                 message,
-                pageContext
+                pageContext,
+                null
         );
 
         String requestId = UUID.randomUUID().toString();
@@ -2688,7 +2971,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
 
         // V4.5：游客路径同样先发过程状态——三处出口共用同一 helper，避免「游客无提示」
         return Flux.concat(
-                buildChatStatusFlux(guestDecision),
+                buildChatStatusFlux(guestDecision, intent),
                 Flux.defer(() -> streamGuestChatFlow(
                         message, pageContext, intent, guestDecision,
                         fullReply, now, guestSession, userMessage, requestId

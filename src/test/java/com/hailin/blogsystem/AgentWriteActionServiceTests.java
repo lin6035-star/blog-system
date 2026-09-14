@@ -166,7 +166,7 @@ class AgentWriteActionServiceTests {
         when(runMapper.selectById(1L)).thenReturn(
                 run(1L, "WAITING_WRITE_CONFIRM", PROPOSAL_ADD_CONTEXT));
         when(runMapper.update(any(AiAgentRun.class), any())).thenReturn(1);
-        when(learningPlansService.matchActivePlansByMessage(100L, "Redis 学习计划")).thenReturn(List.of(
+        when(learningPlansService.matchPlansByMessage(100L, "Redis 学习计划")).thenReturn(List.of(
                 activePlan(1L, "Redis 学习计划")));
         when(learningPlansService.listByUser(100L)).thenReturn(List.of(
                 activePlan(1L, "Redis 学习计划")));
@@ -200,7 +200,7 @@ class AgentWriteActionServiceTests {
         when(runMapper.selectById(1L)).thenReturn(
                 run(1L, "WAITING_WRITE_CONFIRM", PROPOSAL_ADD_CONTEXT));
         when(runMapper.update(any(AiAgentRun.class), any())).thenReturn(1);
-        when(learningPlansService.matchActivePlansByMessage(100L, "Redis 学习计划")).thenReturn(List.of(
+        when(learningPlansService.matchPlansByMessage(100L, "Redis 学习计划")).thenReturn(List.of(
                 activePlan(1L, "Redis 学习计划")));
         when(learningPlansService.listByUser(100L)).thenReturn(List.of(
                 activePlan(1L, "Redis 学习计划")));
@@ -330,7 +330,7 @@ class AgentWriteActionServiceTests {
         when(runMapper.selectById(1L)).thenReturn(
                 run(1L, "WAITING_WRITE_CONFIRM", PROPOSAL_RENAME_CONTEXT));
         when(runMapper.update(any(AiAgentRun.class), any())).thenReturn(1);
-        when(learningPlansService.matchActivePlansByMessage(100L, "Redis 学习计划")).thenReturn(List.of(
+        when(learningPlansService.matchPlansByMessage(100L, "Redis 学习计划")).thenReturn(List.of(
                 activePlan(1L, "Redis 学习计划")));
         when(learningPlansService.listByUser(100L)).thenReturn(List.of(
                 activePlan(1L, "Redis 学习计划")));
@@ -366,7 +366,7 @@ class AgentWriteActionServiceTests {
         when(runMapper.selectById(1L)).thenReturn(
                 run(1L, "WAITING_WRITE_CONFIRM", PROPOSAL_RENAME_CONTEXT));
         when(runMapper.update(any(AiAgentRun.class), any())).thenReturn(1);
-        when(learningPlansService.matchActivePlansByMessage(100L, "Redis 学习计划")).thenReturn(List.of(
+        when(learningPlansService.matchPlansByMessage(100L, "Redis 学习计划")).thenReturn(List.of(
                 activePlan(1L, "Redis 学习计划")));
         when(learningPlansService.listByUser(100L)).thenReturn(List.of(
                 activePlan(1L, "Redis 学习计划")));
@@ -385,7 +385,7 @@ class AgentWriteActionServiceTests {
         when(runMapper.selectById(1L)).thenReturn(
                 run(1L, "WAITING_WRITE_CONFIRM", PROPOSAL_RENAME_CONTEXT));
         when(runMapper.update(any(AiAgentRun.class), any())).thenReturn(1);
-        when(learningPlansService.matchActivePlansByMessage(100L, "Redis 学习计划")).thenReturn(List.of(
+        when(learningPlansService.matchPlansByMessage(100L, "Redis 学习计划")).thenReturn(List.of(
                 activePlan(1L, "Redis 学习计划")));
         when(learningPlansService.listByUser(100L)).thenReturn(List.of(
                 activePlan(1L, "Redis 学习计划")));

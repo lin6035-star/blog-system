@@ -883,24 +883,15 @@ public class CreateArticleWorkflowHandler extends AbstractWorkflowHandler {
 
         return draft;
     }
+    //LLM 不可用时的降级标签：直接取主题截断。
+    //曾硬编码 Redis / 缓存 / 高并发 三个词——只在「LLM 挂了且主题恰好含这三个词」时命中，
+    //收益接近零，维护成本是纯负债（换个主题就一个标签都没有，观感上是"为特定用例定制"）。
     private List<String> extractSimpleKeywords(String text) {
         List<String> keywords = new ArrayList<>();
         String normalized = text == null ? "" : text.trim();
-
-        if (normalized.contains("Redis")) {
-            keywords.add("Redis");
-        }
-        if (normalized.contains("缓存")) {
-            keywords.add("缓存");
-        }
-        if (normalized.contains("高并发")) {
-            keywords.add("高并发");
-        }
-
-        if (keywords.isEmpty() && !normalized.isBlank()) {
+        if (!normalized.isBlank()) {
             keywords.add(normalized.length() > 20 ? normalized.substring(0, 20) : normalized);
         }
-
         return keywords;
     }
     /**

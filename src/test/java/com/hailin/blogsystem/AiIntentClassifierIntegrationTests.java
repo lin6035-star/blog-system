@@ -1,11 +1,16 @@
 package com.hailin.blogsystem;
 
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.hailin.blogsystem.entity.LearningPlans;
 import com.hailin.blogsystem.entity.dto.AiIntent;
 import com.hailin.blogsystem.entity.dto.PageContextDTO;
+import com.hailin.blogsystem.mapper.LearningPlanMapper;
 import com.hailin.blogsystem.service.AiIntentClassifier;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Tag;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
@@ -16,6 +21,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 
 import java.io.InputStream;
+import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Objects;
 import java.util.stream.Stream;
@@ -34,6 +40,12 @@ class AiIntentClassifierIntegrationTests {
     /** mock 掉真 ES vectorStore（评测门只测分类器 prompt，不依赖本地 ES 可用性） */
     @MockBean
     private VectorStore vectorStore;
+
+    /** 别名选中用例的计划 fixture 用户：避开其他测试类占用的 101/102/103/106/107 */
+    private static final Long PLAN_TEST_USER = 109L;
+
+    @Autowired
+    private LearningPlanMapper learningPlanMapper;
 
     // ------------------------------------------------------------------
     // 评测集：JSON 文件驱动（classifier-evaluation-cases.json）
@@ -102,6 +114,55 @@ class AiIntentClassifierIntegrationTests {
         return cases.stream().map(c -> Arguments.of(c.name(), c));
     }
 
+    // ------------------------------------------------------------------
+    // V4.x：分类器拿到「用户真实计划列表」之后的别名选中能力
+    // 与固定样例集分开：这两条依赖库内 fixture（两个易混标题），锁的是「换个说法对不对得上」与「没点名不许猜」
+    // ------------------------------------------------------------------
+
+    @Test
+    void picksPlanFromInjectedListByAlias() {
+        // 旧行为：learningPlanRef="c++学习计划" 被分词切成 "c"，与「C语言系统学习计划」同分并列 → 弹卡让用户重选
+        insertActivePlan("C语言系统学习计划");
+        LearningPlans cppPlan = insertActivePlan("C++ 系统学习与工程化实践计划");
+
+        AiIntent intent = aiIntentClassifier.classify(
+                "帮我把c++的第一阶段浓缩成四个小任务", null, PLAN_TEST_USER);
+
+        assertThat(intent.getLearningPlanId())
+                .as("用户说了 c++，应选中《C++ 系统学习与工程化实践计划》，而不是《C语言系统学习计划》")
+                .isEqualTo(String.valueOf(cppPlan.getId()));
+    }
+
+    @Test
+    void doesNotGuessWhenNoPlanMentioned() {
+        insertActivePlan("C语言系统学习计划");
+        insertActivePlan("C++ 系统学习与工程化实践计划");
+
+        AiIntent intent = aiIntentClassifier.classify(
+                "帮我把第一阶段浓缩成四个小任务", null, PLAN_TEST_USER);
+
+        assertThat(intent.getLearningPlanId())
+                .as("用户没点名计划、多候选下不得猜——宁可留给后端追问")
+                .isNull();
+    }
+
+    private LearningPlans insertActivePlan(String title) {
+        LearningPlans plan = new LearningPlans();
+        plan.setUserId(PLAN_TEST_USER);
+        plan.setTitle(title);
+        plan.setStatus(LearningPlans.STATUS_ACTIVE);
+        plan.setCreatedAt(LocalDateTime.now());
+        plan.setUpdatedAt(LocalDateTime.now());
+        learningPlanMapper.insert(plan);
+        return plan;
+    }
+
+    @AfterEach
+    void cleanupPlanFixture() {
+        learningPlanMapper.delete(new LambdaQueryWrapper<LearningPlans>()
+                .eq(LearningPlans::getUserId, PLAN_TEST_USER));
+    }
+
     @ParameterizedTest(name = "[{index}] {0}")
     @MethodSource("evalCases")
     void classifierMatchesFixedEvalCase(String caseName, ClassifierEvalCase c) {
@@ -112,7 +173,9 @@ class AiIntentClassifierIntegrationTests {
             pageContext.setPageType(c.pageType());
             pageContext.setArticleId(c.pageArticleId());
         }
-        AiIntent intent = aiIntentClassifier.classify(c.message(), pageContext);
+        // userId 传 null：固定样例集锁的是「分类器只看原话能理解到什么」（原有 22 例语义不变）；
+        // 注入真实计划列表后的「别名选中」能力由 picksPlanFromInjectedListByAlias 单独验证
+        AiIntent intent = aiIntentClassifier.classify(c.message(), pageContext, null);
 
         if (c.expectedIntent() != null) {
             assertThat(intent.getIntent())

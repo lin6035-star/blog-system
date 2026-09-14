@@ -15,6 +15,7 @@ import com.hailin.blogsystem.entity.dto.AgentAction;
 import com.hailin.blogsystem.entity.dto.AgentDecision;
 import com.hailin.blogsystem.entity.dto.AiIntent;
 import com.hailin.blogsystem.entity.dto.AiWorkflowType;
+import com.hailin.blogsystem.entity.dto.CtaKind;
 import com.hailin.blogsystem.entity.dto.PageContextDTO;
 import com.hailin.blogsystem.mapper.AiWorkflowRunMapper;
 import org.junit.jupiter.api.BeforeEach;
@@ -55,11 +56,14 @@ class AgentPlannerSupportTests {
     }
 
     @Test
-    void queryRequestUsesDashboardToolEvenWhenClassifierMisjudgesPlanIntent() {
-        AiIntent intent = workflowIntent("LEARNING_PLAN", AiWorkflowType.LEARNING_PLAN, 0.95, "LOW");
+    void queryIntentUsesDashboardTool() {
+        AiIntent intent = new AiIntent();
+        intent.setIntent("LEARNING_PLAN_QUERY");
+        intent.setSuggestedAction("TOOL");
+        intent.setConfidence(0.95);
+        intent.setRisk("LOW");
 
         AgentDecision decision = planner.decideLearning(
-                "你帮我看看我有几个学习规划",
                 intent,
                 1L,
                 session(10L)
@@ -71,11 +75,32 @@ class AgentPlannerSupportTests {
     }
 
     @Test
+    void analyzeRequestIsNotHijackedByQueryWording() {
+        /*
+         * V4.x：这里曾有一行字面正则（看看/查/进度 + 计划）分流 dashboard，且**写在分类器判断之前**。
+         * 实测被截胡的原句：「你帮我分析一下我的c++学习计划，看看这份计划按安排的有没有什么问题」
+         * —— 分类器判得完全正确（LEARNING_ASSIST + 计划定位准确），却被"看看…计划"的字面命中推翻，
+         * 结果不进工作流、也没有任何过程提示（用户只看到干等后突然出一大段）。
+         * 若有人想加回"用词像查询就走 TOOL"的字面分流，这条会拦住他。
+         */
+        AiIntent intent = workflowIntent("LEARNING_ASSIST", AiWorkflowType.LEARNING_ASSIST, 0.95, "LOW");
+        intent.setLearningPlanRef("c++学习计划");
+
+        AgentDecision decision = planner.decideLearning(
+                intent,
+                1L,
+                session(10L)
+        );
+
+        assertThat(decision.getAction()).isEqualTo(AgentAction.WORKFLOW);
+        assertThat(decision.getWorkflowType()).isEqualTo(AiWorkflowType.LEARNING_ASSIST);
+    }
+
+    @Test
     void planRequestAutoStartsWhenLlmSuggestionAndRuleBothMatch() {
         AiIntent intent = workflowIntent("LEARNING_PLAN", AiWorkflowType.LEARNING_PLAN, 0.91, "LOW");
 
         AgentDecision decision = planner.decideLearning(
-                "我想学习 Redis",
                 intent,
                 1L,
                 session(10L)
@@ -96,7 +121,6 @@ class AgentPlannerSupportTests {
         );
 
         AgentDecision decision = planner.decideLearning(
-                "我想系统学习消息队列",
                 intent,
                 1L,
                 session(10L)
@@ -112,7 +136,6 @@ class AgentPlannerSupportTests {
         AiIntent intent = workflowIntent("LEARNING_PROGRESS", AiWorkflowType.LEARNING_PROGRESS, 0.91, "LOW");
 
         AgentDecision decision = planner.decideLearning(
-                "帮我压缩一下学习计划的第二阶段",
                 intent,
                 1L,
                 session(10L)
@@ -135,7 +158,6 @@ class AgentPlannerSupportTests {
         intent.setLearningStageRef("第二阶段");
 
         AgentDecision decision = planner.decideLearning(
-                "帮我把 Agent学习计划的第二阶段压缩一下",
                 intent,
                 1L,
                 session(10L)
@@ -153,7 +175,6 @@ class AgentPlannerSupportTests {
         AiIntent intent = workflowIntent("LEARNING_ASSIST", AiWorkflowType.LEARNING_ASSIST, 0.91, "LOW");
 
         AgentDecision decision = planner.decideLearning(
-                "Redis 计划里的缓存击穿我看不懂",
                 intent,
                 1L,
                 session(10L)
@@ -169,7 +190,6 @@ class AgentPlannerSupportTests {
         AiIntent intent = workflowIntent("LEARNING_ASSIST", AiWorkflowType.LEARNING_ASSIST, 0.95, "LOW");
 
         AgentDecision decision = planner.decideLearning(
-                "该计划的第二阶段就挺难的了，能帮我拆分一下吗",
                 intent,
                 1L,
                 session(10L)
@@ -190,7 +210,6 @@ class AgentPlannerSupportTests {
         intent.setReason("学习目标不够明确");
 
         AgentDecision decision = planner.decideLearning(
-                "我最近学 Redis 有点乱",
                 intent,
                 1L,
                 session(10L)
@@ -198,6 +217,7 @@ class AgentPlannerSupportTests {
 
         assertThat(decision.getAction()).isEqualTo(AgentAction.CTA);
         assertThat(decision.getReason()).contains("分类器建议 CTA");
+        assertThat(decision.getCtaKind()).isEqualTo(CtaKind.AMBIGUOUS_REQUEST);
     }
 
     @Test
@@ -205,7 +225,6 @@ class AgentPlannerSupportTests {
         AiIntent intent = workflowIntent("LEARNING_PLAN", AiWorkflowType.LEARNING_PLAN, 0.91, "MEDIUM");
 
         AgentDecision decision = planner.decideLearning(
-                "我想学习 Redis",
                 intent,
                 1L,
                 session(10L)
@@ -216,11 +235,55 @@ class AgentPlannerSupportTests {
     }
 
     @Test
+    void mediumRiskProgressRequestIsAllowedWhenSessionHasPlanAnchor() {
+        /*
+         * V4.x：分类器判 MEDIUM 的典型理由是「计划对象不清楚」，而会话锚恰好补上了这个信息
+         * （上一轮已经真实定位到具体计划）。所以锚命中时 MEDIUM 不再降级——这是实测断片的修复点：
+         * 「帮我分析我的c++学习计划」→「我是要应对学校课程，你会怎么改」（第二句没有计划名）。
+         */
+        AiIntent intent = workflowIntent(
+                "LEARNING_PROGRESS", AiWorkflowType.LEARNING_PROGRESS, 0.95, "MEDIUM");
+        AiSessions sessionWithAnchor = session(10L);
+        sessionWithAnchor.setLastLearningPlanId(1L);
+
+        AgentDecision decision = planner.decideLearning(intent, 1L, sessionWithAnchor);
+
+        assertThat(decision.getAction()).isEqualTo(AgentAction.WORKFLOW);
+        assertThat(decision.getWorkflowType()).isEqualTo(AiWorkflowType.LEARNING_PROGRESS);
+    }
+
+    @Test
+    void mediumRiskProgressRequestStillFallsBackToCtaWithoutAnchor() {
+        AiIntent intent = workflowIntent(
+                "LEARNING_PROGRESS", AiWorkflowType.LEARNING_PROGRESS, 0.95, "MEDIUM");
+
+        AgentDecision decision = planner.decideLearning(intent, 1L, session(10L));
+
+        assertThat(decision.getAction()).isEqualTo(AgentAction.CTA);
+        assertThat(decision.getReason()).contains("风险不是 LOW");
+    }
+
+    @Test
+    void planAnchorDoesNotRelaxRiskForNewPlanWorkflow() {
+        /*
+         * 锚解答的是「改哪个计划」，而新建计划（LEARNING_PLAN）不涉及"改哪个"——
+         * 所以即便会话里有锚，也不该为它放行 MEDIUM。放宽范围会被这条拦住。
+         */
+        AiIntent intent = workflowIntent("LEARNING_PLAN", AiWorkflowType.LEARNING_PLAN, 0.95, "MEDIUM");
+        AiSessions sessionWithAnchor = session(10L);
+        sessionWithAnchor.setLastLearningPlanId(1L);
+
+        AgentDecision decision = planner.decideLearning(intent, 1L, sessionWithAnchor);
+
+        assertThat(decision.getAction()).isEqualTo(AgentAction.CTA);
+        assertThat(decision.getReason()).contains("风险不是 LOW");
+    }
+
+    @Test
     void workflowRuleHitFallsBackToCtaWhenConfidenceIsTooLow() {
         AiIntent intent = workflowIntent("LEARNING_PLAN", AiWorkflowType.LEARNING_PLAN, 0.69, "LOW");
 
         AgentDecision decision = planner.decideLearning(
-                "我想学习 Redis",
                 intent,
                 1L,
                 session(10L)
@@ -228,21 +291,52 @@ class AgentPlannerSupportTests {
 
         assertThat(decision.getAction()).isEqualTo(AgentAction.CTA);
         assertThat(decision.getReason()).contains("置信度不足");
+        assertThat(decision.getCtaKind()).isEqualTo(CtaKind.SYSTEM_UNCERTAIN);
     }
 
     @Test
-    void workflowRuleHitFallsBackToCtaWhenWorkflowSuggestionDoesNotMatch() {
-        AiIntent intent = workflowIntent("LEARNING_PLAN", AiWorkflowType.LEARNING_PROGRESS, 0.91, "LOW");
+    void workflowSuggestionWithoutLearningIntentFallsBackToCta() {
+        /*
+         * V4.x 起「双签失败降级 CTA」的触发条件变了：
+         * 原先是「intent 命中但用户原话未命中字面词表」，词表复核已删除（见 AgentPlannerSupport
+         * resolveLearningWorkflowType 的说明），现在只剩「intent 与 suggestedWorkflowType
+         * 都不属于任何学习类」这一种。保护本身仍在——分类器说 WORKFLOW 却拿不出学习类目标时，
+         * 绝不静默放行到 CHAT。
+         */
+        AiIntent intent = new AiIntent();
+        intent.setIntent("GENERAL_CHAT");
+        intent.setConfidence(0.91);
+        intent.setRisk("LOW");
+        intent.setSuggestedAction("WORKFLOW");
 
         AgentDecision decision = planner.decideLearning(
-                "我想学习 Redis",
                 intent,
                 1L,
                 session(10L)
         );
 
         assertThat(decision.getAction()).isEqualTo(AgentAction.CTA);
-        assertThat(decision.getReason()).contains("未建议对应 Workflow");
+        assertThat(decision.getReason()).contains("未指明学习类类型");
+    }
+
+    @Test
+    void learningWorkflowIntentIsAcceptedRegardlessOfWording() {
+        /*
+         * V4.x：后端不再对用户原话做字面复核。
+         * 「浓缩」不在任何历史词表里，曾因此把明确的调整诉求降级成 CTA；「补充几个」同理。
+         * 语义判断归分类器（有评测门锁边界），后端只判事实（有没有 ACTIVE 计划、是不是本人）。
+         * 若将来有人想加回「必须命中 XX 词才放行」的准入正则，这条用例会拦住他。
+         */
+        AiIntent intent = workflowIntent("LEARNING_PROGRESS", AiWorkflowType.LEARNING_PROGRESS, 0.95, "LOW");
+
+        AgentDecision decision = planner.decideLearning(
+                intent,
+                1L,
+                session(10L)
+        );
+
+        assertThat(decision.getAction()).isEqualTo(AgentAction.WORKFLOW);
+        assertThat(decision.getWorkflowType()).isEqualTo(AiWorkflowType.LEARNING_PROGRESS);
     }
 
     @Test
@@ -256,7 +350,6 @@ class AgentPlannerSupportTests {
         AiIntent intent = workflowIntent("LEARNING_PLAN", AiWorkflowType.LEARNING_PLAN, 0.91, "LOW");
 
         AgentDecision decision = planner.decideLearning(
-                "我想学习 Redis",
                 intent,
                 1L,
                 session(10L)
@@ -264,6 +357,7 @@ class AgentPlannerSupportTests {
 
         assertThat(decision.getAction()).isEqualTo(AgentAction.CTA);
         assertThat(decision.getReason()).contains("自动拉起次数已达上限");
+        assertThat(decision.getCtaKind()).isEqualTo(CtaKind.QUOTA_REACHED);
     }
 
     @Test
@@ -273,7 +367,6 @@ class AgentPlannerSupportTests {
         intent.setConfidence(0.95);
 
         AgentDecision decision = planner.decideLearning(
-                "Redis 是什么",
                 intent,
                 1L,
                 session(10L)
@@ -324,6 +417,7 @@ class AgentPlannerSupportTests {
         );
 
         assertThat(decision.getAction()).isEqualTo(AgentAction.CTA);
+        assertThat(decision.getCtaKind()).isEqualTo(CtaKind.MISSING_ARTICLE_CONTEXT);
         assertThat(decision.getRuleHits())
                 .contains("article_context_missing");
     }
@@ -496,6 +590,7 @@ class AgentPlannerSupportTests {
         );
 
         assertThat(decision.getAction()).isEqualTo(AgentAction.CTA);
+        assertThat(decision.getCtaKind()).isEqualTo(CtaKind.PAGE_CONTEXT_MISMATCH);
     }
 
     @Test

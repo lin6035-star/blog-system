@@ -134,7 +134,7 @@ class AgentRunSuggestionServiceTests {
         when(runMapper.update(any(AiAgentRun.class), any())).thenReturn(1);
         when(learningPlansService.listByUser(100L)).thenReturn(List.of(
                 activePlan(1L, "C++ 学习计划"), activePlan(2L, "Redis 学习计划")));
-        when(learningPlansService.matchActivePlansByMessage(100L, "C++ 计划的第三阶段太难了，帮我拆解一下"))
+        when(learningPlansService.matchPlansByMessage(100L, "C++ 计划的第三阶段太难了，帮我拆解一下"))
                 .thenReturn(List.of(activePlan(1L, "C++ 学习计划")));
         AiWorkflowRunVO vo = new AiWorkflowRunVO();
         vo.setId("wf-assist");
@@ -150,6 +150,7 @@ class AgentRunSuggestionServiceTests {
         AiWorkflowLearningAssistDTO dto = dtoCaptor.getValue();
         assertThat(dto.getPlanId()).isEqualTo(1L);
         assertThat(dto.getRequest()).isEqualTo("C++ 计划的第三阶段太难了，帮我拆解一下");
+        assertThat(dto.getHandoffReason()).isEqualTo("需要辅助拆解");
     }
 
     @Test
@@ -176,6 +177,7 @@ class AgentRunSuggestionServiceTests {
         AiWorkflowLearningAssistDTO dto = dtoCaptor.getValue();
         assertThat(dto.getPlanId()).isNull();
         assertThat(dto.getCandidates()).hasSize(2);
+        assertThat(dto.getHandoffReason()).isNull();
     }
 
     @Test

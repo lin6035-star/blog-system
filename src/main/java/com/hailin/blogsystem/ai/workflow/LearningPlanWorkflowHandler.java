@@ -19,7 +19,9 @@ import java.util.regex.Pattern;
 public class LearningPlanWorkflowHandler extends AbstractWorkflowHandler {
 
     //否定反馈："算了/不用了/不学了..." → 取消 workflow 而不是继续生成
-    private static final Pattern NEGATIVE_FEEDBACK = Pattern.compile("(不想学|不学了|不用了|算了|不需要|不是要|不是想)");
+    //V4.x：移除「不是要|不是想」——它们是纠正句式的前半（"不是要X，我要Y"），
+    //后面跟的往往是新要求而非终止意图；真要终止，需求确认面板有「取消工作流」按钮兜底。
+    private static final Pattern NEGATIVE_FEEDBACK = Pattern.compile("(不想学|不学了|不用了|算了|不需要)");
     private static final String GOAL_QUESTION = "你的基础怎么样？计划学多久？";
 
     private final LearningPlanFlowSupport flowSupport;

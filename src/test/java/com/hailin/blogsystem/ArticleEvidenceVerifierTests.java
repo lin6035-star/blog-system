@@ -2,6 +2,7 @@ package com.hailin.blogsystem;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hailin.blogsystem.ai.agent.AgentStepDecision;
+import com.hailin.blogsystem.ai.AiJudgeModelSupport;
 import com.hailin.blogsystem.ai.agent.ArticleEvidenceVerifier;
 import com.hailin.blogsystem.ai.agent.Verdict;
 import com.hailin.blogsystem.entity.AiAgentRun;
@@ -49,7 +50,7 @@ class ArticleEvidenceVerifierTests {
         when(requestSpec.options(any())).thenReturn(requestSpec);
         when(requestSpec.call()).thenReturn(callSpec);
 
-        verifier = new ArticleEvidenceVerifier(builder, new ObjectMapper());
+        verifier = new ArticleEvidenceVerifier(builder, new ObjectMapper(), new AiJudgeModelSupport(""));
     }
 
     private static AiAgentRun run(Long targetArticleId, String goal) {

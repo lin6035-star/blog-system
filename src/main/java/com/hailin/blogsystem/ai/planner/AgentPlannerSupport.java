@@ -9,6 +9,7 @@ import com.hailin.blogsystem.entity.Articles;
 import com.hailin.blogsystem.entity.dto.AgentAction;
 import com.hailin.blogsystem.entity.dto.AgentDecision;
 import com.hailin.blogsystem.entity.dto.AiIntent;
+import com.hailin.blogsystem.entity.dto.CtaKind;
 import com.hailin.blogsystem.entity.dto.AiWorkflowType;
 import com.hailin.blogsystem.entity.dto.PageContextDTO;
 import com.hailin.blogsystem.ai.agent.AgentRuntimeRouteRegistry;
@@ -114,9 +115,8 @@ public class AgentPlannerSupport {
          * 先保持现有 Learning Agent V1 行为不变。
          * 后续全域入口接通后，再删除这里对旧学习规则的兼容依赖。
          */
-        if (isLearningDomain(intent)
-                || looksLikeLearningPlanQueryRequest(message)) {
-            return decideLearning(message, intent, userId, session);
+        if (isLearningDomain(intent)) {
+            return decideLearning(intent, userId, session);
         }
 
         if (intent == null) {
@@ -136,7 +136,8 @@ public class AgentPlannerSupport {
             return cta(
                     intent.getIntent(),
                     List.of(),
-                    "分类器建议 CTA，等待用户进一步澄清"
+                    "分类器建议 CTA，等待用户进一步澄清",
+                    CtaKind.AMBIGUOUS_REQUEST
             );
         }
 
@@ -219,38 +220,57 @@ public class AgentPlannerSupport {
         );
     }
 
-    public AgentDecision decideLearning(String message, AiIntent intent, Long userId, AiSessions session){
+    public AgentDecision decideLearning(AiIntent intent, Long userId, AiSessions session){
         List<String> ruleHits = new ArrayList<>();
-
-        if (looksLikeLearningPlanQueryRequest(message)) {
-            ruleHits.add("learning_plan_query");
-            return AgentDecision.builder()
-                    .action(AgentAction.TOOL)
-                    .intent(intent == null ? "LEARNING_PLAN_QUERY" : intent.getIntent())
-                    .toolName(TOOL_DASHBOARD)
-                    .retrievalMode(RETRIEVAL_NONE)
-                    .ruleHits(ruleHits)
-                    .reason("学习计划查询句，使用 dashboard 读工具")
-                    .build();
-        }
 
         if (isCtaSuggestion(intent)) {
             return cta(
                     intent == null ? null : intent.getIntent(),
                     ruleHits,
-                    "分类器建议 CTA，等待用户进一步澄清"
+                    "分类器建议 CTA，等待用户进一步澄清",
+                    CtaKind.AMBIGUOUS_REQUEST
             );
         }
 
-        AiWorkflowType workflowType = resolveLearningWorkflowType(intent, message, ruleHits);
+        AiWorkflowType workflowType = resolveLearningWorkflowType(intent, ruleHits);
         if (workflowType == null) {
-            // LLM 想启动 Workflow，但后端确定性规则没有复核通过。
-            // 这里不能直接 CHAT，否则双签失败被静默放行。
+            /*
+             * 没有工作流意图时，看是不是纯粹的「查询已有计划」→ dashboard 读工具。
+             *
+             * 位置很关键：必须在 resolveLearningWorkflowType **之后**。
+             * 主字段是 LEARNING_PLAN_QUERY 但建议字段指向真实工作流时，那一步会把它救回成 WORKFLOW
+             * （见 workflowSuggestionCanPassWhenIntentIsMisclassifiedButSuggestedTypeMatches）；
+             * 这里只承接"确实没有工作流诉求"的查询句。
+             *
+             * V4.x：这个分流原先用字面正则（看看/查/进度 + 计划）实现，且写在**分类器之前**，
+             * 于是「你帮我分析一下我的c++学习计划，看看这份计划有没有问题」被截胡成"查询"——
+             * 分类器明明判对了 LEARNING_ASSIST（分析评估），却被"看看…计划"的字面命中推翻，
+             * 结果不进工作流、也没有任何过程提示（用户只看到干等后突然出一大段）。
+             * 原测试名写的是「EvenWhenClassifierMisjudgesPlanIntent」（分类器判错时兜底），
+             * 实现却是"无条件优先"——兜底与抢跑的区别就在这里。正则整体删除，语义判断交还分类器。
+             */
+            if (intent != null && "LEARNING_PLAN_QUERY".equals(intent.getIntent())) {
+                ruleHits.add("learning_plan_query");
+                return AgentDecision.builder()
+                        .action(AgentAction.TOOL)
+                        .intent(intent.getIntent())
+                        .toolName(TOOL_DASHBOARD)
+                        .retrievalMode(RETRIEVAL_NONE)
+                        .ruleHits(ruleHits)
+                        .reason("分类器判定为学习计划查询，使用 dashboard 读工具")
+                        .build();
+            }
+
+            // 分类器说了 WORKFLOW，却拿不出任何学习类 Workflow 类型
+            // （intent 与 suggestedWorkflowType 两个字段都落空）。
+            // 这里不能直接 CHAT，否则分类器的 WORKFLOW 建议被静默吞掉。
+            // 注：措辞已随 V4.x 词表移除更新——此前写「后端规则未命中」，
+            // 现在后端不再做字面复核，失配只可能来自分类器自身。
             if (isWorkflowSuggestion(intent)) {
                 return cta(
                         intent == null ? null : intent.getIntent(),
                         ruleHits,
-                        "LLM 建议启动 Workflow，但后端规则未命中，降级 CTA"
+                        "分类器建议启动 Workflow 但未指明学习类类型，降级 CTA"
                 );
             }
 
@@ -263,7 +283,15 @@ public class AgentPlannerSupport {
                     .build();
         }
 
-        if (!isLowRisk(intent)) {
+        /*
+         * V4.x：会话学习计划锚命中时，MEDIUM 不再拦（仅限"操作已有计划"的意图）。
+         *
+         * 分类器判 MEDIUM 的典型理由正是「计划对象不清楚」（它的 risk 定义里就有这条），
+         * 而锚解决的恰好是这件事——上一轮已经定位到具体计划，这一轮省略主语也有据可依。
+         * 代价可控：放行不等于改数据，工作流本身有确认门，最高代价是多弹一张可确认的卡。
+         * 锚失效（计划已删/不是本人）不会误放行——下游 resolve 返回 null，仍走原有追问。
+         */
+        if (!isLowRisk(intent) && !hasPlanAnchorFor(session, workflowType)) {
             return cta(
                     intent == null ? null : intent.getIntent(),
                     ruleHits,
@@ -288,7 +316,8 @@ public class AgentPlannerSupport {
             return cta(
                     intent == null ? null : intent.getIntent(),
                     ruleHits,
-                    "本会话自动拉起次数已达上限，降级 CTA"
+                    "本会话自动拉起次数已达上限，降级 CTA",
+                    CtaKind.QUOTA_REACHED
             );
         }
 
@@ -318,7 +347,8 @@ public class AgentPlannerSupport {
             return cta(
                     intent.getIntent(),
                     ruleHits,
-                    "分类器建议 CTA，等待用户进一步澄清"
+                    "分类器建议 CTA，等待用户进一步澄清",
+                    CtaKind.AMBIGUOUS_REQUEST
             );
         }
 
@@ -361,7 +391,8 @@ public class AgentPlannerSupport {
             return cta(
                     intent.getIntent(),
                     ruleHits,
-                    "分类器建议 CTA，等待用户进一步澄清"
+                    "分类器建议 CTA，等待用户进一步澄清",
+                    CtaKind.AMBIGUOUS_REQUEST
             );
         }
 
@@ -399,7 +430,8 @@ public class AgentPlannerSupport {
                     intent.getIntent(),
                     ruleHits,
                     "你说的这篇文章在这段对话里还没有出现过。打开那篇文章的详情页，"
-                            + "再对我说\"把这篇…\"，我就能直接帮你处理。"
+                            + "再对我说\"把这篇…\"，我就能直接帮你处理。",
+                    CtaKind.MISSING_ARTICLE_CONTEXT
             );
         }
 
@@ -470,10 +502,24 @@ public class AgentPlannerSupport {
                 .build();
     }
 
+    /**
+     * CTA 缺省分类：系统自身不确定（置信 / 风险 / 字段不一致 / 白名单外）。
+     * 用户对这些原因无从行动，文案层只给中性引导，不解释内部机制。
+     */
     private AgentDecision cta(
             String intent,
             List<String> ruleHits,
             String reason
+    ) {
+        return cta(intent, ruleHits, reason, CtaKind.SYSTEM_UNCERTAIN);
+    }
+
+    /** CTA 指定面向用户的分类（V4.x：reason 只作诊断，用户文案走 ctaKind） */
+    private AgentDecision cta(
+            String intent,
+            List<String> ruleHits,
+            String reason,
+            CtaKind ctaKind
     ) {
         return AgentDecision.builder()
                 .action(AgentAction.CTA)
@@ -481,6 +527,7 @@ public class AgentPlannerSupport {
                 .retrievalMode(RETRIEVAL_NONE)
                 .ruleHits(ruleHits)
                 .reason(reason)
+                .ctaKind(ctaKind)
                 .build();
     }
 
@@ -499,16 +546,48 @@ public class AgentPlannerSupport {
                 .build();
     }
 
-    private AiWorkflowType resolveLearningWorkflowType(AiIntent intent, String message, List<String> ruleHits) {
-        if (isLearningAssistIntent(intent) && looksLikeLearningDifficultyRequest(message)) {
+    /**
+     * 学习类 intent → Workflow 类型。**只认分类器输出，不对用户原话做字面复核**（V4.x 决策）。
+     *
+     * 这里曾对 message 做「动作词/难度词 + 计划名词」的正则校验，只有"长得像"才放行，否则降级 CTA。
+     * 实践证伪：用字面匹配复核语义判断，等于让更弱的能力否决更强的能力——分类器已判对 intent、
+     * 计划与阶段，却被"你的用词不在词表里"退回（实测：「压缩」在表内、「浓缩」不在 → 明确诉求降成 CTA）。
+     * 词表是有限闭集、表达是开放集，结构上补不完（补了「浓缩」还有「精简/梳理/补充几个/换一批」）；
+     * 其内容实质是"历史踩坑清单"，只认曾经出过问题的说法。
+     *
+     * 两个字段的用法（两侧行为都有测试锁定，改动前先看那两个用例）：
+     * - **主字段 intent 优先**——它是分类器对"这是什么诉求"的正面判断。主字段是学习类时以它为准；
+     *   若与 suggestedWorkflowType 打架（LEARNING_PLAN vs LEARNING_PROGRESS），交给下游
+     *   hasWorkflowSuggestion 判不一致 → 降级 CTA——两个字段互相矛盾时不猜哪个对。
+     * - **主字段没落在学习 Workflow 上时，退到建议字段救回**——分类器把主意图判成
+     *   LEARNING_PLAN_QUERY / GENERAL_CHAT 但建议字段明确指向某个学习 Workflow 时仍应拉起
+     *   （见 workflowSuggestionCanPassWhenIntentIsMisclassifiedButSuggestedTypeMatches）。
+     *
+     * 后端该判的是**事实**而非**语义**：有没有 ACTIVE 计划、计划是不是本人的、定位不到怎么办、
+     * 写操作是否经过确认——这些在 routeLearningXxxWorkflow 与工作流确认门里已经具备。
+     * 误放行的最高代价是"多弹一张可取消的确认卡"，误拦截的代价是用户明确诉求被降级。
+     */
+    private AiWorkflowType resolveLearningWorkflowType(AiIntent intent, List<String> ruleHits) {
+        if (intent == null) {
+            return null;
+        }
+        AiWorkflowType declared = learningWorkflowTypeOf(intent.getIntent(), ruleHits);
+        return declared != null
+                ? declared
+                : learningWorkflowTypeOf(intent.getSuggestedWorkflowType(), ruleHits);
+    }
+
+    //分类器字段值 → 学习类 Workflow 类型（命中才记 ruleHit）；非学习类返回 null
+    private AiWorkflowType learningWorkflowTypeOf(String value, List<String> ruleHits) {
+        if ("LEARNING_ASSIST".equals(value)) {
             ruleHits.add("learning_assist_rule");
             return AiWorkflowType.LEARNING_ASSIST;
         }
-        if (isLearningProgressIntent(intent) && looksLikeLearningProgressRequest(message)) {
+        if ("LEARNING_PROGRESS".equals(value)) {
             ruleHits.add("learning_progress_rule");
             return AiWorkflowType.LEARNING_PROGRESS;
         }
-        if (isLearningPlanIntent(intent) && looksLikeLearningPlanRequest(message)) {
+        if ("LEARNING_PLAN".equals(value)) {
             ruleHits.add("learning_plan_rule");
             return AiWorkflowType.LEARNING_PLAN;
         }
@@ -543,6 +622,25 @@ public class AgentPlannerSupport {
 
     private boolean isLowRisk(AiIntent intent) {
         return intent != null && "LOW".equals(intent.getRisk());
+    }
+
+    /**
+     * 会话学习计划锚能否为「风险」兜底（V4.x）——**只对"操作已有计划"的意图生效**。
+     *
+     * 锚解答的是"改哪个计划"这个问题，所以：
+     * - LEARNING_PROGRESS / LEARNING_ASSIST 需要定位目标 → 锚有意义 ✓
+     * - LEARNING_PLAN（新建）不涉及"改哪个" → 锚帮不上忙，仍按 MEDIUM 降级 ✗
+     *
+     * 只看字段非空，**不在 Planner 里查库**（保持它无 IO）：锚指向的计划是否还存在、
+     * 是否属于本人，由下游 {@code LearningPlanAnchorService.resolve} 单点校验——
+     * 校验不过时那条路会退回原有的追问行为，不会因为这里的放行而出错。
+     */
+    private boolean hasPlanAnchorFor(AiSessions session, AiWorkflowType workflowType) {
+        if (workflowType != AiWorkflowType.LEARNING_PROGRESS
+                && workflowType != AiWorkflowType.LEARNING_ASSIST) {
+            return false;
+        }
+        return session != null && session.getLastLearningPlanId() != null;
     }
 
     private boolean autoStartCountReached(Long userId, AiSessions session) {
@@ -702,7 +800,8 @@ public class AgentPlannerSupport {
             return cta(
                     intent.getIntent(),
                     ruleHits,
-                    "文章优化缺少当前文章 ID，降级 CTA"
+                    "文章优化缺少当前文章 ID，降级 CTA",
+                    CtaKind.MISSING_ARTICLE_CONTEXT
             );
         }
 
@@ -832,7 +931,8 @@ public class AgentPlannerSupport {
             return cta(
                     intent.getIntent(),
                     ruleHits,
-                    "文章动作必须在文章详情页执行"
+                    "文章动作必须在文章详情页执行",
+                    CtaKind.PAGE_CONTEXT_MISMATCH
             );
         }
 
@@ -1025,7 +1125,8 @@ public class AgentPlannerSupport {
             return cta(
                     intent.getIntent(),
                     ruleHits,
-                    "保存或发布必须在文章编辑器页面执行"
+                    "保存或发布必须在文章编辑器页面执行",
+                    CtaKind.PAGE_CONTEXT_MISMATCH
             );
         }
 
@@ -1097,70 +1198,5 @@ public class AgentPlannerSupport {
         return trimToNull(second);
     }
 
-    private boolean isLearningPlanIntent(AiIntent intent) {
-        return intent != null
-                && ("LEARNING_PLAN".equals(intent.getIntent())
-                || "LEARNING_PLAN".equals(intent.getSuggestedWorkflowType()));
-    }
-
-    private boolean isLearningProgressIntent(AiIntent intent) {
-        return intent != null
-                && ("LEARNING_PROGRESS".equals(intent.getIntent())
-                || "LEARNING_PROGRESS".equals(intent.getSuggestedWorkflowType()));
-    }
-
-    private boolean isLearningAssistIntent(AiIntent intent) {
-        return intent != null
-                && ("LEARNING_ASSIST".equals(intent.getIntent())
-                || "LEARNING_ASSIST".equals(intent.getSuggestedWorkflowType()));
-    }
-
-    // 入口兜底：学习意图本身（想/要/帮我 + 学/入门/进阶 + 目标对象）才起规划 Workflow。
-    // 纯名词命中（例如“学习规划”）容易误伤查询句，所以这里保持旧路由的收敛规则。
-    // V3.0：补「创建/制定/给我…学习计划」变体——这类明确诉求不因正则漏匹配被降级 CTA。
-    // 查询句已由 looksLikeLearningPlanQueryRequest 优先排除，不会误伤。
-    private boolean looksLikeLearningPlanRequest(String message) {
-        if (message == null || message.isBlank()) {
-            return false;
-        }
-        String text = message.trim();
-        return text.matches(".*(想|要|帮我|打算).{0,10}?(学|学习|入门|进阶|掌握).{1,30}.*")
-                || text.matches(".*(创建|制定|规划一下|安排一下|给我|来一个|做一个|搞一个).{0,15}(学习|学).{0,15}(计划|规划|路线).*")
-                || text.matches(".*(学习|学).{0,15}(计划|规划|路线).{0,15}(创建|制定|规划一下|安排一下|给我|来一个|做一个|搞一个).*");
-    }
-
-    // 查询排除：询问/查看已有计划（查词/询问词 + 计划词，两种语序）→ 走 dashboard 读工具，不进 Workflow。
-    // 查询句误进制定 Workflow 的成本更高，所以这里宁可范围稍宽。
-    private boolean looksLikeLearningPlanQueryRequest(String message) {
-        if (message == null || message.isBlank()) {
-            return false;
-        }
-        String text = message.trim();
-        return text.matches(".*(看看|查|有几个|有哪些|多少个|学到哪|进行到哪|做到哪|进度|计划是什么|都有什么).{0,12}(学习)?(计划|规划|路线|进度).*")
-                || text.matches(".*(我)?(的)?(学习)?(计划|规划|路线).{0,10}(学到哪|进行到哪|做到哪|怎么样|是什么|有哪些|几个).*");
-    }
-
-    // 调整类动词 + 计划/进度/阶段/任务关键词 → 学习进度 Workflow 候选。
-    private boolean looksLikeLearningProgressRequest(String message) {
-        if (message == null || message.isBlank()) {
-            return false;
-        }
-        String text = message.trim();
-        return text.matches(".*(调整|改一下|改改|修改|更新|重新|重排|压缩|加快|延长|缩短|去掉|删掉|加点|加个|换个).{0,12}(学习)?(计划|进度|阶段|任务|安排|节奏).*")
-                || text.matches(".*(调整|修改|更新|重新|压缩|加快|缩短).{0,8}(学习|学).*")
-                || text.matches(".*(学习)?(计划|进度|阶段|任务|安排|节奏).{0,20}(调整|改一下|改改|修改|更新|重新|重排|压缩|加快|延长|缩短|去掉|删掉|加点|加个|换个).*");
-    }
-
-    // 难点攻坚：难度词 + 计划类名词，双向语序。
-    private boolean looksLikeLearningDifficultyRequest(String message) {
-        if (message == null || message.isBlank()) {
-            return false;
-        }
-        String text = message.trim();
-        String difficulty = "(卡住|卡壳|不会|看不懂|看不太懂|没看懂|好难|挺难|太难|很难|不理解|不明白|弄不明白|总是忘|总忘|记不住|学不会|学不明白|搞不懂)";
-        String planWord = "(计划|规划|任务|阶段|进度)";
-        return text.matches(".*" + planWord + ".{0,12}?" + difficulty + ".*")
-                || text.matches(".*" + difficulty + ".{0,12}?" + planWord + ".*");
-    }
 
 }

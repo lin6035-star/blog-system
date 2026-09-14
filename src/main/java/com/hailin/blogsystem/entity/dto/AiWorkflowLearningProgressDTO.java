@@ -12,6 +12,9 @@ public class AiWorkflowLearningProgressDTO {
     private Long conversationId;  //关联的 AI 会话 ID，可为空
     private Long planId;  //目标学习计划 ID（入口已确认属于当前用户且 ACTIVE）；歧义时为 null
     private String request;  //用户原始调整诉求（原文直通，不信任 LLM 提取的结构化字段）
+    //上一轮 Agent/建议卡带来的调整方向弱参考；创建时固化进 context.handoff，不作为目标定位依据
+    private String handoffReason;
+    private Long handoffSourceAgentRunId;
     //入口点名命中多个计划时的候选列表：Handler 先追问用户选哪个，再开始调整
     private List<Candidate> candidates;
 

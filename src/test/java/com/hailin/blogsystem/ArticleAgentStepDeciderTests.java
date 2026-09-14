@@ -2,6 +2,7 @@ package com.hailin.blogsystem;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hailin.blogsystem.ai.agent.AgentStepDecision;
+import com.hailin.blogsystem.ai.AiJudgeModelSupport;
 import com.hailin.blogsystem.ai.agent.ArticleAgentStepDecider;
 import com.hailin.blogsystem.entity.dto.AgentStepActionType;
 import org.junit.jupiter.api.BeforeEach;
@@ -40,7 +41,7 @@ class ArticleAgentStepDeciderTests {
         when(requestSpec.options(any())).thenReturn(requestSpec);
         when(requestSpec.call()).thenReturn(callSpec);
 
-        decider = new ArticleAgentStepDecider(builder, new ObjectMapper());
+        decider = new ArticleAgentStepDecider(builder, new ObjectMapper(), new AiJudgeModelSupport(""));
     }
 
     @Test

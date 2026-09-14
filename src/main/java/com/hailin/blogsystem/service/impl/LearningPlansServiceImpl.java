@@ -5,6 +5,7 @@ import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.hailin.blogsystem.constants.RedisConstants;
 import com.hailin.blogsystem.entity.LearningPlans;
 import com.hailin.blogsystem.entity.LearningStages;
 import com.hailin.blogsystem.entity.vo.LearningPlansDetailVO;
@@ -12,9 +13,12 @@ import com.hailin.blogsystem.mapper.LearningPlanMapper;
 import com.hailin.blogsystem.mapper.LearningStageMapper;
 import com.hailin.blogsystem.service.LearningPlansService;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -27,11 +31,24 @@ import java.util.regex.Pattern;
 
 @Service
 @RequiredArgsConstructor
+@Slf4j
 public class LearningPlansServiceImpl extends ServiceImpl<LearningPlanMapper, LearningPlans>
         implements LearningPlansService {
 
     //提取字母数字段和汉字段（"RocketMQ学习计划" → rocketmq / 学习计划）
-    private static final Pattern TOKEN_PATTERN = Pattern.compile("[a-z0-9]+|[\\u4e00-\\u9fa5]+");
+    //V4.x：字母数字段补上 + # .（编程语言/框架名：C++ / C# / .NET / Node.js）——
+    //原 [a-z0-9]+ 会把 "C++" 切成 "c"，与「C语言系统学习计划」同分并列（实测踩过）。
+    //字符集与 RAG 侧 DefaultArticleRagRanker 的分词保持一致。
+    private static final Pattern TOKEN_PATTERN = Pattern.compile("[a-z0-9+#.]+|[\\u4e00-\\u9fa5]+");
+
+    /**
+     * 计划定位里的通用词不应压过具体技术名：
+     * 「C++ 学习计划」同时命中 C++ 计划和 C 语言学习计划时，
+     * 「学习计划」只能作为弱兜底，不能制造并列。
+     */
+    private static final Set<String> GENERIC_PLAN_TOKENS = Set.of(
+            "计划", "学习", "学习计划", "规划", "进度", "阶段", "任务"
+    );
 
     /** 阶段序号形态：「第X阶段 / X阶段 / 阶段X」（X = 中文数字或阿拉伯数字） */
     private static final Pattern STAGE_ORDINAL_PATTERN = Pattern.compile(
@@ -39,6 +56,7 @@ public class LearningPlansServiceImpl extends ServiceImpl<LearningPlanMapper, Le
 
     private final LearningStageMapper learningStageMapper;
     private final ObjectMapper objectMapper;
+    private final StringRedisTemplate stringRedisTemplate;
 
     //幂等保存，两条覆盖路径：
     //  plan.id 非空（调整已有计划）→ 按 id 覆盖，目标必须存在且属于同一用户
@@ -169,6 +187,65 @@ public class LearningPlansServiceImpl extends ServiceImpl<LearningPlanMapper, Le
                 .orderByDesc(LearningPlans::getCreatedAt));
     }
 
+    /**
+     * ACTIVE 计划列表（Redis 缓存 + 写时失效）。
+     *
+     * 分类器是所有消息的必经之路（说"你好"也要经过），而它每次都要这份列表才能"选计划"——
+     * 缓存挡住绝大多数重复查询。缓存只存 id/title/status 三列（调用方只需从列表里选）。
+     *
+     * 一致性：写计划 / 换计划状态时失效（evictPlanListCache），TTL 兜底；
+     * Redis 不可用时整体退化为直接查库（fail-open，不影响分类主流程）。
+     */
+    @Override
+    public List<LearningPlans> listActiveByUserCached(Long userId) {
+        if (userId == null) {
+            return List.of();
+        }
+        String key = RedisConstants.LEARNING_PLAN_LIST_KEY_PREFIX + userId;
+
+        //1. 读缓存（Redis 异常不影响，继续查库）
+        try {
+            String cached = stringRedisTemplate.opsForValue().get(key);
+            if (cached != null) {
+                return objectMapper.readValue(cached, new TypeReference<List<LearningPlans>>() {});
+            }
+        } catch (Exception e) {
+            log.warn("学习计划列表缓存读取失败，回退查库: userId={}", userId, e);
+        }
+
+        //2. 查库：状态过滤下推 SQL + 只取三列（原来取全表字段再在内存过滤 ACTIVE）
+        List<LearningPlans> actives = list(new LambdaQueryWrapper<LearningPlans>()
+                .select(LearningPlans::getId, LearningPlans::getTitle, LearningPlans::getStatus)
+                .eq(LearningPlans::getUserId, userId)
+                .eq(LearningPlans::getStatus, LearningPlans.STATUS_ACTIVE)
+                .orderByDesc(LearningPlans::getCreatedAt));
+
+        //3. 回写（空列表也缓存——防穿透；写失败不影响本次返回）
+        try {
+            stringRedisTemplate.opsForValue().set(
+                    key,
+                    objectMapper.writeValueAsString(actives),
+                    Duration.ofMinutes(RedisConstants.LEARNING_PLAN_LIST_TTL_MINUTES));
+        } catch (Exception e) {
+            log.warn("学习计划列表缓存写入失败: userId={}", userId, e);
+        }
+
+        return actives;
+    }
+
+    //计划列表缓存失效：写计划 / 改任务状态（可能带动计划状态）后调用。
+    //失败无害——TTL 兜底；顺序上在写库之后删（Cache-Aside），极端并发下最坏是 TTL 内读到旧列表。
+    private void evictPlanListCache(Long userId) {
+        if (userId == null) {
+            return;
+        }
+        try {
+            stringRedisTemplate.delete(RedisConstants.LEARNING_PLAN_LIST_KEY_PREFIX + userId);
+        } catch (Exception e) {
+            log.warn("学习计划列表缓存失效失败（TTL 兜底）: userId={}", userId, e);
+        }
+    }
+
     //权限：plan.userId 必须等于当前用户；进度实时聚合（不存库）
     @Override
     public LearningPlansDetailVO getDetail(Long planId, Long userId) {
@@ -244,21 +321,42 @@ public class LearningPlansServiceImpl extends ServiceImpl<LearningPlanMapper, Le
                 .toList();
     }
 
-    //整句消息点名匹配（入口用，只 ACTIVE）：分词 + 命中词段数打分，返回最高分计划列表。
+    //整句消息点名匹配：分词 + 命中词段数打分，返回最高分计划列表。
     // 唯一最高分 = 点名成功；并列 = 歧义（需追问）；空 = 未点名（入口 fallback 最新 ACTIVE）
+    //
+    // 不按状态过滤（2026-09-14 修）：原先只认 ACTIVE，导致《Java后端学习路线规划》（COMPLETED）
+    // 压根不参与匹配，于是「java」命中了标题里恰好含该词的《Agent 计划（Java后端方向）》——
+    // 锚被写到错误的计划上，且每次新会话都重演。锚自身的设计也写着「完成 ≠ 不能再改」
+    // （LearningPlanAnchorService.resolve 不校验状态），两处语义原先打架，这里对齐：
+    // **匹配只看名字像不像，不替用户决定能不能操作**。
+    // 多命中仍返回并列（调用方追问），放开状态不会让系统变"更敢猜"。
     @Override
-    public List<LearningPlans> matchActivePlansByMessage(Long userId, String message) {
+    public List<LearningPlans> matchPlansByMessage(Long userId, String message) {
         List<String> tokens = tokenize(message);
-        List<LearningPlans> actives = listByUser(userId).stream()
-                .filter(plan -> LearningPlans.STATUS_ACTIVE.equals(plan.getStatus()))
-                .toList();
-        if (tokens.isEmpty() || actives.isEmpty()) {
+        List<LearningPlans> plans = listByUser(userId);
+        if (tokens.isEmpty() || plans.isEmpty()) {
             return new ArrayList<>();
         }
 
+        // 先用具体词裁决。只要具体词命中至少一个计划，就不让「计划 / 学习」等通用词参与并列。
+        List<String> specificTokens = tokens.stream()
+                .filter(token -> !GENERIC_PLAN_TOKENS.contains(token))
+                .toList();
+        if (!specificTokens.isEmpty()) {
+            List<LearningPlans> specificMatches = bestScoredPlans(plans, specificTokens);
+            if (!specificMatches.isEmpty()) {
+                return specificMatches;
+            }
+        }
+
+        // 没有具体词命中时保留原语义：通用请求对多个计划并列，交给用户选择。
+        return bestScoredPlans(plans, tokens);
+    }
+
+    private List<LearningPlans> bestScoredPlans(List<LearningPlans> plans, List<String> tokens) {
         int bestScore = 0;
         List<LearningPlans> bestPlans = new ArrayList<>();
-        for (LearningPlans plan : actives) {
+        for (LearningPlans plan : plans) {
             int score = score(plan.getTitle(), tokens);
             if (score > bestScore) {
                 bestScore = score;
@@ -517,6 +615,7 @@ public class LearningPlansServiceImpl extends ServiceImpl<LearningPlanMapper, Le
         learningStageMapper.delete(new LambdaQueryWrapper<LearningStages>()
                 .eq(LearningStages::getPlanId, planId));
         removeById(planId);
+        evictPlanListCache(userId);//删除不经过 refreshPlanStatus，单独失效
     }
 
     private void refreshPlanStatus(Long planId){
@@ -524,6 +623,9 @@ public class LearningPlansServiceImpl extends ServiceImpl<LearningPlanMapper, Le
         if(plan == null){
             return;
         }
+        //计划状态可能被本次聚合改写（ACTIVE ↔ COMPLETED）→ 列表缓存失效。
+        //放这里的理由：4 个写路径（保存 / 勾选 / 改名 / 追加任务）都汇聚到本方法，单点覆盖。
+        evictPlanListCache(plan.getUserId());
 
         int total = 0;
         int done = 0;

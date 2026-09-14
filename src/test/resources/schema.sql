@@ -125,6 +125,11 @@ CREATE TABLE IF NOT EXISTS ai_sessions (
     last_conclusion_source_run_id BIGINT,
     last_conclusion_source_type VARCHAR(32),
     last_conclusion_updated_at TIMESTAMP,
+    -- V4.x 会话学习计划锚（最近一次"真实定位到"的计划；纯查询不写）
+    last_learning_plan_id BIGINT,
+    last_learning_plan_title VARCHAR(255),
+    last_learning_plan_source VARCHAR(32),
+    last_learning_plan_updated_at TIMESTAMP,
     created_at TIMESTAMP,
     updated_at TIMESTAMP
 );

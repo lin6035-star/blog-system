@@ -256,10 +256,12 @@ public class AgentRunSuggestionService {
                 AiWorkflowLearningAssistDTO dto = new AiWorkflowLearningAssistDTO();
                 dto.setConversationId(run.getSessionId());
                 dto.setRequest(suggestion.initialMessage());
-                // V4③ 第二刀：确认时直接交接 reason（不改 ai_sessions 结论锚结构）。
-                // 这是「确认时交接」——用户点了确认，reason 就是他要的方向，不需要跨 run 锚。
-                dto.setSuggestionReason(suggestion.reason());
                 applyPlanTarget(dto, run.getUserId(), suggestion.initialMessage());
+                // V4③ 第二刀第一阶段：确认时直接交接 reason（不改 ai_sessions 结论锚结构）。
+                // 只有 planId 已被后端权威解析时才传，避免候选计划未确认时把方向串到后续用户选择。
+                if (dto.getPlanId() != null && notBlank(suggestion.reason())) {
+                    dto.setHandoffReason(suggestion.reason());
+                }
                 yield aiWorkflowRunService.createLearningAssistWorkflow(dto);
             }
             case "OPTIMIZE_ARTICLE" -> {
@@ -324,7 +326,7 @@ public class AgentRunSuggestionService {
         // 修复：消息点名（建议 initialMessage = 用户原句）唯一命中 → 直进，与 chat 入口一致——
         // 原来只按 userId 判断（多 ACTIVE 全塞候选），用户原句点名完全被无视，多计划用户必被要求再选一遍
         if (message != null && !message.isBlank()) {
-            List<LearningPlans> mentioned = learningPlansService.matchActivePlansByMessage(userId, message);
+            List<LearningPlans> mentioned = learningPlansService.matchPlansByMessage(userId, message);
             if (mentioned.size() == 1) {
                 return new PlanTarget(mentioned.get(0).getId(), List.of());
             }

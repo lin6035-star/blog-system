@@ -75,8 +75,17 @@ public class AgentDecision {
 
     /**
      * 最终裁决原因。
+     *
+     * 开发者诊断用（进 AgentDecisionTrace / 评测门断言），**不直接进用户文案**——
+     * 面向用户的解释由 ctaKind 分类后渲染（V4.x）。
      */
     private String reason;
+
+    /**
+     * CTA 的面向用户原因分类（V4.x）。
+     * 只有 action=CTA 时有值；缺省视为 SYSTEM_UNCERTAIN。
+     */
+    private CtaKind ctaKind;
 
     public boolean isTool(String name) {
         return action == AgentAction.TOOL

@@ -12,6 +12,7 @@ import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.model.Generation;
 import org.springframework.ai.openai.OpenAiChatOptions;
+import org.springframework.ai.openai.api.ResponseFormat;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
@@ -62,6 +63,28 @@ public class LlmStreamCaller {
             String userPrompt,
             Integer maxTokens         //可空
     ) {
+        return call(stepPrefix, step, field, emitter, systemPrompt, userPrompt, maxTokens, false);
+    }
+
+    /**
+     * @param jsonMode 要求服务端按 JSON 对象约束输出（response_format=json_object）。
+     *                  实测（2026-09-13，qwen3.6-plus-2026-04-02）：长 prompt + 长 JSON 输出场景下
+     *                  （学习计划「调整模式」：prompt 2749 字符、输出 2200-2700 字符）
+     *                  **约 57% 概率漏掉最外层收尾 `]}`**，而 finish_reason 仍是 stop——
+     *                  流完整结束、token 远未触顶，纯粹是模型自己没写完；
+     *                  开启本参数后同场景 7/7 全部返回合法 JSON。
+     *                  **只对「输出纯 JSON」的调用点开启**：Markdown 输出的步骤（大纲/草稿/重写）开了会坏。
+     */
+    public LlmStreamResult call(
+            String stepPrefix,
+            AiWorkflowStep step,
+            String field,
+            AiWorkflowStepEmitter emitter,
+            String systemPrompt,
+            String userPrompt,
+            Integer maxTokens,
+            boolean jsonMode
+    ) {
         AiWorkflowStepEmitter safeEmitter = emitter == null ? AiWorkflowStepEmitter.noop() : emitter;
 
         long llmStart = System.currentTimeMillis();
@@ -93,16 +116,20 @@ public class LlmStreamCaller {
                     userPrompt == null ? 0 : userPrompt.length();
 
             log.info(
-                    "[PERF-WORKFLOW] llm_start step={} systemPromptChars={} userPromptChars={} maxTokens={}",
+                    "[PERF-WORKFLOW] llm_start step={} systemPromptChars={} userPromptChars={} maxTokens={} jsonMode={}",
                     step,
                     systemPromptChars,
                     userPromptChars,
-                    maxTokens
+                    maxTokens,
+                    jsonMode
             );
 
             OpenAiChatOptions.Builder options = OpenAiChatOptions.builder().streamUsage(true);
             if (maxTokens != null) {
                 options.maxTokens(maxTokens);
+            }
+            if (jsonMode) {
+                options.responseFormat(ResponseFormat.builder().type(ResponseFormat.Type.JSON_OBJECT).build());
             }
 
             chatClientBuilder.build()

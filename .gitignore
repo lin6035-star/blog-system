@@ -35,3 +35,9 @@ build/
 ### Agent 运行产物 ###
 output/
 perf-workflow.log
+
+### 日志 ###
+logs/
+
+### 本地私有配置（真实密钥不入库；模板见 config/application.example.yml）###
+config/application.yml

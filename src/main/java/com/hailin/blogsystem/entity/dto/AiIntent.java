@@ -23,6 +23,8 @@ public class AiIntent {
 
     private String learningPlanRef;  //学习计划名称或关键词，只能来自用户原话
     private String learningStageRef;  //学习阶段或任务名称，只能来自用户原话
+    private Integer learningPlanIndex;  //LLM 从后端注入的「该用户 ACTIVE 计划列表」中选中的序号（1 起）；未提及/选不出 → null
+    private String learningPlanId;  //权威计划 ID——由后端把 learningPlanIndex 映射得到（越界即丢弃），不从 LLM 输出读取
 
     private String suggestedAction;  // CHAT / TOOL / WORKFLOW / CTA，LLM 建议，不是最终裁决
     private String suggestedWorkflowType;// LEARNING_PLAN / LEARNING_PROGRESS / LEARNING_ASSIST

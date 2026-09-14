@@ -1,10 +1,10 @@
 [
   {
-    "name": "学习计划查询进入 Dashboard",
+    "name": "学习计划查询进入 Dashboard（分类器判对，不再靠字面兜底）",
     "message": "我有几个学习计划",
-    "intent": "LEARNING_PLAN",
-    "suggestedAction": "WORKFLOW",
-    "suggestedWorkflowType": "LEARNING_PLAN",
+    "intent": "LEARNING_PLAN_QUERY",
+    "suggestedAction": "TOOL",
+    "suggestedWorkflowType": null,
     "confidence": 0.95,
     "risk": "LOW",
     "actionType": null,
@@ -18,7 +18,7 @@
     "expectedToolName": "getLearningDashboard",
     "expectedClientActionType": null,
     "expectedRuleHit": "learning_plan_query",
-    "expectedReasonContains": "学习计划查询句",
+    "expectedReasonContains": "学习计划查询",
     "autoStartedCount": 0
   },
   {
@@ -154,7 +154,7 @@
     "autoStartedCount": 0
   },
   {
-    "name": "模糊学习句规则未命中时降级 CTA",
+    "name": "学习攻坚请求（intent 与建议一致、低风险高置信）直通 Workflow",
     "message": "我最近学 Redis 有点乱",
     "intent": "LEARNING_ASSIST",
     "suggestedAction": "WORKFLOW",
@@ -167,12 +167,12 @@
     "param": null,
     "content": null,
     "pageType": null,
-    "expectedAction": "CTA",
-    "expectedWorkflowType": null,
+    "expectedAction": "WORKFLOW",
+    "expectedWorkflowType": "LEARNING_ASSIST",
     "expectedToolName": null,
     "expectedClientActionType": null,
-    "expectedRuleHit": null,
-    "expectedReasonContains": "后端规则未命中",
+    "expectedRuleHit": "learning_assist_rule",
+    "expectedReasonContains": "双签命中",
     "autoStartedCount": 0
   },
   {

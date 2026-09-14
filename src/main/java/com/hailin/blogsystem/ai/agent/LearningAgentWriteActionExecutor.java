@@ -217,7 +217,7 @@ public class LearningAgentWriteActionExecutor implements AgentWriteActionExecuto
                 .toList();
         LearningPlans plan;
         if (proposal.planRef() != null && !proposal.planRef().isBlank()) {
-            List<LearningPlans> matched = learningPlansService.matchActivePlansByMessage(userId, proposal.planRef());
+            List<LearningPlans> matched = learningPlansService.matchPlansByMessage(userId, proposal.planRef());
             if (matched.size() != 1) {
                 throw new BusinessException(BlogConstants.ErrorCode.CONFLICT,
                         matched.isEmpty()

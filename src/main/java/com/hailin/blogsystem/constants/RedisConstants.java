@@ -24,6 +24,9 @@ public class RedisConstants
     //AI 接口限流：ai:rate:{bucket}:{user|ip}:{identity}:{window}，bucket = chat / workflow / rag
     public static final String AI_RATE_LIMIT_KEY_PREFIX =
             "ai:rate:";
+    //学习计划列表（ACTIVE）：learning:plan:list:{userId}
+    //分类器每条消息都要读这个列表（要"选计划"就得先有选项），写计划/改任务状态时失效
+    public static final String LEARNING_PLAN_LIST_KEY_PREFIX = "learning:plan:list:";
 
 
     public static final double ARTICLE_VIEW_HOT_SCORE = 1.0;
@@ -39,6 +42,7 @@ public class RedisConstants
     public static final long ARTICLE_LIST_TTL_MINUTES = 5;
     public static final long COMMON_LIST_TTL_MINUTES = 30;
     public static final long COMMENT_LIST_TTL_MINUTES = 3;
+    public static final long LEARNING_PLAN_LIST_TTL_MINUTES = 5;
 
     //防止缓存穿透
     public static final String CACHE_NULL_VALUE = "__NULL__";

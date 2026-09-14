@@ -1,205 +1,512 @@
 [
-  {
-    "name": "入口点名：唯一最高分计划胜出",
-    "category": "plan-match",
-    "target": "PLAN_MATCH",
-    "message": "帮我压缩一下我的 Redis 计划的周期",
-    "fixtures": {
-      "plans": [
-        { "ref": "java", "title": "Java 学习计划", "status": "ACTIVE" },
-        { "ref": "redis", "title": "Redis 学习计划", "status": "ACTIVE" }
-      ]
+ {
+  "name": "入口点名：唯一最高分计划胜出",
+  "category": "plan-match",
+  "target": "PLAN_MATCH",
+  "message": "帮我压缩一下我的 Redis 计划的周期",
+  "fixtures": {
+   "plans": [
+    {
+     "ref": "java",
+     "title": "Java 学习计划",
+     "status": "ACTIVE"
     },
-    "expected": { "matchedCount": 1, "matchedTitles": ["Redis 学习计划"] }
+    {
+     "ref": "redis",
+     "title": "Redis 学习计划",
+     "status": "ACTIVE"
+    }
+   ]
   },
-  {
-    "name": "入口点名：并列最高分返回全部",
-    "category": "plan-match",
-    "target": "PLAN_MATCH",
-    "message": "帮我压缩学习计划的周期",
-    "fixtures": {
-      "plans": [
-        { "ref": "java", "title": "Java 学习计划", "status": "ACTIVE" },
-        { "ref": "redis", "title": "Redis 学习计划", "status": "ACTIVE" }
-      ]
-    },
-    "expected": { "matchedCount": 2 }
-  },
-  {
-    "name": "入口点名：非 ACTIVE 计划不参与",
-    "category": "plan-match",
-    "target": "PLAN_MATCH",
-    "message": "压缩 Redis 计划的周期",
-    "fixtures": {
-      "plans": [
-        { "ref": "redis", "title": "Redis 学习计划", "status": "COMPLETED" }
-      ]
-    },
-    "expected": { "matchedCount": 0 }
-  },
-  {
-    "name": "入口点名：无实词零命中为空",
-    "category": "plan-match",
-    "target": "PLAN_MATCH",
-    "message": "调整一下",
-    "fixtures": {
-      "plans": [
-        { "ref": "redis", "title": "Redis 学习计划", "status": "ACTIVE" }
-      ]
-    },
-    "expected": { "matchedCount": 0 }
-  },
-  {
-    "name": "入口点名：中文 2-gram 命中",
-    "category": "plan-match",
-    "target": "PLAN_MATCH",
-    "message": "压缩机器学习那个计划",
-    "fixtures": {
-      "plans": [
-        { "ref": "java", "title": "Java 学习计划", "status": "ACTIVE" },
-        { "ref": "ml", "title": "机器学习入门计划", "status": "ACTIVE" }
-      ]
-    },
-    "expected": { "matchedCount": 1, "matchedTitles": ["机器学习入门计划"] }
-  },
-  {
-    "name": "查询详情：标题 AND 匹配可省略中段",
-    "category": "plan-title-match",
-    "target": "PLAN_TITLE_MATCH",
-    "message": "RocketMQ学习计划",
-    "fixtures": {
-      "plans": [
-        { "ref": "rocketmq", "title": "RocketMQ 30天入门学习计划", "status": "ACTIVE" }
-      ]
-    },
-    "expected": { "matchedCount": 1, "matchedTitles": ["RocketMQ 30天入门学习计划"] }
-  },
-  {
-    "name": "阶段点名：任务标题命中定位所属阶段",
-    "category": "stage-match",
-    "target": "STAGE_MATCH",
-    "message": "缓存击穿看不懂",
-    "fixtures": {
-      "plans": [
-        { "ref": "redis", "title": "Redis 学习计划", "status": "ACTIVE" }
-      ],
-      "stages": [
-        { "planRef": "redis", "orderNum": 1, "title": "基础阶段", "tasks": [ { "title": "Redis 数据结构" } ] },
-        { "planRef": "redis", "orderNum": 2, "title": "进阶阶段", "tasks": [ { "title": "缓存击穿" } ] }
-      ]
-    },
-    "expected": { "matchedCount": 1, "matchedTitles": ["进阶阶段"] }
-  },
-  {
-    "name": "阶段点名：阶段标题命中直接定位",
-    "category": "stage-match",
-    "target": "STAGE_MATCH",
-    "message": "基础阶段学不会",
-    "fixtures": {
-      "plans": [
-        { "ref": "redis", "title": "Redis 学习计划", "status": "ACTIVE" }
-      ],
-      "stages": [
-        { "planRef": "redis", "orderNum": 1, "title": "基础阶段", "tasks": [ { "title": "Redis 数据结构" } ] },
-        { "planRef": "redis", "orderNum": 2, "title": "进阶阶段", "tasks": [ { "title": "缓存击穿" } ] }
-      ]
-    },
-    "expected": { "matchedCount": 1, "matchedTitles": ["基础阶段"] }
-  },
-  {
-    "name": "阶段点名：序号词序归一（第三阶段 vs 阶段三）",
-    "category": "stage-match",
-    "target": "STAGE_MATCH",
-    "message": "C++ 计划的第三阶段太难了，帮我拆解一下",
-    "fixtures": {
-      "plans": [
-        { "ref": "cpp", "title": "C++ 学习计划", "status": "ACTIVE" }
-      ],
-      "stages": [
-        { "planRef": "cpp", "orderNum": 1, "title": "阶段一：基础", "tasks": [ { "title": "变量与类型" } ] },
-        { "planRef": "cpp", "orderNum": 2, "title": "阶段三：进阶", "tasks": [ { "title": "模板与泛型" } ] }
-      ]
-    },
-    "expected": { "matchedCount": 1, "matchedTitles": ["阶段三：进阶"] }
-  },
-  {
-    "name": "阶段点名：反方向（阶段3 vs 第三阶段）",
-    "category": "stage-match",
-    "target": "STAGE_MATCH",
-    "message": "阶段3的任务看不懂",
-    "fixtures": {
-      "plans": [
-        { "ref": "cpp", "title": "C++ 学习计划", "status": "ACTIVE" }
-      ],
-      "stages": [
-        { "planRef": "cpp", "orderNum": 1, "title": "第一阶段：基础", "tasks": [ { "title": "变量与类型" } ] },
-        { "planRef": "cpp", "orderNum": 2, "title": "第三阶段：进阶", "tasks": [ { "title": "模板与泛型" } ] }
-      ]
-    },
-    "expected": { "matchedCount": 1, "matchedTitles": ["第三阶段：进阶"] }
-  },
-  {
-    "name": "阶段点名：主题名标题下序号直解 order_num",
-    "category": "stage-match",
-    "target": "STAGE_MATCH",
-    "message": "Redis计划中的阶段三感觉好难,能帮我拆解一下吗",
-    "fixtures": {
-      "plans": [
-        { "ref": "redis", "title": "Redis 学习计划", "status": "ACTIVE" }
-      ],
-      "stages": [
-        { "planRef": "redis", "orderNum": 1, "title": "基础环境与核心数据结构重温", "tasks": [ { "title": "Redis 入门" } ] },
-        { "planRef": "redis", "orderNum": 2, "title": "缓存工程化与三大问题专项治理", "tasks": [ { "title": "搭建 3 主 3 从集群" } ] },
-        { "planRef": "redis", "orderNum": 3, "title": "持久化机制与数据可靠性保障", "tasks": [ { "title": "对比 RDB 和 AOF" } ] }
-      ]
-    },
-    "expected": { "matchedCount": 1, "matchedTitles": ["持久化机制与数据可靠性保障"] }
-  },
-  {
-    "name": "阶段点名：并列返回全部阶段",
-    "category": "stage-match",
-    "target": "STAGE_MATCH",
-    "message": "Redis 这块看不懂",
-    "fixtures": {
-      "plans": [
-        { "ref": "redis", "title": "Redis 学习计划", "status": "ACTIVE" }
-      ],
-      "stages": [
-        { "planRef": "redis", "orderNum": 1, "title": "Redis 基础", "tasks": [ { "title": "数据结构" } ] },
-        { "planRef": "redis", "orderNum": 2, "title": "Redis 进阶", "tasks": [ { "title": "持久化" } ] }
-      ]
-    },
-    "expected": { "matchedCount": 2 }
-  },
-  {
-    "name": "阶段点名：零命中为空",
-    "category": "stage-match",
-    "target": "STAGE_MATCH",
-    "message": "就是看不懂啊",
-    "fixtures": {
-      "plans": [
-        { "ref": "redis", "title": "Redis 学习计划", "status": "ACTIVE" }
-      ],
-      "stages": [
-        { "planRef": "redis", "orderNum": 1, "title": "基础阶段", "tasks": [ { "title": "数据结构" } ] }
-      ]
-    },
-    "expected": { "matchedCount": 0 }
-  },
-  {
-    "name": "阶段点名：跨用户计划拒绝",
-    "category": "stage-match",
-    "target": "STAGE_MATCH",
-    "message": "数据结构看不懂",
-    "callerUserId": 999,
-    "fixtures": {
-      "plans": [
-        { "ref": "redis", "title": "Redis 学习计划", "status": "ACTIVE" }
-      ],
-      "stages": [
-        { "planRef": "redis", "orderNum": 1, "title": "基础阶段", "tasks": [ { "title": "数据结构" } ] }
-      ]
-    },
-    "expected": { "errorContains": "学习计划不存在或无权访问" }
+  "expected": {
+   "matchedCount": 1,
+   "matchedTitles": [
+    "Redis 学习计划"
+   ]
   }
+ },
+ {
+  "name": "入口点名：C++ 强词压过通用计划词",
+  "category": "plan-match",
+  "target": "PLAN_MATCH",
+  "message": "帮我分析我的 C++ 学习计划",
+  "fixtures": {
+   "plans": [
+    {
+     "ref": "cpp",
+     "title": "C++ 系统学习与工程化实践计划",
+     "status": "ACTIVE"
+    },
+    {
+     "ref": "c",
+     "title": "C语言系统学习计划",
+     "status": "ACTIVE"
+    }
+   ]
+  },
+  "expected": {
+   "matchedCount": 1,
+   "matchedTitles": [
+    "C++ 系统学习与工程化实践计划"
+   ]
+  }
+ },
+ {
+  "name": "入口点名：并列最高分返回全部",
+  "category": "plan-match",
+  "target": "PLAN_MATCH",
+  "message": "帮我压缩学习计划的周期",
+  "fixtures": {
+   "plans": [
+    {
+     "ref": "java",
+     "title": "Java 学习计划",
+     "status": "ACTIVE"
+    },
+    {
+     "ref": "redis",
+     "title": "Redis 学习计划",
+     "status": "ACTIVE"
+    }
+   ]
+  },
+  "expected": {
+   "matchedCount": 2
+  }
+ },
+ {
+  "name": "入口点名：已完成计划仍参与匹配（2026-09-14 起，原先被状态过滤掉）",
+  "category": "plan-match",
+  "target": "PLAN_MATCH",
+  "message": "压缩 Redis 计划的周期",
+  "fixtures": {
+   "plans": [
+    {
+     "ref": "redis",
+     "title": "Redis 学习计划",
+     "status": "COMPLETED"
+    }
+   ]
+  },
+  "expected": {
+   "matchedCount": 1,
+   "matchedTitles": [
+    "Redis 学习计划"
+   ]
+  }
+ },
+ {
+  "name": "入口点名：无实词零命中为空",
+  "category": "plan-match",
+  "target": "PLAN_MATCH",
+  "message": "调整一下",
+  "fixtures": {
+   "plans": [
+    {
+     "ref": "redis",
+     "title": "Redis 学习计划",
+     "status": "ACTIVE"
+    }
+   ]
+  },
+  "expected": {
+   "matchedCount": 0
+  }
+ },
+ {
+  "name": "入口点名：中文 2-gram 命中",
+  "category": "plan-match",
+  "target": "PLAN_MATCH",
+  "message": "压缩机器学习那个计划",
+  "fixtures": {
+   "plans": [
+    {
+     "ref": "java",
+     "title": "Java 学习计划",
+     "status": "ACTIVE"
+    },
+    {
+     "ref": "ml",
+     "title": "机器学习入门计划",
+     "status": "ACTIVE"
+    }
+   ]
+  },
+  "expected": {
+   "matchedCount": 1,
+   "matchedTitles": [
+    "机器学习入门计划"
+   ]
+  }
+ },
+ {
+  "name": "查询详情：标题 AND 匹配可省略中段",
+  "category": "plan-title-match",
+  "target": "PLAN_TITLE_MATCH",
+  "message": "RocketMQ学习计划",
+  "fixtures": {
+   "plans": [
+    {
+     "ref": "rocketmq",
+     "title": "RocketMQ 30天入门学习计划",
+     "status": "ACTIVE"
+    }
+   ]
+  },
+  "expected": {
+   "matchedCount": 1,
+   "matchedTitles": [
+    "RocketMQ 30天入门学习计划"
+   ]
+  }
+ },
+ {
+  "name": "阶段点名：任务标题命中定位所属阶段",
+  "category": "stage-match",
+  "target": "STAGE_MATCH",
+  "message": "缓存击穿看不懂",
+  "fixtures": {
+   "plans": [
+    {
+     "ref": "redis",
+     "title": "Redis 学习计划",
+     "status": "ACTIVE"
+    }
+   ],
+   "stages": [
+    {
+     "planRef": "redis",
+     "orderNum": 1,
+     "title": "基础阶段",
+     "tasks": [
+      {
+       "title": "Redis 数据结构"
+      }
+     ]
+    },
+    {
+     "planRef": "redis",
+     "orderNum": 2,
+     "title": "进阶阶段",
+     "tasks": [
+      {
+       "title": "缓存击穿"
+      }
+     ]
+    }
+   ]
+  },
+  "expected": {
+   "matchedCount": 1,
+   "matchedTitles": [
+    "进阶阶段"
+   ]
+  }
+ },
+ {
+  "name": "阶段点名：阶段标题命中直接定位",
+  "category": "stage-match",
+  "target": "STAGE_MATCH",
+  "message": "基础阶段学不会",
+  "fixtures": {
+   "plans": [
+    {
+     "ref": "redis",
+     "title": "Redis 学习计划",
+     "status": "ACTIVE"
+    }
+   ],
+   "stages": [
+    {
+     "planRef": "redis",
+     "orderNum": 1,
+     "title": "基础阶段",
+     "tasks": [
+      {
+       "title": "Redis 数据结构"
+      }
+     ]
+    },
+    {
+     "planRef": "redis",
+     "orderNum": 2,
+     "title": "进阶阶段",
+     "tasks": [
+      {
+       "title": "缓存击穿"
+      }
+     ]
+    }
+   ]
+  },
+  "expected": {
+   "matchedCount": 1,
+   "matchedTitles": [
+    "基础阶段"
+   ]
+  }
+ },
+ {
+  "name": "阶段点名：序号词序归一（第三阶段 vs 阶段三）",
+  "category": "stage-match",
+  "target": "STAGE_MATCH",
+  "message": "C++ 计划的第三阶段太难了，帮我拆解一下",
+  "fixtures": {
+   "plans": [
+    {
+     "ref": "cpp",
+     "title": "C++ 学习计划",
+     "status": "ACTIVE"
+    }
+   ],
+   "stages": [
+    {
+     "planRef": "cpp",
+     "orderNum": 1,
+     "title": "阶段一：基础",
+     "tasks": [
+      {
+       "title": "变量与类型"
+      }
+     ]
+    },
+    {
+     "planRef": "cpp",
+     "orderNum": 2,
+     "title": "阶段三：进阶",
+     "tasks": [
+      {
+       "title": "模板与泛型"
+      }
+     ]
+    }
+   ]
+  },
+  "expected": {
+   "matchedCount": 1,
+   "matchedTitles": [
+    "阶段三：进阶"
+   ]
+  }
+ },
+ {
+  "name": "阶段点名：反方向（阶段3 vs 第三阶段）",
+  "category": "stage-match",
+  "target": "STAGE_MATCH",
+  "message": "阶段3的任务看不懂",
+  "fixtures": {
+   "plans": [
+    {
+     "ref": "cpp",
+     "title": "C++ 学习计划",
+     "status": "ACTIVE"
+    }
+   ],
+   "stages": [
+    {
+     "planRef": "cpp",
+     "orderNum": 1,
+     "title": "第一阶段：基础",
+     "tasks": [
+      {
+       "title": "变量与类型"
+      }
+     ]
+    },
+    {
+     "planRef": "cpp",
+     "orderNum": 2,
+     "title": "第三阶段：进阶",
+     "tasks": [
+      {
+       "title": "模板与泛型"
+      }
+     ]
+    }
+   ]
+  },
+  "expected": {
+   "matchedCount": 1,
+   "matchedTitles": [
+    "第三阶段：进阶"
+   ]
+  }
+ },
+ {
+  "name": "阶段点名：主题名标题下序号直解 order_num",
+  "category": "stage-match",
+  "target": "STAGE_MATCH",
+  "message": "Redis计划中的阶段三感觉好难,能帮我拆解一下吗",
+  "fixtures": {
+   "plans": [
+    {
+     "ref": "redis",
+     "title": "Redis 学习计划",
+     "status": "ACTIVE"
+    }
+   ],
+   "stages": [
+    {
+     "planRef": "redis",
+     "orderNum": 1,
+     "title": "基础环境与核心数据结构重温",
+     "tasks": [
+      {
+       "title": "Redis 入门"
+      }
+     ]
+    },
+    {
+     "planRef": "redis",
+     "orderNum": 2,
+     "title": "缓存工程化与三大问题专项治理",
+     "tasks": [
+      {
+       "title": "搭建 3 主 3 从集群"
+      }
+     ]
+    },
+    {
+     "planRef": "redis",
+     "orderNum": 3,
+     "title": "持久化机制与数据可靠性保障",
+     "tasks": [
+      {
+       "title": "对比 RDB 和 AOF"
+      }
+     ]
+    }
+   ]
+  },
+  "expected": {
+   "matchedCount": 1,
+   "matchedTitles": [
+    "持久化机制与数据可靠性保障"
+   ]
+  }
+ },
+ {
+  "name": "阶段点名：并列返回全部阶段",
+  "category": "stage-match",
+  "target": "STAGE_MATCH",
+  "message": "Redis 这块看不懂",
+  "fixtures": {
+   "plans": [
+    {
+     "ref": "redis",
+     "title": "Redis 学习计划",
+     "status": "ACTIVE"
+    }
+   ],
+   "stages": [
+    {
+     "planRef": "redis",
+     "orderNum": 1,
+     "title": "Redis 基础",
+     "tasks": [
+      {
+       "title": "数据结构"
+      }
+     ]
+    },
+    {
+     "planRef": "redis",
+     "orderNum": 2,
+     "title": "Redis 进阶",
+     "tasks": [
+      {
+       "title": "持久化"
+      }
+     ]
+    }
+   ]
+  },
+  "expected": {
+   "matchedCount": 2
+  }
+ },
+ {
+  "name": "阶段点名：零命中为空",
+  "category": "stage-match",
+  "target": "STAGE_MATCH",
+  "message": "就是看不懂啊",
+  "fixtures": {
+   "plans": [
+    {
+     "ref": "redis",
+     "title": "Redis 学习计划",
+     "status": "ACTIVE"
+    }
+   ],
+   "stages": [
+    {
+     "planRef": "redis",
+     "orderNum": 1,
+     "title": "基础阶段",
+     "tasks": [
+      {
+       "title": "数据结构"
+      }
+     ]
+    }
+   ]
+  },
+  "expected": {
+   "matchedCount": 0
+  }
+ },
+ {
+  "name": "阶段点名：跨用户计划拒绝",
+  "category": "stage-match",
+  "target": "STAGE_MATCH",
+  "message": "数据结构看不懂",
+  "callerUserId": 999,
+  "fixtures": {
+   "plans": [
+    {
+     "ref": "redis",
+     "title": "Redis 学习计划",
+     "status": "ACTIVE"
+    }
+   ],
+   "stages": [
+    {
+     "planRef": "redis",
+     "orderNum": 1,
+     "title": "基础阶段",
+     "tasks": [
+      {
+       "title": "数据结构"
+      }
+     ]
+    }
+   ]
+  },
+  "expected": {
+   "errorContains": "学习计划不存在或无权访问"
+  }
+ },
+ {
+  "name": "入口点名：已完成计划仍参与匹配（不再被状态过滤）",
+  "category": "plan-match",
+  "target": "PLAN_MATCH",
+  "message": "帮我分析我的 java 学习计划",
+  "fixtures": {
+   "plans": [
+    {
+     "ref": "javaroute",
+     "title": "Java后端学习路线规划",
+     "status": "COMPLETED"
+    },
+    {
+     "ref": "agent",
+     "title": "两个月 Agent 开发入门到实战计划（Java后端方向）",
+     "status": "ACTIVE"
+    }
+   ]
+  },
+  "expected": {
+   "matchedCount": 2
+  }
+ }
 ]

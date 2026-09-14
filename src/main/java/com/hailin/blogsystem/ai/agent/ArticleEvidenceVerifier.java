@@ -2,6 +2,7 @@ package com.hailin.blogsystem.ai.agent;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.hailin.blogsystem.ai.AiJudgeModelSupport;
 import com.hailin.blogsystem.entity.AiAgentRun;
 import com.hailin.blogsystem.entity.dto.AgentStepActionType;
 import lombok.RequiredArgsConstructor;
@@ -38,6 +39,7 @@ public class ArticleEvidenceVerifier {
 
     private final ChatClient.Builder chatClientBuilder;
     private final ObjectMapper objectMapper;
+    private final AiJudgeModelSupport aiJudgeModelSupport;
 
     /**
      * 收敛门入口。
@@ -107,8 +109,9 @@ public class ArticleEvidenceVerifier {
                     .prompt()
                     .system(buildSystemPrompt(repair))
                     .user(buildUserPrompt(goal, context, answer))
-                    .options(OpenAiChatOptions.builder()
-                            .temperature(TEMPERATURE)
+                    //判断链：收敛门判定"证据够不够"，判错会让回答空转或放水——配了 judge-model 就用强模型
+                    .options(aiJudgeModelSupport.applyTo(OpenAiChatOptions.builder()
+                            .temperature(TEMPERATURE))
                             .build())
                     .call()
                     .content();

@@ -163,5 +163,110 @@
     "pageArticleId": "12",
     "expectedIntent": "ARTICLE_DETAIL_QA",
     "expectedSuggestedAction": "CHAT"
+  },
+  {
+    "name": "V4 第一刀：单节内容评价走 ARTICLE_DETAIL_QA",
+    "category": "boundary",
+    "message": "这篇文章的缓存击穿那一节写得怎么样",
+    "pageType": "article-detail",
+    "pageArticleId": "12",
+    "expectedIntent": "ARTICLE_DETAIL_QA",
+    "expectedSuggestedAction": "CHAT"
+  },
+  {
+    "name": "V4 第一刀：多子目标读文走 ARTICLE_AGENT",
+    "category": "boundary",
+    "message": "先看整体结构，再看看缓存击穿那一节",
+    "pageType": "article-detail",
+    "pageArticleId": "12",
+    "expectedIntent": "ARTICLE_AGENT",
+    "expectedSuggestedAction": "AGENT"
+  },
+  {
+    "name": "V4 第一刀：多子目标检查章节走 ARTICLE_AGENT",
+    "category": "boundary",
+    "message": "先看整体结构，再检查分布式锁那一节",
+    "pageType": "article-detail",
+    "pageArticleId": "12",
+    "expectedIntent": "ARTICLE_AGENT",
+    "expectedSuggestedAction": "AGENT"
+  },
+  {
+    "name": "V4 第一刀：结合写作偏好走 ARTICLE_AGENT",
+    "category": "boundary",
+    "message": "对比一下缓存击穿和缓存穿透这两节的写法，说说哪节写得更好，再结合我的写作偏好给建议",
+    "pageType": "article-detail",
+    "pageArticleId": "12",
+    "expectedIntent": "ARTICLE_AGENT",
+    "expectedSuggestedAction": "AGENT"
+  },
+  {
+    "name": "V4 第一刀：单目标开头评价走 ARTICLE_DETAIL_QA",
+    "category": "boundary",
+    "message": "这篇文章的开头写得怎么样",
+    "pageType": "article-detail",
+    "pageArticleId": "12",
+    "expectedIntent": "ARTICLE_DETAIL_QA",
+    "expectedSuggestedAction": "CHAT"
+  },
+  {
+    "name": "分界：分析计划内容走 LEARNING_AGENT 而非 PLAN_QUERY",
+    "category": "boundary",
+    "message": "帮我分析我的Agent学习计划，看看有没有问题",
+    "expectedIntent": "LEARNING_AGENT",
+    "expectedPlanRefContains": "Agent",
+    "expectedConfidenceMin": 0.55
+  },
+  {
+    "name": "分界：评价计划安排合理性走 LEARNING_AGENT",
+    "category": "boundary",
+    "message": "我的C++学习计划安排得合理吗",
+    "expectedIntent": "LEARNING_AGENT",
+    "expectedConfidenceMin": 0.55
+  },
+  {
+    "name": "分界：计划求改进建议走 LEARNING_AGENT",
+    "category": "boundary",
+    "message": "帮我看看我的Redis学习计划写得怎么样，有什么可以改进的",
+    "expectedIntent": "LEARNING_AGENT",
+    "expectedConfidenceMin": 0.55
+  },
+  {
+    "name": "分界：非计划页分析计划仍走 LEARNING_AGENT（防页面依赖）",
+    "category": "boundary",
+    "message": "帮我分析我的Agent学习计划，看看有没有问题",
+    "pageType": "article-detail",
+    "pageArticleId": "12",
+    "expectedIntent": "LEARNING_AGENT",
+    "expectedConfidenceMin": 0.55
+  },
+  {
+    "name": "分界：计划详情页分析计划走 LEARNING_AGENT",
+    "category": "boundary",
+    "message": "帮我分析我的Agent学习计划，看看有没有问题",
+    "pageType": "learning-plan-detail",
+    "expectedIntent": "LEARNING_AGENT",
+    "expectedConfidenceMin": 0.55
+  },
+  {
+    "name": "回归：问计划进度仍走 LEARNING_PLAN_QUERY",
+    "category": "regression",
+    "message": "我的MySQL学习计划学到哪了",
+    "expectedIntent": "LEARNING_PLAN_QUERY",
+    "expectedConfidenceMin": 0.55
+  },
+  {
+    "name": "回归：问有哪些计划仍走 LEARNING_PLAN_QUERY",
+    "category": "regression",
+    "message": "我有几个学习规划",
+    "expectedIntent": "LEARNING_PLAN_QUERY",
+    "expectedConfidenceMin": 0.55
+  },
+  {
+    "name": "回归：列计划清单仍走 LEARNING_PLAN_QUERY",
+    "category": "regression",
+    "message": "我的学习计划都有哪些",
+    "expectedIntent": "LEARNING_PLAN_QUERY",
+    "expectedConfidenceMin": 0.55
   }
 ]

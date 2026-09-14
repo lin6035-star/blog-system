@@ -6,6 +6,7 @@ import com.hailin.blogsystem.ai.agent.AgentStepDecider;
 import com.hailin.blogsystem.ai.agent.AgentRunResult;
 import com.hailin.blogsystem.ai.agent.LearningAgentActionExecutor;
 import com.hailin.blogsystem.ai.agent.LearningAgentRuntime;
+import com.hailin.blogsystem.ai.agent.LearningPlanAnchorService;
 import com.hailin.blogsystem.entity.AiAgentRun;
 import com.hailin.blogsystem.entity.AiAgentStep;
 import com.hailin.blogsystem.entity.LearningPlans;
@@ -21,6 +22,7 @@ import org.mockito.ArgumentCaptor;
 
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -42,6 +44,7 @@ class LearningAgentRuntimeTests {
     private AiAgentRunMapper runMapper;
     private AiAgentStepMapper stepMapper;
     private LearningPlansService learningPlansService;
+    private LearningPlanAnchorService learningPlanAnchorService;
     private LearningAgentRuntime runtime;
 
     @BeforeEach
@@ -51,6 +54,7 @@ class LearningAgentRuntimeTests {
         runMapper = mock(AiAgentRunMapper.class);
         stepMapper = mock(AiAgentStepMapper.class);
         learningPlansService = mock(LearningPlansService.class);
+        learningPlanAnchorService = mock(LearningPlanAnchorService.class);
 
         // MyBatis-Plus ASSIGN_ID 在 mock 下不生效，insert 时手动赋 id
         when(runMapper.insert(any(AiAgentRun.class))).thenAnswer(inv -> {
@@ -60,7 +64,8 @@ class LearningAgentRuntimeTests {
         });
 
         runtime = new LearningAgentRuntime(
-                decider, executor, runMapper, stepMapper, new ObjectMapper(), learningPlansService
+                decider, executor, runMapper, stepMapper, new ObjectMapper(),
+                learningPlansService, learningPlanAnchorService
         );
     }
 
@@ -353,7 +358,7 @@ class LearningAgentRuntimeTests {
         when(executor.execute(any(), any(), any()))
                 .thenReturn("学习计划总览：共 1 个计划。\n- 阶段《阶段二》：缓存穿透；缓存雪崩防护；");
         when(learningPlansService.listByUser(100L)).thenReturn(List.of(activePlan(1L, "Redis 学习计划")));
-        when(learningPlansService.matchActivePlansByMessage(100L, "Redis 学习计划"))
+        when(learningPlansService.matchPlansByMessage(100L, "Redis 学习计划"))
                 .thenReturn(List.of(activePlan(1L, "Redis 学习计划")));
         when(learningPlansService.getDetail(1L, 100L)).thenReturn(
                 detailWithStages(stageWithTasks(11L, "阶段二", "缓存雪崩防护")));
@@ -417,7 +422,7 @@ class LearningAgentRuntimeTests {
         when(executor.execute(any(), any(), any()))
                 .thenReturn("学习计划总览：共 1 个计划。\n- 阶段《阶段二》：缓存击穿；缓存雪崩防护；");
         when(learningPlansService.listByUser(100L)).thenReturn(List.of(activePlan(1L, "Redis 学习计划")));
-        when(learningPlansService.matchActivePlansByMessage(100L, "Redis 学习计划"))
+        when(learningPlansService.matchPlansByMessage(100L, "Redis 学习计划"))
                 .thenReturn(List.of(activePlan(1L, "Redis 学习计划")));
         when(learningPlansService.getDetail(1L, 100L)).thenReturn(
                 detailWithStages(stageWithTasks(11L, "阶段二", "缓存击穿", "缓存雪崩防护")));
@@ -578,6 +583,47 @@ class LearningAgentRuntimeTests {
         assertThat(steps.get(0).getStatus()).isEqualTo("FAILED");
         AiAgentRun saved = captureRun();
         assertThat(saved.getContextJson()).contains("动作执行失败");
+    }
+
+    // V4.x 补口：会话学习计划锚注入 goal——用户省略主语时，决策器手里终于有"刚才聊的是哪个"的依据，
+    // 不再只能列一串候选反问"是哪个计划"（实测：上一轮刚分析完 RocketMQ 计划，下一句照样反问）
+    @Test
+    void sessionPlanAnchorInjectedIntoGoal() {
+        LearningPlans anchor = new LearningPlans();
+        anchor.setId(9L);
+        anchor.setTitle("RocketMQ 30天入门学习计划");
+        when(learningPlanAnchorService.resolve(200L, 100L)).thenReturn(anchor);
+
+        AtomicReference<String> seenGoal = new AtomicReference<>();
+        when(decider.decide(any(), any(), anyInt(), anyInt())).thenAnswer(inv -> {
+            seenGoal.set(inv.getArgument(0));
+            return AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
+                    .withInput(Map.of("answer", "好的"));
+        });
+
+        runtime.run(100L, 200L, "帮我看看我的计划怎么样");
+
+        assertThat(seenGoal.get())
+                .contains("【会话最近讨论的学习计划】")
+                .contains("RocketMQ 30天入门学习计划");
+    }
+
+    // 无锚也要显式标注"无"（与文章域同构）：决策器据此知道确实没有线索可选，
+    // 而不是"系统忘了给"——前者该 ASK_USER，后者会诱发模型自己编一个计划名
+    @Test
+    void missingAnchorMarkedAsNoneInGoal() {
+        when(learningPlanAnchorService.resolve(200L, 100L)).thenReturn(null);
+
+        AtomicReference<String> seenGoal = new AtomicReference<>();
+        when(decider.decide(any(), any(), anyInt(), anyInt())).thenAnswer(inv -> {
+            seenGoal.set(inv.getArgument(0));
+            return AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
+                    .withInput(Map.of("answer", "好的"));
+        });
+
+        runtime.run(100L, 200L, "帮我看看我的计划怎么样");
+
+        assertThat(seenGoal.get()).contains("【会话最近讨论的学习计划】无");
     }
 
     private AiAgentRun captureRun() {

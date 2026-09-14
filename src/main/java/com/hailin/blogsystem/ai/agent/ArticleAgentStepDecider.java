@@ -1,6 +1,7 @@
 package com.hailin.blogsystem.ai.agent;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.hailin.blogsystem.ai.AiJudgeModelSupport;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.stereotype.Component;
 
@@ -15,8 +16,9 @@ import org.springframework.stereotype.Component;
 @Component
 public class ArticleAgentStepDecider extends LlmAgentStepDecider {
 
-    public ArticleAgentStepDecider(ChatClient.Builder chatClientBuilder, ObjectMapper objectMapper) {
-        super(chatClientBuilder, objectMapper);
+    public ArticleAgentStepDecider(ChatClient.Builder chatClientBuilder, ObjectMapper objectMapper,
+                                   AiJudgeModelSupport aiJudgeModelSupport) {
+        super(chatClientBuilder, objectMapper, aiJudgeModelSupport);
     }
 
     @Override
@@ -49,6 +51,8 @@ public class ArticleAgentStepDecider extends LlmAgentStepDecider {
                 - QUERY_ARTICLE：按 anchorMode 定位目标文章并分析结构（必须先做这个，验证文章归属）。
                   V3.11：如需目标文章某段/某节的具体内容，可带 input.focus（如 "focus":"缓存击穿那一节"），
                   后端会返回该节/段原文片段；缺省不带 focus 返回整体结构摘要。一次只聚焦一个点。
+                  注意：整体性询问（"整篇/整体/框架怎么样"）**不要带 focus**——缺省的结构摘要就是为它准备的；
+                  focus 只用于用户明确指向某一节/某一段时（塞进"整体结构"这类泛化词只会让后端定位不到）。
                 - QUERY_MEMORY：查询用户长期记忆（写作偏好等）。**一次就够**——一次调用即返回全部命中项，
                   没命中就是确实没有：此时基于文章本身给建议，或在回答里说明「没有找到相关写作偏好」，
                   不要用重复查询代替「接受信息不足」。

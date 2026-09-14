@@ -1,13 +1,19 @@
 package com.hailin.blogsystem.service.impl;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.hailin.blogsystem.ai.AiJudgeModelSupport;
+import com.hailin.blogsystem.entity.LearningPlans;
 import com.hailin.blogsystem.entity.dto.AiIntent;
 import com.hailin.blogsystem.entity.dto.PageContextDTO;
 import com.hailin.blogsystem.service.AiIntentClassifier;
+import com.hailin.blogsystem.service.LearningPlansService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.stereotype.Service;
+
+import java.util.List;
 
 @Service
 @RequiredArgsConstructor
@@ -16,33 +22,49 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
 {
     private final ChatClient.Builder chatClientBuilder;
     private final ObjectMapper objectMapper;
+    private final LearningPlansService learningPlansService;
+    private final AiJudgeModelSupport aiJudgeModelSupport;
 
     @Override  //判断分类，用户想要干什么，如果是要生成文章，单独拆一个实现类专门实现
-    public AiIntent classify(String message, PageContextDTO pageContextDTO){
-        // 首次调用；JSON 解析失败（模型把规则/注释文字混进输出）→ repair prompt 重试一次，
-        // 仍失败才降级普通聊天（原来一次失败直接降级——点名单任务等诉求会静默退化成无能力聊天）
-        String json = callClassifier(message, pageContextDTO, false);
-        AiIntent aiIntent = json == null ? null : tryParse(json);
-        if (aiIntent == null && json != null) {
-            String repaired = callClassifier(message, pageContextDTO, true);
-            if (repaired != null) {
-                aiIntent = tryParse(repaired);
-                if (aiIntent != null) {
-                    log.warn("AI意图识别 repair 成功：首次输出混入非 JSON 文字，已恢复");
-                }
-            }
-        }
-        if (aiIntent == null) {
+    public AiIntent classify(String message, PageContextDTO pageContextDTO, Long userId){
+        /*
+         * 第一段：不带计划列表。
+         *
+         * 绝大多数消息（闲聊、文章问答、概念问答、创建计划）到此为止——
+         * 不查库、user prompt 里也没有计划列表（普通聊天不该背这个包袱）。
+         */
+        AiIntent aiIntent = callOnce(message, pageContextDTO, List.of());
+        if (aiIntent == null || aiIntent.getIntent() == null || aiIntent.getIntent().isBlank()) {
             log.warn("AI意图识别失败，降级为普通聊天");
             return generalChat();
         }
-        if (aiIntent.getIntent() == null || aiIntent.getIntent().isBlank()){
-            return generalChat();
+
+        /*
+         * 第二段：只有「意图是调整/攻坚已有计划」且「用户原话点了计划名」才查列表 + 重新调用。
+         *
+         * 为什么是重新调用而不是事后补一个序号：计划定位要模型「看着选项选」，
+         * 后端字符串匹配在同分并列时会退化（"C++" 曾被切成 "c"，与「C语言系统学习计划」同分，
+         * 结果弹卡让用户重选——实测踩过）。宁可让这一小撮消息多等一次调用，
+         * 也不让每条消息都带上计划列表（后者是"普通聊天也塞进 prompt"）。
+         */
+        List<LearningPlans> plans = List.of();
+        if (needsPlanLocating(aiIntent)) {
+            plans = loadActivePlans(userId);
+            if (!plans.isEmpty()) {
+                log.info("意图命中计划定位，二次分类带列表：planRef={}", aiIntent.getLearningPlanRef());
+                AiIntent located = callOnce(message, pageContextDTO, plans);
+                if (located != null && located.getIntent() != null && !located.getIntent().isBlank()) {
+                    aiIntent = located;
+                }
+            }
         }
+
+        resolveLearningPlanId(aiIntent, plans);
         log.info(
                 "AI意图识别结果: intent={}, confidence={}, "
                         + "suggestedAction={}, suggestedWorkflowType={}, "
                         + "risk={}, reason={}, planRef={}, stageRef={}, "
+                        + "planIndex={}, planId={}, "
                         + "actionType={}, articleId={}, authorId={}, userId={}, "
                         + "needsThinking={}, needsThinkingReason={}",
                 aiIntent.getIntent(),
@@ -53,6 +75,8 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                 aiIntent.getReason(),
                 aiIntent.getLearningPlanRef(),
                 aiIntent.getLearningStageRef(),
+                aiIntent.getLearningPlanIndex(),
+                aiIntent.getLearningPlanId(),
                 aiIntent.getActionType(),
                 aiIntent.getArticleId(),
                 aiIntent.getAuthorId(),
@@ -64,18 +88,94 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
         return aiIntent;
     }
 
-    private String callClassifier(String message, PageContextDTO pageContextDTO, boolean repair) {
+    private String callClassifier(String message, PageContextDTO pageContextDTO, List<LearningPlans> plans, boolean repair) {
         try {
             return chatClientBuilder.build()
                     .prompt()
                     .system(buildSystemPrompt(repair))
-                    .user(buildUserPrompt(message, pageContextDTO))
+                    .user(buildUserPrompt(message, pageContextDTO, plans))
+                    //判断链：配了 judge-model 用强模型（换模型导致判分界线漂移的实测见 AiJudgeModelSupport）
+                    .options(aiJudgeModelSupport.applyTo(OpenAiChatOptions.builder()).build())
                     .call()
                     .content();
         } catch (Exception e) {
             log.warn("AI意图识别调用失败", e);
             return null;
         }
+    }
+
+    /**
+     * 一次完整分类：调用 → 解析 → 解析失败则 repair 重试一次 → 仍失败返回 null。
+     *
+     * repair 的理由：模型偶尔把规则/注释文字混进输出，一次失败就降级会让
+     * 「点名单任务」这类诉求静默退化成无能力聊天。
+     */
+    private AiIntent callOnce(String message, PageContextDTO pageContextDTO, List<LearningPlans> plans) {
+        String json = callClassifier(message, pageContextDTO, plans, false);
+        AiIntent intent = json == null ? null : tryParse(json);
+        if (intent != null || json == null) {
+            return intent;
+        }
+        String repaired = callClassifier(message, pageContextDTO, plans, true);
+        if (repaired == null) {
+            return null;
+        }
+        AiIntent repairedIntent = tryParse(repaired);
+        if (repairedIntent != null) {
+            log.warn("AI意图识别 repair 成功：首次输出混入非 JSON 文字，已恢复");
+        }
+        return repairedIntent;
+    }
+
+    /**
+     * 是否需要"带计划列表二次分类"——即这条消息要不要付出计划列表的代价。
+     *
+     * 判据：意图是「调整 / 攻坚已有计划」**且**用户原话点了计划名（learningPlanRef 非空）。
+     * 任一不满足就不查库、不带列表：
+     * - 闲聊 / 文章 / 概念问答 → 与计划无关
+     * - LEARNING_PLAN（新建计划）→ 不涉及已有计划
+     * - 没点名计划（"帮我调整一下计划"）→ 给了列表也选不出，交给下游追问
+     */
+    private boolean needsPlanLocating(AiIntent intent) {
+        String intentName = intent.getIntent();
+        if (!"LEARNING_PROGRESS".equals(intentName) && !"LEARNING_ASSIST".equals(intentName)) {
+            return false;
+        }
+        String planRef = intent.getLearningPlanRef();
+        return planRef != null && !planRef.isBlank();
+    }
+
+    //该用户的 ACTIVE 计划（分类器只做选择，不创建/修改）。查库失败不阻断分类——退化为按原话摘录。
+    //只在"点名了计划"的二次分类里调用（needsPlanLocating），普通聊天不经过这里。
+    private List<LearningPlans> loadActivePlans(Long userId) {
+        if (userId == null) {
+            return List.of();
+        }
+        try {
+            return learningPlansService.listActiveByUserCached(userId);
+        } catch (Exception e) {
+            log.warn("分类器加载用户学习计划失败，本次不注入计划列表，退化为按原话摘录", e);
+            return List.of();
+        }
+    }
+
+    /**
+     * 把模型选中的序号映射为权威 planId（后端独占写权限）。
+     *
+     * 模型不直接输出 ID：雪花 ID 19 位，模型抄写容易少位/错位；序号短且可校验。
+     * 越界或缺失一律丢弃（learningPlanId 保持 null），由调用方落回关键词匹配兜底——后端绝不猜。
+     *
+     * public static 是为了可单测：这里的两条保障（清空防伪造 / 越界丢弃）是安全边界，
+     * 被"优化"掉就是漏洞，必须有测试锁住。
+     */
+    public static void resolveLearningPlanId(AiIntent aiIntent, List<LearningPlans> plans) {
+        // 先清空：即便模型幻觉出 learningPlanId 字段，也不采信——这个字段只能由后端写
+        aiIntent.setLearningPlanId(null);
+        Integer index = aiIntent.getLearningPlanIndex();
+        if (index == null || index < 1 || index > plans.size()) {
+            return;
+        }
+        aiIntent.setLearningPlanId(String.valueOf(plans.get(index - 1).getId()));
     }
 
     private AiIntent tryParse(String json) {
@@ -230,6 +330,22 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 - suggestedAction=AGENT
                                 - suggestedWorkflowType=null
 
+                                当用户要求**分析、评价自己已有学习计划的内容**（只是要分析结论或建议，
+                                **不要求动手改**），例如"帮我分析我的 X 学习计划，看看有没有问题"
+                                "我的 X 计划安排得合理吗""这个计划写得怎么样"时：
+                                - intent=LEARNING_AGENT
+                                - suggestedAction=AGENT
+                                - suggestedWorkflowType=null
+                                Agent 会读取计划内容后给出分析与改进建议（不改任何数据）。
+                                三条分界（易混，务必按判据选）：
+                                - 问"有哪些计划 / 进行到哪了" → LEARNING_PLAN_QUERY（查状态）
+                                - 问"好不好 / 有没有问题 / 哪里不合理" → 本类（要分析结论）
+                                - **要求动手改计划本身** → LEARNING_PROGRESS（要执行），不是本类。
+                                  典型措辞：优化 / 调整 / 改一下 / 压缩 / 重排 + 计划，
+                                  含"**那就按照你的建议优化一下我的计划**"这类承接上轮建议、要动手执行的说法；
+                                  "改"出现在"要你改"里就是 PROGRESS，只有"问你该怎么改"才是本类。
+                                句子里出现"我的X学习计划"不代表就是查询。
+
                                 当用户明确要求勾选 / 取消勾选学习计划中的任务、
                                 标记任务完成 / 取消完成时（V2.4 受控写动作），
                                 或把已有任务改名 / 重命名（V3.3 受控写改名，新名来自用户原话）时：
@@ -247,6 +363,7 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 - “我想学 Redis，帮我制定学习计划” -> LEARNING_PLAN
                                 - “帮我调整第二阶段” -> LEARNING_PROGRESS
                                 - “Redis 跳表我不懂，帮我拆小一点” -> LEARNING_ASSIST
+                                - “帮我分析我的 Agent 学习计划，看看有没有问题” -> LEARNING_AGENT（分析计划内容，不是 PLAN_QUERY）
                                 - “我今天继续学 Redis，帮我安排今天学什么” -> LEARNING_AGENT
                                 - “我下一步学什么” -> LEARNING_AGENT
                                 - “我最近学 Redis 有点乱，帮我理一下” -> LEARNING_AGENT
@@ -364,12 +481,18 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 - intent=LEARNING_PLAN_QUERY
                                 - suggestedAction=TOOL
                                 - suggestedWorkflowType=null
+                                边界：本类只处理「有哪些计划 / 某个计划进行到哪了」这类**列表与状态查询**。
+                                用户要求对计划**内容**做分析、评价、挑问题、给改进建议时，
+                                即使句子里出现"我的X学习计划"，也**不是**本类 → 走 LEARNING_AGENT（见上）。
 
                                 当用户要求调整、压缩、重排、延长、缩短、
                                 重新生成已有学习计划或进度时：
                                 - intent=LEARNING_PROGRESS
                                 - suggestedAction=WORKFLOW
                                 - suggestedWorkflowType=LEARNING_PROGRESS
+                                （本节优先于 LEARNING_AGENT 的"分析计划"：**只要用户是要你动手改计划**，
+                                哪怕话里带"建议 / 分析"字样（如"按你刚才的建议优化一下我的计划"），
+                                也归本类——分析是手段，执行才是诉求。）
                                 （注意：仅把某个已有任务改名 / 重命名且新名来自用户原话 →
                                 不是 LEARNING_PROGRESS，走 LEARNING_AGENT 受控写改名提案；
                                 “调整、压缩、重排”整段/整体结构仍属本类）
@@ -395,6 +518,16 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                                 - learningPlanRef 只能摘录用户原话中的计划名称或关键词
                                 - learningStageRef 只能摘录用户原话中的阶段或任务名称
                                 - 不允许猜测、编造计划名、阶段名或 ID
+
+                                learningPlanIndex（该用户的学习计划列表会在用户问题前给出，按序号编号）：
+                                - 当用户指代了列表里的某个计划时，输出它在列表中的序号（从 1 开始）。
+                                  简称、别名、口语说法都算指代，例如用户说"c++ 计划"或"C加加那个"，
+                                  而列表里有「C++ 系统学习与工程化实践计划」，就输出它的序号
+                                - 用户没提到任何计划，或者你无法确定指代哪一个 → 输出 null
+                                - 列表里没有用户说的那个计划 → 输出 null，不要退而求其次挑一个最接近的
+                                - 序号必须真实存在于列表中，禁止编造；不要输出计划 ID
+                                - 只对 LEARNING_ASSIST / LEARNING_PROGRESS 输出；其他意图一律输出 null
+                                - learningPlanIndex 字段必须输出，没有值时输出 null
 
                                 对模糊学习表达：
                                 例如"我最近学 Redis 有点乱"
@@ -519,7 +652,7 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
                """;
     }
 
-    private String buildUserPrompt(String message,PageContextDTO pageContext){
+    private String buildUserPrompt(String message, PageContextDTO pageContext, List<LearningPlans> plans) {
         StringBuilder sb = new StringBuilder();
         sb.append("页面上下文：\n");
 
@@ -531,6 +664,19 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
             sb.append("articleId=").append(pageContext.getArticleId()).append("\n");
             sb.append("authorId=").append(pageContext.getAuthorId()).append("\n");
             sb.append("userId=").append(pageContext.getUserId()).append("\n");
+        }
+
+        // 该用户真实的 ACTIVE 计划（仅标题 + 序号，不给 ID）：模型据此输出 learningPlanIndex。
+        // 只有"点名了计划"的消息才会带列表上来（见 needsPlanLocating）——普通聊天不含这一段。
+        if (plans != null && !plans.isEmpty()) {
+            sb.append("\n该用户的学习计划列表（按顺序编号）：\n");
+            for (int i = 0; i < plans.size(); i++) {
+                sb.append(i + 1).append(". ").append(plans.get(i).getTitle()).append("\n");
+            }
+        } else {
+            // 显式说明"这次没有列表"：避免模型硬编序号，同时提醒它计划名/阶段名照常按原话摘录
+            sb.append("\n（本次未提供学习计划列表，learningPlanIndex 输出 null；"
+                    + "learningPlanRef / learningStageRef 仍按用户原话摘录）\n");
         }
 
         sb.append("\n用户问题：\n").append(message);

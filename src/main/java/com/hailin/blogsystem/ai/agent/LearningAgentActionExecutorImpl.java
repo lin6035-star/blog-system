@@ -89,7 +89,7 @@ public class LearningAgentActionExecutorImpl implements LearningAgentActionExecu
         // 点名：唯一命中 → 详情；多个命中 → 候选（歧义，不猜）
         if (planRef != null && !planRef.isBlank()) {
             List<LearningPlans> matched =
-                    learningPlansService.matchActivePlansByMessage(userId, planRef);
+                    learningPlansService.matchPlansByMessage(userId, planRef);
             if (matched.size() == 1) {
                 appendPlanDetail(sb, matched.get(0), userId);
                 return sb.toString();

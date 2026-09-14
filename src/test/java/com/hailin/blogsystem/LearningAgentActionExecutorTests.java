@@ -98,7 +98,7 @@ class LearningAgentActionExecutorTests {
     void dashboardWithPlanRefShowsTargetPlanDetail() {
         LearningPlans plan = plan(1L, "Redis 学习计划", "ACTIVE");
         when(learningPlansService.listByUser(100L)).thenReturn(List.of(plan));
-        when(learningPlansService.matchActivePlansByMessage(eq(100L), any()))
+        when(learningPlansService.matchPlansByMessage(eq(100L), any()))
                 .thenReturn(List.of(plan));
         // getDetail 未 mock，返回 null：详情分支容错，不炸
 
@@ -118,7 +118,7 @@ class LearningAgentActionExecutorTests {
         LearningPlans planA = plan(1L, "Redis 学习计划", "ACTIVE");
         LearningPlans planB = plan(2L, "Redis 进阶计划", "ACTIVE");
         when(learningPlansService.listByUser(100L)).thenReturn(List.of(planA, planB));
-        when(learningPlansService.matchActivePlansByMessage(eq(100L), any()))
+        when(learningPlansService.matchPlansByMessage(eq(100L), any()))
                 .thenReturn(List.of(planA, planB));
 
         String observation = executor.execute(
@@ -138,7 +138,7 @@ class LearningAgentActionExecutorTests {
     void dashboardWithoutPlanRefAndSingleActiveShowsDetail() {
         LearningPlans plan = plan(1L, "Redis 学习计划", "ACTIVE");
         when(learningPlansService.listByUser(100L)).thenReturn(List.of(plan));
-        // matchActivePlansByMessage 未 mock，返回 null/空：点名分支不触发
+        // matchPlansByMessage 未 mock，返回 null/空：点名分支不触发
 
         String observation = executor.execute(
                 AgentStepDecision.of(AgentStepActionType.QUERY_LEARNING_DASHBOARD),
@@ -174,7 +174,7 @@ class LearningAgentActionExecutorTests {
         // 必须只提示未找到 + 候选，绝不能 fallback 出《Redis 计划》详情误导 Agent
         LearningPlans plan = plan(1L, "Redis 学习计划", "ACTIVE");
         when(learningPlansService.listByUser(100L)).thenReturn(List.of(plan));
-        when(learningPlansService.matchActivePlansByMessage(eq(100L), any()))
+        when(learningPlansService.matchPlansByMessage(eq(100L), any()))
                 .thenReturn(List.of());
 
         String observation = executor.execute(
