@@ -2,6 +2,7 @@ package com.hailin.blogsystem.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.hailin.blogsystem.component.UserSetCache;
 import com.hailin.blogsystem.constants.RedisConstants;
 import com.hailin.blogsystem.entity.ArticleLikes;
 import com.hailin.blogsystem.entity.Articles;
@@ -15,7 +16,6 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
-import java.util.concurrent.TimeUnit;
 
 @Service
 @RequiredArgsConstructor
@@ -23,6 +23,7 @@ public class ArticleLikesServiceImpl extends ServiceImpl<ArticleLikesMapper, Art
 
     private final ArticlesMapper articlesMapper;
     private final StringRedisTemplate stringRedisTemplate;
+    private final UserSetCache userSetCache;
 
     @Override  //1.点赞文章
     @Transactional
@@ -51,21 +52,15 @@ public class ArticleLikesServiceImpl extends ServiceImpl<ArticleLikesMapper, Art
                 new LambdaUpdateWrapper<Articles>()
                         .eq(Articles::getId, articleId)
                         .setSql("like_count = like_count + 1"));
-        //点赞成功后，将数量加入redis
-        String key = RedisConstants.ARTICLE_LIKED_USER_KEY_PREFIX + userId;
-        stringRedisTemplate.opsForSet().add(key,String.valueOf(articleId));
-
         //点赞成功后，获得对应的score，用户zset排名
         stringRedisTemplate.opsForZSet()
                 .incrementScore(RedisConstants.ARTICLE_HOT_KEY,String.valueOf(articleId),
                         RedisConstants.ARTICLE_LIKE_HOT_SCORE);
 
-        //确认点赞时维护 loaded 后的 Set
-        stringRedisTemplate.opsForSet()
-                .add(RedisConstants.ARTICLE_LIKED_USER_KEY_PREFIX + userId, String.valueOf(articleId));
-
-        stringRedisTemplate.opsForValue()
-                .set(RedisConstants.ARTICLE_LIKED_USER_KEY_PREFIX + userId + ":loaded", "1", 30, TimeUnit.MINUTES);
+        //维护用户点赞集合：仅在集合已加载时同步，未加载时什么都不做——
+        //保持"未加载"让下次读从 DB 全量重建，否则会留下一个只有这一条记录的集合却自称全量
+        userSetCache.addIfLoaded(
+                RedisConstants.ARTICLE_LIKED_USER_KEY_PREFIX + userId, String.valueOf(articleId));
 
         stringRedisTemplate.delete(RedisConstants.ARTICLE_DETAIL_KEY_PREFIX + articleId);
     }
@@ -94,21 +89,14 @@ public class ArticleLikesServiceImpl extends ServiceImpl<ArticleLikesMapper, Art
                         .eq(Articles::getId, articleId)
                         .setSql("like_count = GREATEST(like_count - 1, 0)"));
 
-        //取消点赞后，将数量加入redis
-        String key = RedisConstants.ARTICLE_LIKED_USER_KEY_PREFIX +userId;
-        stringRedisTemplate.opsForSet().remove(key,String.valueOf(articleId));
-
         //取消点赞后，减去对应的score，用户zset排名
         stringRedisTemplate.opsForZSet().incrementScore(RedisConstants.ARTICLE_HOT_KEY,
                 String.valueOf(articleId),
                 RedisConstants.ARTICLE_UNLIKE_HOT_SCORE);
 
-        //取消点赞时维护 loaded 后的 Set
-        stringRedisTemplate.opsForSet()
-                .remove(RedisConstants.ARTICLE_LIKED_USER_KEY_PREFIX + userId, String.valueOf(articleId));
-
-        stringRedisTemplate.opsForValue()
-                .set(RedisConstants.ARTICLE_LIKED_USER_KEY_PREFIX + userId + ":loaded", "1", 30, TimeUnit.MINUTES);
+        //维护用户点赞集合：取消最后一项时状态会转为 EMPTY，不留「全量标记 + 空集合」
+        userSetCache.removeIfLoaded(
+                RedisConstants.ARTICLE_LIKED_USER_KEY_PREFIX + userId, String.valueOf(articleId));
 
         stringRedisTemplate.delete(RedisConstants.ARTICLE_DETAIL_KEY_PREFIX + articleId);
     }

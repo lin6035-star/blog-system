@@ -14,6 +14,7 @@ import com.hailin.blogsystem.mapper.LearningStageMapper;
 import com.hailin.blogsystem.service.LearningPlansService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import com.hailin.blogsystem.component.CacheTtlSupport;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -57,6 +58,7 @@ public class LearningPlansServiceImpl extends ServiceImpl<LearningPlanMapper, Le
     private final LearningStageMapper learningStageMapper;
     private final ObjectMapper objectMapper;
     private final StringRedisTemplate stringRedisTemplate;
+    private final CacheTtlSupport cacheTtlSupport;
 
     //幂等保存，两条覆盖路径：
     //  plan.id 非空（调整已有计划）→ 按 id 覆盖，目标必须存在且属于同一用户
@@ -225,7 +227,7 @@ public class LearningPlansServiceImpl extends ServiceImpl<LearningPlanMapper, Le
             stringRedisTemplate.opsForValue().set(
                     key,
                     objectMapper.writeValueAsString(actives),
-                    Duration.ofMinutes(RedisConstants.LEARNING_PLAN_LIST_TTL_MINUTES));
+                    cacheTtlSupport.jitter(Duration.ofMinutes(RedisConstants.LEARNING_PLAN_LIST_TTL_MINUTES)));
         } catch (Exception e) {
             log.warn("学习计划列表缓存写入失败: userId={}", userId, e);
         }

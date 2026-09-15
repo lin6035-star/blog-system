@@ -4,6 +4,7 @@ import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.hailin.blogsystem.component.CacheTtlSupport;
 import com.hailin.blogsystem.constants.RedisConstants;
 import com.hailin.blogsystem.entity.Category;
 import com.hailin.blogsystem.mapper.CategoryMapper;
@@ -13,14 +14,15 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
+import java.time.Duration;
 import java.util.List;
-import java.util.concurrent.TimeUnit;
 
 @Service
 @RequiredArgsConstructor
 public class CategoryServiceImpl extends ServiceImpl<CategoryMapper, Category> implements CategoryService {
 
     private final StringRedisTemplate stringRedisTemplate;
+    private final CacheTtlSupport cacheTtlSupport;
     private final ObjectMapper objectMapper;
 
     @Override  //获取分类列表
@@ -60,8 +62,7 @@ public class CategoryServiceImpl extends ServiceImpl<CategoryMapper, Category> i
                     .set(
                           RedisConstants.CATEGORY_LIST_KEY,
                           objectMapper.writeValueAsString(list),
-                          RedisConstants.COMMON_LIST_TTL_MINUTES,
-                          TimeUnit.MINUTES
+                          cacheTtlSupport.jitter(Duration.ofMinutes(RedisConstants.COMMON_LIST_TTL_MINUTES))
                     );
 
         }catch(Exception e){

@@ -121,6 +121,48 @@ class ArticlesControllerTests {
         }
     }
 
+    @Test
+    void hiddenArticleNullCacheDoesNotBlockOwnerPreview() throws Exception {
+        setHidden(1L);
+        try {
+            mockMvc.perform(get("/api/articles/1"))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.code").value(40400));
+
+            String authorToken = jwtUtil.generateToken(100L);
+            mockMvc.perform(get("/api/articles/1")
+                            .header("Authorization", "Bearer " + authorToken))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.code").value(0))
+                    .andExpect(jsonPath("$.data.id").value(1));
+        } finally {
+            restorePublished(1L);
+        }
+    }
+
+    @Test
+    void visibilityNullCacheIsStableForOtherLoggedInUser() throws Exception {
+        setHidden(1L);
+        try {
+            stringRedisTemplate.opsForValue().set(
+                    RedisConstants.ARTICLE_DETAIL_KEY_PREFIX + 1,
+                    RedisConstants.CACHE_NULL_VALUE + ":invisible:100:2"
+            );
+
+            String readerToken = jwtUtil.generateToken(101L);
+            mockMvc.perform(get("/api/articles/1")
+                            .header("Authorization", "Bearer " + readerToken))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.code").value(40400));
+
+            org.assertj.core.api.Assertions.assertThat(
+                            stringRedisTemplate.opsForValue().get(RedisConstants.ARTICLE_DETAIL_KEY_PREFIX + 1))
+                    .isEqualTo(RedisConstants.CACHE_NULL_VALUE + ":invisible:100:2");
+        } finally {
+            restorePublished(1L);
+        }
+    }
+
     /** 隐藏文章并清详情缓存（模拟 hideArticle 副作用，避免命中旧 PUBLISHED 缓存） */
     private void setHidden(Long id) {
         Articles article = articlesService.getById(id);

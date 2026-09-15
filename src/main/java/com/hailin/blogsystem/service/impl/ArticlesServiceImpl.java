@@ -9,6 +9,9 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.hailin.blogsystem.ai.rag.ArticleRagIndexService;
 import com.hailin.blogsystem.ai.rag.ArticleRagSyncService;
+import com.hailin.blogsystem.component.CacheTtlSupport;
+import com.hailin.blogsystem.component.RedisKeyScanner;
+import com.hailin.blogsystem.component.UserSetCache;
 import com.hailin.blogsystem.constants.BlogConstants;
 import com.hailin.blogsystem.constants.RedisConstants;
 import com.hailin.blogsystem.entity.*;
@@ -21,14 +24,18 @@ import com.hailin.blogsystem.utils.UserContext;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Duration;
 import java.time.LocalDateTime;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -37,6 +44,51 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 @Slf4j
 public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> implements ArticlesService {
+
+    /** 详情缓存互斥锁 TTL：短 TTL——持锁进程崩溃后最多 5 秒自动释放（对比 Workflow 锁的 120s） */
+    private static final long DETAIL_LOCK_TTL_SECONDS = 5L;
+    /** 未抢到锁时的短轮询：50ms × 10 ≈ 500ms 上限，超时 fail-open 自己查库 */
+    private static final long DETAIL_LOCK_POLL_INTERVAL_MILLIS = 50L;
+    private static final int DETAIL_LOCK_POLL_MAX_ATTEMPTS = 10;
+    private static final String DETAIL_NULL_NOT_FOUND_VALUE = RedisConstants.CACHE_NULL_VALUE + ":not_found";
+    private static final String DETAIL_NULL_INVISIBLE_PREFIX = RedisConstants.CACHE_NULL_VALUE + ":invisible:";
+
+    /** 释放锁：只有 token 匹配才删——否则慢请求会删掉别人的锁，互斥形同虚设 */
+    private static final DefaultRedisScript<Long> UNLOCK_SCRIPT = new DefaultRedisScript<>(
+            """
+            if redis.call('get', KEYS[1]) == ARGV[1] then
+                return redis.call('del', KEYS[1])
+            else
+                return 0
+            end
+            """,
+            Long.class
+    );
+
+    /** 浏览量自增 + 兜底 TTL（一次 Lua 完成，避免 INCR 与 EXPIRE 之间的故障与竞态）。
+     *  判 TTL &lt; 0 而非 INCR == 1：后者补不上"上线前就存在的无 TTL 旧 key"。 */
+    private static final DefaultRedisScript<Long> VIEW_INCR_SCRIPT = new DefaultRedisScript<>(
+            """
+            local current = redis.call('INCR', KEYS[1])
+            if redis.call('TTL', KEYS[1]) < 0 then
+                redis.call('EXPIRE', KEYS[1], ARGV[1])
+            end
+            return current
+            """,
+            Long.class
+    );
+
+    /** 原子取走浏览量增量：GET + DEL 一次 Lua（GETDEL 需 Redis 6.2+，这里兼容更低版本） */
+    private static final DefaultRedisScript<String> VIEW_TAKE_SCRIPT = new DefaultRedisScript<>(
+            """
+            local value = redis.call('GET', KEYS[1])
+            if value then
+                redis.call('DEL', KEYS[1])
+            end
+            return value
+            """,
+            String.class
+    );
 
     private final UsersMapper usersMapper;
     private final CategoryMapper categoryMapper;
@@ -48,6 +100,12 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
     private final ObjectMapper objectMapper;
 
     private final StringRedisTemplate stringRedisTemplate;
+
+    private final CacheTtlSupport cacheTtlSupport;
+
+    private final RedisKeyScanner redisKeyScanner;
+
+    private final UserSetCache userSetCache;
 
     @Override  //1.获取公开文章列表
     public PageVO<ArticleDetailVO> getArticles(Long page, Long pageSize, String keyword, Long categoryId, String sort) {  //1.获取公开文章列表
@@ -146,64 +204,49 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
                     .set(
                             key,
                             objectMapper.writeValueAsString(pageVO),
-                            RedisConstants.ARTICLE_LIST_TTL_MINUTES,
-                            TimeUnit.MINUTES
+                            cacheTtlSupport.jitter(Duration.ofMinutes(RedisConstants.ARTICLE_LIST_TTL_MINUTES))
                     );
         }catch(Exception e){
             // 缓存失败不影响文章列表返回
         }
     }
 
+    /** 文章详情缓存的读取结果（三态）——必须区分"空值缓存"与"未命中"，两者后续动作完全不同 */
+    private enum CacheReadState { HIT, NULL_CACHED, MISS }
+
+    private record DetailCacheRead(CacheReadState state, ArticleDetailVO value) {
+        static DetailCacheRead hit(ArticleDetailVO value) {
+            return new DetailCacheRead(CacheReadState.HIT, value);
+        }
+
+        static DetailCacheRead nullCached() {
+            return new DetailCacheRead(CacheReadState.NULL_CACHED, null);
+        }
+
+        static DetailCacheRead miss() {
+            return new DetailCacheRead(CacheReadState.MISS, null);
+        }
+    }
+
     @Override  //2.获取公开文章详情
     public ArticleDetailVO getPublicArticleById(Long id) {  //2.获取公开文章详情
 
-        String key = RedisConstants.ARTICLE_DETAIL_KEY_PREFIX + id;
-        String json = null;
+        DetailCacheRead read = readArticleDetailCache(id);
 
-        try{
-            json = stringRedisTemplate.opsForValue().get(key);
-        }
-        catch (Exception e){
-            // Redis读取失败不影响文章详情，继续走缓存未命中的 DB 查询逻辑
-        }
+        DetailCacheRead result = read.state() == CacheReadState.HIT
+                ? read
+                : loadArticleDetailWithMutex(id);
 
-        if(RedisConstants.CACHE_NULL_VALUE.equals(json)){
-            // 登录用户可能是文章作者（隐藏文章对本人可见，V3.7 修复）：删空值缓存回源一次——
-            // 非作者访问会由 DB 路径重写空值缓存，无泄露
-            if (UserContext.get() == null) {
-                return null;
-            }
-            try {
-                stringRedisTemplate.delete(key);
-            } catch (Exception e) {
-                // Redis 删除失败不影响：下面继续走 DB 查询
-            }
+        if (result.state() != CacheReadState.HIT) {
+            // NULL_CACHED = 文章不存在 / 当前身份不可见；MISS = 兜底（正常不会走到）
+            return null;
         }
 
-        ArticleDetailVO vo = getArticleDetailFromCache(id);
+        ArticleDetailVO vo = result.value();
 
         Long userId = UserContext.get();
-        if(vo == null){
-            vo = getArticleDetailFromDb(id);
-
-            if(vo == null){
-                return null;
-            }
-            // 共享缓存写入已内聚到 getArticleDetailFromDb（仅 PUBLISHED 写，防隐藏文章缓存泄露）
-        }
-
-        if(userId == null || !userId.equals(vo.getAuthorId())){
-            String viewKey = RedisConstants.ARTICLE_VIEW_KEY_PREFIX + id;
-            try{
-                stringRedisTemplate.opsForValue().increment(viewKey);
-
-                stringRedisTemplate.opsForZSet()
-                        .incrementScore(RedisConstants.ARTICLE_HOT_KEY,
-                                String.valueOf(id),
-                                RedisConstants.ARTICLE_VIEW_HOT_SCORE);
-            }catch(Exception e){
-                // Redis统计失败不影响文章详情返回
-            }
+        if (userId == null || !userId.equals(vo.getAuthorId())) {
+            recordArticleView(id);
         }
 
         fillArticleLiked(vo);
@@ -211,6 +254,180 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
         fillArticleViewCount(List.of(vo));
 
         return vo;
+    }
+
+    /**
+     * 文章详情缓存的**唯一**读入口（三态）。
+     *
+     * 收口的原因：原先读路径有两条（外层判空值 + getArticleDetailFromCache 内部再读一次），
+     * 互斥回源的轮询就是第三条——三条对"空值 / 反序列化失败"的处理必须一致。否则轮询路径
+     * 读到空值走反序列化，会触发"解析失败即删 key"，把别人刚写好的空值缓存误删，互斥自我破坏。
+     *
+     * 空值缓存的身份语义也收口在这里：不存在文章对所有身份都是空；隐藏 / 草稿等不可见文章
+     * 会缓存作者与状态，只有"隐藏文章作者本人预览"才绕过空值回源，避免普通登录用户绕开空值缓存。
+     */
+    private DetailCacheRead readArticleDetailCache(Long id) {
+        String key = RedisConstants.ARTICLE_DETAIL_KEY_PREFIX + id;
+        String json;
+
+        try {
+            json = stringRedisTemplate.opsForValue().get(key);
+        } catch (Exception e) {
+            // Redis 读取失败 → 当作未命中，交给 DB 路径（fail-open）
+            return DetailCacheRead.miss();
+        }
+
+        if (json == null || json.isBlank()) {
+            return DetailCacheRead.miss();
+        }
+
+        if (isArticleDetailNullCache(json)) {
+            return readArticleDetailNullCache(id, json);
+        }
+
+        try {
+            return DetailCacheRead.hit(objectMapper.readValue(json, ArticleDetailVO.class));
+        } catch (JsonProcessingException e) {
+            // 脏数据自愈：留着每次都会解析失败，删掉让下次走 DB 重建
+            try {
+                stringRedisTemplate.delete(key);
+            } catch (Exception ignored) {
+                // 删除失败不影响本次返回
+            }
+            return DetailCacheRead.miss();
+        }
+    }
+
+    private boolean isArticleDetailNullCache(String json) {
+        return RedisConstants.CACHE_NULL_VALUE.equals(json)
+                || DETAIL_NULL_NOT_FOUND_VALUE.equals(json)
+                || json.startsWith(DETAIL_NULL_INVISIBLE_PREFIX);
+    }
+
+    private DetailCacheRead readArticleDetailNullCache(Long id, String value) {
+        if (DETAIL_NULL_NOT_FOUND_VALUE.equals(value)) {
+            return DetailCacheRead.nullCached();
+        }
+
+        if (value.startsWith(DETAIL_NULL_INVISIBLE_PREFIX)) {
+            String[] parts = value.substring(DETAIL_NULL_INVISIBLE_PREFIX.length()).split(":", 2);
+            if (parts.length == 2) {
+                try {
+                    Long authorId = Long.valueOf(parts[0]);
+                    Integer status = Integer.valueOf(parts[1]);
+                    Long viewerId = UserContext.get();
+                    if (Objects.equals(status, BlogConstants.ArticlesStatus.HIDDEN)
+                            && viewerId != null
+                            && viewerId.equals(authorId)) {
+                        deleteArticleDetailCache(id);
+                        return DetailCacheRead.miss();
+                    }
+                    return DetailCacheRead.nullCached();
+                } catch (NumberFormatException ignored) {
+                    // 脏空值缓存，删掉后回源自愈
+                    deleteArticleDetailCache(id);
+                    return DetailCacheRead.miss();
+                }
+            }
+        }
+
+        if (UserContext.get() == null) {
+            return DetailCacheRead.nullCached();
+        }
+        // 兼容旧版 "__NULL__"：无法判断是否隐藏文章作者，只能回源一次并由新格式重写。
+        deleteArticleDetailCache(id);
+        return DetailCacheRead.miss();
+    }
+
+    /**
+     * 互斥回源（防击穿）：同一篇文章只让一个请求查库重建，其余请求短轮询等待缓存被填好；
+     * 轮询超时则 fail-open 自己查库——宁可退化，不让人等死。
+     *
+     * 注意：作者看自己的隐藏文章不会写共享缓存，因此该场景下轮询必然等到超时再回源——
+     * 属于预期行为（低频场景），不是缺陷。
+     */
+    private DetailCacheRead loadArticleDetailWithMutex(Long id) {
+        String lockKey = RedisConstants.CACHE_LOCK_ARTICLE_DETAIL_KEY_PREFIX + id;
+        String token = UUID.randomUUID().toString();
+
+        boolean locked;
+        try {
+            locked = Boolean.TRUE.equals(stringRedisTemplate.opsForValue()
+                    .setIfAbsent(lockKey, token, DETAIL_LOCK_TTL_SECONDS, TimeUnit.SECONDS));
+        } catch (Exception e) {
+            // 锁不可用不能挡住用户看文章：直接回源
+            return loadDetailFromDb(id);
+        }
+
+        if (!locked) {
+            DetailCacheRead polled = pollArticleDetailCache(id);
+            if (polled.state() != CacheReadState.MISS) {
+                return polled;
+            }
+            // 轮询超时：持锁请求可能失败了，自己回源（fail-open）
+            return loadDetailFromDb(id);
+        }
+
+        try {
+            return loadDetailFromDb(id);
+        } finally {
+            releaseLock(lockKey, token);
+        }
+    }
+
+    /**
+     * 未抢到锁时的短轮询（50ms × 10 ≈ 500ms 上限）。
+     * 必须走统一读入口——轮询路径若自己反序列化，会把空值缓存当脏数据删掉。
+     */
+    private DetailCacheRead pollArticleDetailCache(Long id) {
+        for (int i = 0; i < DETAIL_LOCK_POLL_MAX_ATTEMPTS; i++) {
+            try {
+                Thread.sleep(DETAIL_LOCK_POLL_INTERVAL_MILLIS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return DetailCacheRead.miss();
+            }
+
+            DetailCacheRead read = readArticleDetailCache(id);
+            if (read.state() != CacheReadState.MISS) {
+                // HIT = 别人填好了详情；NULL_CACHED = 持锁者确认了不可见（登录用户已在读入口转成 MISS）
+                return read;
+            }
+        }
+        return DetailCacheRead.miss();
+    }
+
+    /** 查 DB 并把结果转成读结果：共享缓存与空值缓存的写入已内聚在 getArticleDetailFromDb */
+    private DetailCacheRead loadDetailFromDb(Long id) {
+        ArticleDetailVO vo = getArticleDetailFromDb(id);
+        return vo == null ? DetailCacheRead.nullCached() : DetailCacheRead.hit(vo);
+    }
+
+    /** 释放锁：Lua 校验 token，防止慢请求删掉别人的锁 */
+    private void releaseLock(String lockKey, String token) {
+        try {
+            stringRedisTemplate.execute(UNLOCK_SCRIPT, Collections.singletonList(lockKey), token);
+        } catch (Exception e) {
+            // 释放失败由锁 TTL 兜底，不影响本次返回
+        }
+    }
+
+    /** 浏览量：自增 + 兜底 TTL 一次 Lua 完成（分两次调用会在中间故障 / 竞态时留下无 TTL 的 key） */
+    private void recordArticleView(Long id) {
+        try {
+            stringRedisTemplate.execute(
+                    VIEW_INCR_SCRIPT,
+                    Collections.singletonList(RedisConstants.ARTICLE_VIEW_KEY_PREFIX + id),
+                    String.valueOf(TimeUnit.MINUTES.toSeconds(RedisConstants.ARTICLE_VIEW_TTL_MINUTES))
+            );
+
+            stringRedisTemplate.opsForZSet()
+                    .incrementScore(RedisConstants.ARTICLE_HOT_KEY,
+                            String.valueOf(id),
+                            RedisConstants.ARTICLE_VIEW_HOT_SCORE);
+        } catch (Exception e) {
+            // Redis统计失败不影响文章详情返回
+        }
     }
 
 
@@ -292,17 +509,8 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
         }
 
         String key = RedisConstants.ARTICLE_LIKED_USER_KEY_PREFIX + currentUserId;
-        String loadedKey = key + ":loaded";
-
-        Set<String> likedIdStrings = null;
-
-        try{
-            if(Boolean.TRUE.equals(stringRedisTemplate.hasKey(loadedKey))){
-                likedIdStrings = stringRedisTemplate.opsForSet().members(key);
-            }
-        }catch(Exception e){
-            // Redis读取失败，下面兜底查数据库
-        }
+        // 三态：null = 未加载或状态不可信（下面回源）；空 Set = 确认没点过赞；非空 = 命中
+        Set<String> likedIdStrings = userSetCache.readIfLoaded(key);
 
         if(likedIdStrings == null){
             List<ArticleLikes> likes = articleLikesMapper.selectList(
@@ -313,20 +521,10 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
                     .map(like -> String.valueOf(like.getArticleId()))
                     .collect(Collectors.toSet());
 
-            try{
-                if(!likedIdStrings.isEmpty()){
-                    stringRedisTemplate.opsForSet().add(key,likedIdStrings.toArray(new String[0]));
-                }
-
-                stringRedisTemplate.opsForValue().set(loadedKey, "1", 30, TimeUnit.MINUTES);
-            }catch(Exception e){
-                // Redis回填失败不影响点赞状态计算
-            }
+            userSetCache.markLoaded(key, likedIdStrings);
         }
 
-        Set<Long> likedArticleIds = likedIdStrings == null
-                ? Set.of()
-                : likedIdStrings.stream()
+        Set<Long> likedArticleIds = likedIdStrings.stream()
                 .map(Long::valueOf)
                 .collect(Collectors.toSet());
 
@@ -362,17 +560,8 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
         }
 
         String key = RedisConstants.ARTICLE_FAVORITED_USER_KEY_PREFIX + currentUserId;
-        String loadedKey = key + ":loaded";
-
-        Set<String> favoritedIdStrings = null;
-
-        try{
-            if (Boolean.TRUE.equals(stringRedisTemplate.hasKey(loadedKey))) {
-                favoritedIdStrings = stringRedisTemplate.opsForSet().members(key);
-            }
-        }catch(Exception e){
-            // Redis读取失败，下面兜底查数据库
-        }
+        // 三态：null = 未加载或状态不可信（下面回源）；空 Set = 确认没收藏过；非空 = 命中
+        Set<String> favoritedIdStrings = userSetCache.readIfLoaded(key);
 
         if(favoritedIdStrings == null){
             List<ArticleFavorites> favorites = articleFavoritesMapper.selectList(
@@ -384,26 +573,10 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
                     .map(favorite -> String.valueOf(favorite.getArticleId()))
                     .collect(Collectors.toSet());
 
-            try{
-                if (!favoritedIdStrings.isEmpty()) {
-                    stringRedisTemplate.opsForSet()
-                            .add(key, favoritedIdStrings.toArray(new String[0]));
-                }
-
-                stringRedisTemplate.opsForValue().set(
-                        loadedKey,
-                        "1",
-                        30,
-                        TimeUnit.MINUTES
-                );
-            }catch(Exception e){
-                // Redis回填失败不影响收藏状态计算
-            }
+            userSetCache.markLoaded(key, favoritedIdStrings);
         }
 
-        Set<Long> favoritedArticleIds = favoritedIdStrings == null
-                ? Set.of()
-                : favoritedIdStrings.stream()
+        Set<Long> favoritedArticleIds = favoritedIdStrings.stream()
                 .map(Long::valueOf)
                 .collect(Collectors.toSet());
 
@@ -919,32 +1092,51 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
 
     @Override  //将存储在redis的浏览量加入到数据库，改数据库
     public void syncViewCountToDb(){
-        Set<String> keys = stringRedisTemplate.keys(RedisConstants.ARTICLE_VIEW_KEY_PREFIX + "*");
+        // SCAN 游标迭代。原 KEYS 每 30 秒全库阻塞一次 Redis 服务端单线程
+        List<String> keys = redisKeyScanner.scan(RedisConstants.ARTICLE_VIEW_KEY_PREFIX + "*");
 
-        if(keys == null || keys.isEmpty())
+        if(keys.isEmpty())
             return;
 
-        String redisViewCount;
+        int dropped = 0;
         for(String key : keys){
-            redisViewCount = stringRedisTemplate.opsForValue().get(key);
-
-            if(redisViewCount == null)
+            // 先原子取走再更库：中途失败的方向是"丢一次增量"，而不是"key 没删掉→下次重复累加"。
+            // SCAN 可能重复返回同一 key——重复时这里返回 null，天然幂等
+            String incrementStr = takeViewIncrement(key);
+            if(incrementStr == null)
                 continue;
 
-            Long articleId = Long.valueOf(key.substring(RedisConstants.ARTICLE_VIEW_KEY_PREFIX.length()));
-            Integer increment = Integer.valueOf(redisViewCount);
+            try{
+                int increment = Integer.valueOf(incrementStr);
+                if(increment <= 0){
+                    continue;
+                }
 
-            if(increment <= 0){
-                stringRedisTemplate.delete(key);
-                continue;
+                Long articleId = Long.valueOf(key.substring(RedisConstants.ARTICLE_VIEW_KEY_PREFIX.length()));
+
+                lambdaUpdate()
+                        .eq(Articles::getId,articleId)
+                        .setSql("view_count = view_count + " + increment)
+                        .update();
+            }catch(Exception e){
+                // 单个 key 失败不中断整轮（原先循环体内无容错，一次异常会让后面的 key 全部不同步）
+                dropped++;
+                log.warn("浏览量同步失败，本次增量丢弃: key={} value={}", key, incrementStr, e);
             }
+        }
 
-            lambdaUpdate()
-                    .eq(Articles::getId,articleId)
-                    .setSql("view_count = view_count + " + increment)
-                    .update();
+        if(dropped > 0){
+            log.warn("浏览量同步完成，本轮丢弃 {} 个 key 的增量（浏览量是可接受丢失的近似统计）", dropped);
+        }
+    }
 
-            stringRedisTemplate.delete(key);
+    /** 原子取走浏览量增量：GET + DEL 一次 Lua（不依赖 Redis 6.2+ 的 GETDEL 命令） */
+    private String takeViewIncrement(String key){
+        try{
+            return stringRedisTemplate.execute(VIEW_TAKE_SCRIPT, Collections.singletonList(key));
+        }catch(Exception e){
+            log.warn("浏览量增量取走失败，跳过该 key: {}", key, e);
+            return null;
         }
     }
 
@@ -954,7 +1146,18 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
                 .eq(Articles::getStatus, BlogConstants.ArticlesStatus.PUBLISHED)
                 .list();
 
-        stringRedisTemplate.delete(RedisConstants.ARTICLE_HOT_KEY);
+        //先建临时榜，建完原子替换。原实现是「先 delete 旧榜 → 再逐篇写入」，
+        //中间窗口读热度榜会读到空榜
+        String tmpKey = RedisConstants.ARTICLE_HOT_KEY + ":rebuilding";
+
+        //清掉上一轮可能残留的临时榜（重建中途失败会留下）
+        stringRedisTemplate.delete(tmpKey);
+
+        if(articles.isEmpty()){
+            //空榜边界：没有已发布文章时临时 key 不会被创建，不能 RENAME 一个不存在的 key
+            stringRedisTemplate.delete(RedisConstants.ARTICLE_HOT_KEY);
+            return;
+        }
 
         for(Articles article : articles){
             String viewKey = RedisConstants.ARTICLE_VIEW_KEY_PREFIX + article.getId();
@@ -970,10 +1173,11 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
                             + safe(article.getCommentCount()) * RedisConstants.ARTICLE_COMMENT_HOT_SCORE;
 
             stringRedisTemplate.opsForZSet()
-                    .add(RedisConstants.ARTICLE_HOT_KEY, String.valueOf(article.getId()), score);
+                    .add(tmpKey, String.valueOf(article.getId()), score);
         }
 
-
+        //RENAME 原子：读方要么看到旧榜、要么看到新榜，不会看到空榜
+        stringRedisTemplate.rename(tmpKey, RedisConstants.ARTICLE_HOT_KEY);
     }
 
     private int safe(Integer value) {
@@ -991,7 +1195,7 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
                 .one();
 
         if(articles == null){
-            writeNullDetailCache(id);
+            writeNullDetailCache(id, DETAIL_NULL_NOT_FOUND_VALUE);
             return null;
         }
 
@@ -1000,7 +1204,7 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
         boolean hiddenOwner = Objects.equals(articles.getStatus(), BlogConstants.ArticlesStatus.HIDDEN)
                 && viewerId != null && viewerId.equals(articles.getAuthorId());
         if(!published && !hiddenOwner){
-            writeNullDetailCache(id);
+            writeNullDetailCache(id, buildInvisibleNullCacheValue(articles));
             return null;
         }
 
@@ -1015,45 +1219,20 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
         return vo;
     }
 
+    private String buildInvisibleNullCacheValue(Articles articles) {
+        return DETAIL_NULL_INVISIBLE_PREFIX + articles.getAuthorId() + ":" + articles.getStatus();
+    }
+
     /** 文章详情空值缓存（防穿透；游客/非作者访问隐藏文章、草稿、不存在时写） */
-    private void writeNullDetailCache(Long id){
+    private void writeNullDetailCache(Long id, String value){
         try{
             stringRedisTemplate.opsForValue().set(
                     RedisConstants.ARTICLE_DETAIL_KEY_PREFIX + id,
-                    RedisConstants.CACHE_NULL_VALUE,
-                    RedisConstants.CACHE_NULL_TTL_MINUTES,
-                    TimeUnit.MINUTES
+                    value,
+                    cacheTtlSupport.jitter(Duration.ofMinutes(RedisConstants.CACHE_NULL_TTL_MINUTES))
             );
         }catch(Exception e){
             // 空值缓存写入失败不影响查询结果
-        }
-    }
-
-    //从缓存中拿文章详情的方法
-    private ArticleDetailVO getArticleDetailFromCache(Long id){
-        String key = RedisConstants.ARTICLE_DETAIL_KEY_PREFIX + id;
-        String json = null;
-
-        try{
-            json = stringRedisTemplate.opsForValue().get(key);
-        }catch(Exception e){
-            // Redis读取失败，交给外层继续查数据库
-            return null;
-        }
-
-        if(json == null || json.isBlank()){
-            return null;
-        }
-
-        try{
-            return objectMapper.readValue(json,ArticleDetailVO.class);
-        } catch (JsonProcessingException e) {
-            try{
-                stringRedisTemplate.delete(key); //这里为什么解析失败要删缓存？
-            }catch(Exception ignored){
-                // Redis删除失败不影响，交给外层继续查数据库
-            }
-            return null;  //因为 Redis 里如果有脏数据，继续留着每次都会解析失败。删掉后下次可以走数据库重建
         }
     }
 
@@ -1071,8 +1250,7 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
                     .set(
                             key,
                             json,
-                            RedisConstants.ARTICLE_DETAIL_TTL_MINUTES,
-                            TimeUnit.MINUTES
+                            cacheTtlSupport.jitter(Duration.ofMinutes(RedisConstants.ARTICLE_DETAIL_TTL_MINUTES))
                     );
         } catch(Exception e){
             //缓存失败不影响，后面可直接查询数据
@@ -1088,14 +1266,9 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
         }
     }
     private void deleteArticleListCache() {
-        try{
-            Set<String> keys = stringRedisTemplate.keys(RedisConstants.ARTICLE_LIST_KEY_PREFIX + "*");
-            if(keys != null && !keys.isEmpty()){
-                stringRedisTemplate.delete(keys);
-            }
-        }catch(Exception e){
-            // Redis删除失败不影响文章变更本身
-        }
+        // SCAN 游标迭代 + UNLINK 异步回收。原 KEYS 会阻塞 Redis 服务端单线程，
+        // 连带卡住同实例上的限流、分布式锁与其它缓存
+        redisKeyScanner.scanAndDelete(RedisConstants.ARTICLE_LIST_KEY_PREFIX + "*");
     }
 
     //但如果 ES 没开、Embedding API 超时、额度没了，现在可能会导致“文章发布失败”

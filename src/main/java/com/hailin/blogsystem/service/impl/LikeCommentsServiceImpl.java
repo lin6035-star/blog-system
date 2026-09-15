@@ -1,6 +1,7 @@
 package com.hailin.blogsystem.service.impl;
 
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.hailin.blogsystem.component.UserSetCache;
 import com.hailin.blogsystem.constants.RedisConstants;
 import com.hailin.blogsystem.entity.ArticleComments;
 import com.hailin.blogsystem.entity.CommentLikes;
@@ -9,19 +10,17 @@ import com.hailin.blogsystem.mapper.LikeCommentsMapper;
 import com.hailin.blogsystem.service.LikeCommentsService;
 import com.hailin.blogsystem.utils.UserContext;
 import lombok.RequiredArgsConstructor;
-import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
-import java.util.concurrent.TimeUnit;
 
 @Service
 @RequiredArgsConstructor
 public class LikeCommentsServiceImpl extends ServiceImpl<LikeCommentsMapper, CommentLikes> implements LikeCommentsService {
 
     private final CommentsMapper commentsMapper;
-    private final StringRedisTemplate stringRedisTemplate;
+    private final UserSetCache userSetCache;
 
     @Override  //1.点赞评论，登录用户可访问
     @Transactional
@@ -46,14 +45,11 @@ public class LikeCommentsServiceImpl extends ServiceImpl<LikeCommentsMapper, Com
 
         save(commentLikes);
 
+        //维护用户评论点赞集合：仅在集合已加载时同步，未加载时什么都不做——
+        //保持"未加载"让下次读从 DB 全量重建，否则会留下一个只有这一条记录的集合却自称全量
         Long userId = UserContext.get();
-        String key = RedisConstants.COMMENT_LIKED_USER_KEY_PREFIX + userId;
-
-        stringRedisTemplate.opsForSet()
-                .add(key,String.valueOf(commentId));
-
-        stringRedisTemplate.opsForValue()
-                .set(key + ":loaded", "1", 30, TimeUnit.MINUTES);
+        userSetCache.addIfLoaded(
+                RedisConstants.COMMENT_LIKED_USER_KEY_PREFIX + userId, String.valueOf(commentId));
     }
 
 
@@ -72,13 +68,9 @@ public class LikeCommentsServiceImpl extends ServiceImpl<LikeCommentsMapper, Com
             commentsMapper.updateById(comment);
         }
 
+        //维护用户评论点赞集合：取消最后一项时状态会转为 EMPTY，不留「全量标记 + 空集合」
         Long userId = UserContext.get();
-        String key = RedisConstants.COMMENT_LIKED_USER_KEY_PREFIX + userId;
-
-        stringRedisTemplate.opsForSet()
-                .remove(key, String.valueOf(commentId));
-
-        stringRedisTemplate.opsForValue()
-                .set(key + ":loaded", "1", 30, TimeUnit.MINUTES);
+        userSetCache.removeIfLoaded(
+                RedisConstants.COMMENT_LIKED_USER_KEY_PREFIX + userId, String.valueOf(commentId));
     }
 }

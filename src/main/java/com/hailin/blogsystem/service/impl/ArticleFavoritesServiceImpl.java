@@ -2,6 +2,7 @@ package com.hailin.blogsystem.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.hailin.blogsystem.component.UserSetCache;
 import com.hailin.blogsystem.constants.RedisConstants;
 import com.hailin.blogsystem.entity.ArticleFavorites;
 import com.hailin.blogsystem.entity.Articles;
@@ -14,7 +15,6 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
-import java.util.concurrent.TimeUnit;
 
 @Service
 @RequiredArgsConstructor
@@ -22,6 +22,7 @@ public class ArticleFavoritesServiceImpl extends ServiceImpl<ArticleFavoritesMap
 
     private final ArticlesMapper articlesMapper;
     private final StringRedisTemplate stringRedisTemplate;
+    private final UserSetCache userSetCache;
 
     @Override  //1.收藏文章
     public void favoriteArticle(Long articleId) {
@@ -44,21 +45,14 @@ public class ArticleFavoritesServiceImpl extends ServiceImpl<ArticleFavoritesMap
                 new LambdaUpdateWrapper<Articles>()
                         .eq(Articles::getId,articleId)
                         .setSql("favorite_count = favorite_count + 1"));
-        //收藏成功后，将数量加入redis
-        String key = RedisConstants.ARTICLE_FAVORITED_USER_KEY_PREFIX + userId;
-        stringRedisTemplate.opsForSet()
-                        .add(key,String.valueOf(articleId));
-
         //点击收藏增加相应的score分数
         stringRedisTemplate.opsForZSet().incrementScore(RedisConstants.ARTICLE_HOT_KEY,
                 String.valueOf(articleId),RedisConstants.ARTICLE_FAVORITE_HOT_SCORE);
 
-        //确认收藏时维护 loaded 后的 Set
-        stringRedisTemplate.opsForSet()
-                .add(RedisConstants.ARTICLE_FAVORITED_USER_KEY_PREFIX + userId, String.valueOf(articleId));
-
-        stringRedisTemplate.opsForValue()
-                .set(RedisConstants.ARTICLE_FAVORITED_USER_KEY_PREFIX + userId + ":loaded", "1", 30, TimeUnit.MINUTES);
+        //维护用户收藏集合：仅在集合已加载时同步，未加载时什么都不做——
+        //保持"未加载"让下次读从 DB 全量重建，否则会留下一个只有这一条记录的集合却自称全量
+        userSetCache.addIfLoaded(
+                RedisConstants.ARTICLE_FAVORITED_USER_KEY_PREFIX + userId, String.valueOf(articleId));
 
         stringRedisTemplate.delete(RedisConstants.ARTICLE_DETAIL_KEY_PREFIX + articleId);
     }
@@ -82,22 +76,13 @@ public class ArticleFavoritesServiceImpl extends ServiceImpl<ArticleFavoritesMap
                 new LambdaUpdateWrapper<Articles>().eq(Articles::getId,articleId)
                         .setSql("favorite_count = GREATEST(favorite_count - 1, 0)"));
 
-        //收藏失败后，将数量加入redis
-        String key = RedisConstants.ARTICLE_FAVORITED_USER_KEY_PREFIX + userId;
-        stringRedisTemplate.opsForSet()
-                        .remove(key,String.valueOf(articleId));
-
         //点击取消收藏增加相应的score分数
         stringRedisTemplate.opsForZSet().incrementScore(RedisConstants.ARTICLE_HOT_KEY,
                 String.valueOf(articleId),RedisConstants.ARTICLE_UNFAVORITE_HOT_SCORE);
 
-
-        //取消收藏时维护 loaded 后的 Set
-        stringRedisTemplate.opsForSet()
-                .remove(RedisConstants.ARTICLE_FAVORITED_USER_KEY_PREFIX + userId, String.valueOf(articleId));
-
-        stringRedisTemplate.opsForValue()
-                .set(RedisConstants.ARTICLE_FAVORITED_USER_KEY_PREFIX + userId + ":loaded", "1", 30, TimeUnit.MINUTES);
+        //维护用户收藏集合：取消最后一项时状态会转为 EMPTY，不留「全量标记 + 空集合」
+        userSetCache.removeIfLoaded(
+                RedisConstants.ARTICLE_FAVORITED_USER_KEY_PREFIX + userId, String.valueOf(articleId));
 
         stringRedisTemplate.delete(RedisConstants.ARTICLE_DETAIL_KEY_PREFIX + articleId);
     }

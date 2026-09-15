@@ -11,16 +11,13 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
-import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 /**
  * 一次性迁移：将 categories 和 tags 的自增旧 ID 替换为雪花 ID。
@@ -36,7 +33,7 @@ public class IdMigrationRunner implements ApplicationRunner {
 
     private final JdbcTemplate jdbcTemplate;
     private final TransactionTemplate transactionTemplate;
-    private final StringRedisTemplate stringRedisTemplate;
+    private final RedisKeyScanner redisKeyScanner;
     private final ArticleRagSyncService articleRagSyncService;
     private final AiUserMemoryMapper aiUserMemoryMapper;
     private final AiMemoryIndexService aiMemoryIndexService;
@@ -314,14 +311,11 @@ public class IdMigrationRunner implements ApplicationRunner {
      */
     private void cleanupRedisAfterMigration() {
         try {
-            Set<String> keys = new HashSet<>(stringRedisTemplate.keys("article:*"));
-            keys.addAll(stringRedisTemplate.keys("comment:list:article:*"));
-            keys.addAll(stringRedisTemplate.keys("comment:liked:user:*"));
-
-            if (!keys.isEmpty()) {
-                stringRedisTemplate.delete(keys);
-                log.info("已清理迁移相关 Redis 缓存，共 {} 个 key", keys.size());
-            }
+            // SCAN 游标迭代 + UNLINK（原 KEYS 会阻塞 Redis 服务端单线程）
+            long removed = redisKeyScanner.scanAndDelete("article:*")
+                    + redisKeyScanner.scanAndDelete("comment:list:article:*")
+                    + redisKeyScanner.scanAndDelete("comment:liked:user:*");
+            log.info("已清理迁移相关 Redis 缓存，共 {} 次删除", removed);
         } catch (Exception e) {
             log.warn("Redis 缓存清理失败（不影响迁移，可稍后手动清理）：{}", e.getMessage());
         }

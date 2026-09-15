@@ -24,12 +24,15 @@ import com.hailin.blogsystem.service.CommentsService;
 import com.hailin.blogsystem.service.IpLocationService;
 import com.hailin.blogsystem.utils.UserContext;
 import lombok.RequiredArgsConstructor;
+import com.hailin.blogsystem.component.CacheTtlSupport;
+import com.hailin.blogsystem.component.RedisKeyScanner;
+import com.hailin.blogsystem.component.UserSetCache;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.*;
-import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -42,7 +45,10 @@ public class CommentsServiceImpl extends ServiceImpl<CommentsMapper, ArticleComm
     private final ArticlesMapper articlesMapper;
     private final IpLocationService ipLocationService;
     private final StringRedisTemplate stringRedisTemplate;
+    private final RedisKeyScanner redisKeyScanner;
+    private final CacheTtlSupport cacheTtlSupport;
     private final ObjectMapper objectMapper;
+    private final UserSetCache userSetCache;
 
     @Override  //1.获取文章评论列表，游客可访问，每条主评论带前几条回复
     public PageVO<CommentsVO> getComments(Long articleId, Long page, Long pageSize, String sort) {
@@ -293,17 +299,8 @@ public class CommentsServiceImpl extends ServiceImpl<CommentsMapper, ArticleComm
 
 
     private void deleteCommentListCache(Long articleId) {
-        try {
-            Set<String> keys = stringRedisTemplate.keys(
-                    RedisConstants.COMMENT_LIST_KEY_PREFIX + articleId + ":*"
-            );
-
-            if (keys != null && !keys.isEmpty()) {
-                stringRedisTemplate.delete(keys);
-            }
-        } catch (Exception e) {
-            // Redis 删除失败不影响评论发布/删除
-        }
+        // SCAN 游标迭代 + UNLINK：原 KEYS 会阻塞 Redis 服务端单线程
+        redisKeyScanner.scanAndDelete(RedisConstants.COMMENT_LIST_KEY_PREFIX + articleId + ":*");
     }
 
 
@@ -381,8 +378,7 @@ public class CommentsServiceImpl extends ServiceImpl<CommentsMapper, ArticleComm
             stringRedisTemplate.opsForValue().set(
                     key,
                     objectMapper.writeValueAsString(pageVO),
-                    RedisConstants.COMMENT_LIST_TTL_MINUTES,
-                    TimeUnit.MINUTES
+                    cacheTtlSupport.jitter(Duration.ofMinutes(RedisConstants.COMMENT_LIST_TTL_MINUTES))
             );
         } catch (Exception e) {
             // 缓存失败不影响评论列表返回
@@ -473,17 +469,8 @@ public class CommentsServiceImpl extends ServiceImpl<CommentsMapper, ArticleComm
 
         //改为Redis Set优先，再来判断是否要查询数据库
         String key = RedisConstants.COMMENT_LIKED_USER_KEY_PREFIX + currentUserId;
-        String loadedKey = key + ":loaded";
-
-        Set<String> likedIdStrings = null;
-
-        try {
-            if (Boolean.TRUE.equals(stringRedisTemplate.hasKey(loadedKey))) {
-                likedIdStrings = stringRedisTemplate.opsForSet().members(key);
-            }
-        } catch (Exception e) {
-            // Redis读取失败，下面兜底查数据库
-        }
+        // 三态：null = 未加载或状态不可信（下面回源）；空 Set = 确认没点过赞；非空 = 命中
+        Set<String> likedIdStrings = userSetCache.readIfLoaded(key);
 
         if (likedIdStrings == null) {
             List<CommentLikes> commentLikes = likeCommentsMapper.selectList(
@@ -495,21 +482,9 @@ public class CommentsServiceImpl extends ServiceImpl<CommentsMapper, ArticleComm
                     .map(like -> String.valueOf(like.getCommentId()))
                     .collect(Collectors.toSet());
 
-            try {
-                if (!likedIdStrings.isEmpty()) {
-                    stringRedisTemplate.opsForSet()
-                            .add(key, likedIdStrings.toArray(new String[0]));
-                }
-
-                stringRedisTemplate.opsForValue()
-                        .set(loadedKey, "1", 30, TimeUnit.MINUTES);
-            } catch (Exception e) {
-                // Redis回填失败不影响 liked 状态计算
-            }
+            userSetCache.markLoaded(key, likedIdStrings);
         }
-        Set<Long> likedCommentIds = likedIdStrings == null
-                ? Set.of()
-                : likedIdStrings.stream()
+        Set<Long> likedCommentIds = likedIdStrings.stream()
                 .map(Long::valueOf)
                 .collect(Collectors.toSet());
 

@@ -20,6 +20,15 @@ spring:
   application:
     name: blog-system        # 日志 correlation 与 tracing 使用
 
+  # 定时任务调度：Spring Boot 默认就是 1，这里显式写出来是为了不靠默认值。
+  # 浏览量同步（30s）与热度榜重建（30min）读同一批数据（article:view:* 增量 + 文章计数），
+  # 并发执行会出现「DB 已加、Redis key 未删」的重复计分窗口。串行调度保证不并发，
+  # 比加分布式锁简单。改这个值前先看 ArticleViewCountSyncTask 的注释。
+  task:
+    scheduling:
+      pool:
+        size: 1
+
   datasource:
     url: jdbc:mysql://localhost:3306/blog_system?serverTimezone=Asia/Shanghai&useUnicode=true&characterEncoding=utf-8&zeroDateTimeBehavior=convertToNull&useSSL=false&allowPublicKeyRetrieval=true
     username: myRoot

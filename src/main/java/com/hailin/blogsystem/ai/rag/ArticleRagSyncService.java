@@ -3,11 +3,11 @@ package com.hailin.blogsystem.ai.rag;
 import com.hailin.blogsystem.constants.RedisConstants;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import com.hailin.blogsystem.component.RedisKeyScanner;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
-import java.util.Set;
 import java.util.function.Supplier;
 
 @Slf4j
@@ -36,6 +36,7 @@ public class ArticleRagSyncService {
 
     private final ArticleRagIndexService articleRagIndexService;
     private final StringRedisTemplate stringRedisTemplate;
+    private final RedisKeyScanner redisKeyScanner;
 
     @Async("articleRagTaskExecutor")
     public void indexArticle(Long articleId){
@@ -132,10 +133,8 @@ public class ArticleRagSyncService {
 
     /** 全量重建成功后清空所有失败标记（重建已覆盖旧的失败同步结果） */
     private void clearAllFailureMarks() {
-        Set<String> keys = stringRedisTemplate.keys(RedisConstants.RAG_INDEX_FAILURE_KEY_PREFIX + "*");
-        if (keys != null && !keys.isEmpty()) {
-            stringRedisTemplate.delete(keys);
-        }
+        // SCAN 游标迭代 + UNLINK：原 KEYS 会阻塞 Redis 服务端单线程
+        redisKeyScanner.scanAndDelete(RedisConstants.RAG_INDEX_FAILURE_KEY_PREFIX + "*");
     }
 
     private String buildFailureKey(String actionKey, Long articleId) {
