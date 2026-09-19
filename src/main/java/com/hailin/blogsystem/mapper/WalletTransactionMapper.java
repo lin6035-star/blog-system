@@ -3,6 +3,7 @@ package com.hailin.blogsystem.mapper;
 import com.baomidou.mybatisplus.core.mapper.BaseMapper;
 import com.hailin.blogsystem.entity.WalletTransaction;
 import com.hailin.blogsystem.entity.vo.WalletBillEntryVO;
+import com.hailin.blogsystem.entity.vo.WalletLedgerAnomalyVO;
 import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
 import org.apache.ibatis.annotations.Select;
@@ -76,4 +77,56 @@ public interface WalletTransactionMapper extends BaseMapper<WalletTransaction> {
             ) c
             """)
     long countBill(@Param("userId") Long userId);
+
+    /**
+     * 全表扫出一行都接不上的流水（对账用，设计稿 §7.3）。
+     *
+     * <p>用窗口函数把「前一笔」拉到同一行上，判定在 SQL 里做完，不把全表捞进内存。
+     * 判两条：
+     * <ul>
+     *   <li>{@code prev_seq + 1 = balance_seq} —— 序号连号，<b>没有漏流水</b></li>
+     *   <li>{@code prev_balance + amount = balance_after} —— 余额快照接得上</li>
+     * </ul>
+     *
+     * <p>⚠️ {@code prev_seq IS NULL} 的行（每个用户的第一笔）会被跳过——它没有前驱可比。
+     * 这个盲区由 {@link #selectUsersWithMissingEarlyTransactions} 补上。
+     *
+     * <p>⚠️ <b>全表扫</b>，随流水增长会越来越慢。当前数据量下可接受（1 小时一轮）；
+     * 真到百万级要改成按 {@code user_id} 分批，用 {@code idx_wallet_tx_user} 走索引逐一校验。
+     */
+    @Select("""
+            SELECT user_id, balance_seq, amount, balance_after, prev_balance, prev_seq
+            FROM (
+                SELECT user_id,
+                       balance_seq,
+                       amount,
+                       balance_after,
+                       LAG(balance_after) OVER (PARTITION BY user_id ORDER BY balance_seq) AS prev_balance,
+                       LAG(balance_seq)   OVER (PARTITION BY user_id ORDER BY balance_seq) AS prev_seq
+                FROM wallet_transaction
+            ) ledger
+            WHERE prev_seq IS NOT NULL
+              AND (prev_seq <> balance_seq - 1 OR prev_balance + amount <> balance_after)
+            LIMIT #{limit}
+            """)
+    List<WalletLedgerAnomalyVO> selectLedgerAnomalies(@Param("limit") int limit);
+
+    /**
+     * 最早一笔不是第 1 号的用户。
+     *
+     * <p><b>补的正是 {@link #selectLedgerAnomalies} 够不着的那一格</b>：{@code LAG} 对每个用户的
+     * 第一笔返回 {@code NULL}，而那恰好是「更早的流水被删掉了」时会留下的那一行。
+     * 删掉开头几笔之后，剩下的序列仍然首尾自洽——只有「首笔必须是 1」这个不变量能发现。
+     *
+     * <p>序号从 1 起是 {@code applyChange} 保证的（钱包行创建时 {@code balance_seq = 0}，
+     * 第一次变更读写成 1），所以这里能把它当硬约束用。
+     */
+    @Select("""
+            SELECT user_id
+            FROM wallet_transaction
+            GROUP BY user_id
+            HAVING MIN(balance_seq) <> 1
+            LIMIT #{limit}
+            """)
+    List<Long> selectUsersWithMissingEarlyTransactions(@Param("limit") int limit);
 }
