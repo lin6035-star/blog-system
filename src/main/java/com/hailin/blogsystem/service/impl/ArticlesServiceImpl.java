@@ -20,6 +20,7 @@ import com.hailin.blogsystem.entity.*;
 import com.hailin.blogsystem.entity.dto.ArticlesDTO;
 import com.hailin.blogsystem.entity.vo.PageVO;
 import com.hailin.blogsystem.mapper.*;
+import com.hailin.blogsystem.search.ArticleSearchService;
 import com.hailin.blogsystem.service.ArticlesService;
 import com.hailin.blogsystem.entity.vo.ArticleDetailVO;
 import com.hailin.blogsystem.utils.UserContext;
@@ -36,7 +37,9 @@ import java.time.Duration;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -157,12 +160,30 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
     private final UserSetCache userSetCache;
     private final AfterCommitExecutor afterCommitExecutor;
     private final UserActivityTracker userActivityTracker;
+    /** 站内搜索：keyword 非空时走 ES 全文检索，ES 不可用则降级回原本的 LIKE。 */
+    private final ArticleSearchService articleSearchService;
 
     @Override  //1.获取公开文章列表
     public PageVO<ArticleDetailVO> getArticles(Long page, Long pageSize, String keyword, Long categoryId, String sort) {  //1.获取公开文章列表
 
         String normalizedKeyword = keyword == null || keyword.isBlank() ? null : keyword;
         String normalizedSort = "recommend".equals(sort) ? "recommend" : "latest";
+
+        // 有关键词 → 优先走 ES 全文检索（标题 + 摘要 + 正文，带相关性排序与高亮）。
+        // 无关键词 → 完全走下面的 DB + 缓存路径，一行不动。
+        //
+        // 为什么用「keyword 非空」而不是「整体替换」：无关键词的列表页是**热路径且有缓存**，
+        // 走 ES 只会平白多一次网络往返；而关键词查询本来就不走缓存（缓存 key 里没有 keyword）。
+        if (normalizedKeyword != null) {
+            PageVO<ArticleDetailVO> esResult =
+                    searchByEs(page, pageSize, normalizedKeyword, categoryId, normalizedSort);
+            if (esResult != null) {
+                return esResult;
+            }
+            // ES 不可用：**不报错**，继续往下走 LIKE —— 搜索是增强功能，挂了不该让列表页也打不开
+            log.warn("[SEARCH] ES 不可用，降级到 LIKE 查询：keyword={}", normalizedKeyword);
+        }
+
         boolean cacheable = normalizedKeyword == null;
         String cacheKey = cacheable ? buildArticleListCacheKey(page,pageSize,categoryId,normalizedSort) : null;
 
@@ -208,6 +229,53 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
         fillArticleViewCount(list);
 
         return result;
+    }
+
+    /**
+     * ES 检索路径。**返回 null 表示 ES 不可用**，调用方据此降级到 LIKE。
+     *
+     * <p>返回的 { @code total } 用 ES 的命中总数（不是本页条数）——分页要靠它。
+     */
+    private PageVO<ArticleDetailVO> searchByEs(Long page, Long pageSize, String keyword,
+                                               Long categoryId, String sort) {
+        ArticleSearchService.SearchHits hits =
+                articleSearchService.search(keyword, categoryId, sort, page, pageSize);
+        if (hits == null) {
+            return null;
+        }
+        if (hits.articleIds().isEmpty()) {
+            return new PageVO<>(List.of(), 0L, page, pageSize);
+        }
+
+        /*
+         * ⚠️ 按 id 查库之后**必须按 ES 的顺序重排**：
+         * SQL 的 `IN (...)` 返回顺序是**不保证**的（MySQL 通常按主键，但那是实现细节不是承诺），
+         * 直接拿来用会让 ES 辛苦算的相关性排序白做——用户看到的是"按 id 排的搜索结果"。
+         */
+        List<Articles> found = lambdaQuery().in(Articles::getId, hits.articleIds()).list();
+        Map<Long, Articles> byId = new HashMap<>();
+        for (Articles a : found) {
+            byId.put(a.getId(), a);
+        }
+
+        List<ArticleDetailVO> list = new ArrayList<>();
+        for (Long id : hits.articleIds()) {
+            Articles article = byId.get(id);
+            if (article == null) {
+                // 索引比库"新"：文章已删但索引还没清干净。跳过，不补空对象
+                continue;
+            }
+            ArticleDetailVO vo = ArticleDetailVO.from(article);
+            vo.setHighlight(hits.highlights().get(id));
+            list.add(vo);
+        }
+
+        fillArticleMeta(list);
+        fillArticleLiked(list);
+        fillArticleFavorited(list);
+        fillArticleViewCount(list);
+
+        return new PageVO<>(list, hits.total(), page, pageSize);
     }
 
     private String buildArticleListCacheKey(Long page, Long pageSize, Long categoryId, String sort) {
@@ -1427,12 +1495,46 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
         } catch (Exception e) {
             log.warn("文章 RAG 索引同步失败，articleId={}",articleId,e);
         }
+        // 站内搜索索引与 RAG 索引共用触发点，就地同步（见 safelyIndexArticleSearch 注释）
+        safelyIndexArticleSearch(articleId);
     }
     private void safelyDeleteArticleRagIndex(Long articleId){
         try{
             articleRagSyncService.deleteArticleIndex(articleId);
         } catch (Exception e) {
             log.warn("文章 RAG 索引删除失败，articleId={}",articleId,e);
+        }
+        try{
+            articleSearchService.deleteArticle(articleId);
+        } catch (Exception e) {
+            log.warn("文章搜索索引删除失败，articleId={}",articleId,e);
+        }
+    }
+
+    /**
+     * 站内搜索索引同步。
+     *
+     * <p><b>为什么挂在这里而不是每个业务方法各加一次</b>：发布 / 更新 / 删除 / 隐藏 / 改可见性 /
+     * 创建这 6 个触发点**全都已经调 {@code safelyIndexArticleRag}**，在它内部顺带做，
+     * 调用点零改动；将来新增触发点也不会漏掉搜索索引。
+     *
+     * <p><b>失败只 warn</b>：搜索是增强功能，索引缺一篇不该让「发布文章」整个失败——
+     * 真漏了可以用重建接口补回来。
+     *
+     * <p>非 PUBLISHED 状态**主动删索引**（而不是不管）：文章从公开改为隐藏时，
+     * 索引里那份必须消失——虽然检索期还有一道 status 过滤兜底，但两道防线各司其职。
+     */
+    private void safelyIndexArticleSearch(Long articleId) {
+        try {
+            Articles article = getById(articleId);
+            if (article == null
+                    || !Objects.equals(article.getStatus(), BlogConstants.ArticlesStatus.PUBLISHED)) {
+                articleSearchService.deleteArticle(articleId);
+                return;
+            }
+            articleSearchService.indexArticle(article);
+        } catch (Exception e) {
+            log.warn("文章搜索索引同步失败，articleId={}", articleId, e);
         }
     }
 }

@@ -26,6 +26,16 @@ public class ArticleDetailVO {
     private Integer liked = 0;
     private Integer favorited = 0;
     private Integer shareCount = 0;
+
+    /**
+     * 搜索命中的高亮片段（含 {@code <em>} 标记），**只在走 ES 检索时有值**，
+     * 普通列表接口为 null。
+     *
+     * <p>⚠️ 前端渲染前必须经过 DOMPurify（项目统一清洗出口）——
+     * 虽然这个字段是 ES 生成的、来源可信，但「带 HTML 标签的字符串」一律按不可信处理，
+     * 免得以后有人把用户输入拼进来。
+     */
+    private String highlight;
     /**
      * 今日独立访客数（HyperLogLog 近似值，非累计）。
      *

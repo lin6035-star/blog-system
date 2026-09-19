@@ -2,6 +2,7 @@ package com.hailin.blogsystem.service.impl;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hailin.blogsystem.ai.AiJudgeModelSupport;
+import com.hailin.blogsystem.ai.LlmErrorClassifier;
 import com.hailin.blogsystem.ai.LlmResponseSupport;
 import com.hailin.blogsystem.ai.TokenUsageAccumulator;
 import com.hailin.blogsystem.entity.LearningPlans;
@@ -107,7 +108,18 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
             TokenUsageAccumulator.addTo(usage, LlmResponseSupport.usageOf(response));
             return LlmResponseSupport.textOf(response);
         } catch (Exception e) {
-            log.warn("AI意图识别调用失败", e);
+            /*
+             * 429 的重试由 Spring AI 的 RetryTemplate 负责
+             * （spring.ai.retry.on-http-codes: 429 + max-attempts: 3）。
+             *
+             * **这里刻意不再自己重试**：分类器走的正是 .call()，框架那一层已经生效，
+             * 两层叠加会变成 3×3=9 次调用、退避层层相加，用户只会等到超时。
+             * 流式路径则相反——框架完全不覆盖，所以重试实现在 LlmStreamCaller 里。
+             *
+             * 本处只负责把**失败类型**打出来：压测时正是靠它区分了「被 429 打挂」
+             * 和「模型判不准」，两者现象都是"降级成闲聊"，但根因完全不同。
+             */
+            log.warn("AI意图识别调用失败（失败类型 {}）", LlmErrorClassifier.classify(e), e);
             return null;
         }
     }

@@ -86,6 +86,9 @@ class AiRunStartupRecoveryTests {
                 AiWorkflowStatus.WAITING_PLAN_CONFIRM.name(),
                 AiWorkflowStatus.WAITING_LEARNING_PLAN_CONFIRM.name(),
                 AiWorkflowStatus.WAITING_FILL_CONFIRM.name(),
+                // 已废弃、无写入点，但**存量数据可能有**：前端 AiAssistant.vue 仍认这个状态
+                // （显示"已填充编辑器，等待保存/发布"面板），把它清掉等于让存量 run 凭空消失
+                AiWorkflowStatus.WAITING_USER_SAVE.name(),
                 AiWorkflowStatus.PAUSED.name()
         );
         List<Long> ids = untouched.stream().map(this::insertWorkflowRun).toList();

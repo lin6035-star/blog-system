@@ -189,6 +189,82 @@ class AiOrchestrationTaskAdmissionTests {
         blocker.countDown();
     }
 
+    // ---------- ②′ 同步执行：占名额，但不占池 ----------
+
+    /**
+     * 同步执行期间名额是占住的——这正是它存在的意义。
+     *
+     * <p>这条路径（Agent 建议确认）跑在 HTTP 线程上，没有 submit，所以占名额必须由
+     * {@code runAdmitted} 自己做。只做 precheck 会是<b>假保护</b>：precheck 只读计数不加计数，
+     * 用户连点确认每次都读到同一个数、每次都通过，每用户上限完全失效。
+     */
+    @Test
+    void runAdmittedOccupiesUserSlot() {
+        Fixture f = fixture(2, 4, 2);
+        AtomicReference<AiTaskRejectedException> insideError = new AtomicReference<>();
+
+        f.admission.runAdmitted(task(1L), () -> {
+            // 嵌套一层，把该用户名额顶到上限（maxPerUser=2）。
+            // ⚠️ 检查必须在**最内层**做：内层一旦返回，它占的名额就释放了。
+            f.admission.runAdmitted(task(1L), () -> {
+                // 此刻两个名额都被占住，同用户提交必须被拒
+                try {
+                    f.admission.submit(task(1L), () -> {
+                    });
+                } catch (AiTaskRejectedException e) {
+                    insideError.set(e);
+                }
+                return null;
+            });
+            return null;
+        });
+
+        assertThat(insideError.get())
+                .as("runAdmitted 不占名额的话，两次调用后计数仍是 0，这里的 submit 会成功")
+                .isNotNull();
+        assertThat(insideError.get().getReason()).isEqualTo(Reason.USER_LIMIT);
+    }
+
+    /**
+     * 池满不该拦住它——这条路根本不往池里投任务。
+     *
+     * <p>反过来才会出问题：拿池的容量去拒绝一个不占池的操作，
+     * 等于「系统忙的时候，用户连确认都不让点」。
+     */
+    @Test
+    void runAdmittedIgnoresPoolCapacity() throws Exception {
+        Fixture f = fixture(1, 0, 2);   // worker 1 + queue 0：池容量就是 1
+        CountDownLatch blocker = new CountDownLatch(1);
+
+        f.admission.submit(task(1L), blockingTask(blocker));
+
+        // 池确实满了（换任何用户来 submit 都会 POOL_FULL）
+        assertThatThrownBy(() -> f.admission.precheck(2L, AiTaskType.AGENT, "probe"))
+                .isInstanceOf(AiTaskRejectedException.class)
+                .satisfies(e -> assertThat(((AiTaskRejectedException) e).getReason()).isEqualTo(Reason.POOL_FULL));
+
+        // 同步执行照常：占的是调用者线程，与池无关
+        String result = f.admission.runAdmitted(task(2L), () -> "done");
+
+        assertThat(result).isEqualTo("done");
+
+        blocker.countDown();
+    }
+
+    /** 任务抛异常时名额也要释放——同步执行的 finally 同样不能漏。 */
+    @Test
+    void runAdmittedReleasesSlotWhenTaskThrows() {
+        Fixture f = fixture(2, 4, 2);
+
+        assertThatThrownBy(() -> f.admission.runAdmitted(task(1L), () -> {
+            throw new IllegalStateException("模拟任务失败");
+        })).isInstanceOf(IllegalStateException.class);
+
+        // 上限是 2：泄漏 1 个的话，这里第二次就会撞 USER_LIMIT
+        f.admission.runAdmitted(task(1L), () -> null);
+        f.admission.runAdmitted(task(1L), () -> null);
+    }
+
     // ---------- ③ 全局容量有界 ----------
 
     @Test

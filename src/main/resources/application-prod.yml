@@ -32,6 +32,11 @@ spring:
     username: myRoot
     password: ${DB_PASSWORD}
     driver-class-name: com.mysql.cj.jdbc.Driver
+    # 同 application.yml：必须明显大于 AI 准入 workerCount（默认 8）。
+    # 每个走准入的 Workflow 任务在 @Transactional 里跑 LLM，会长时间占住一个连接；
+    # 默认的 10 会让 8 个长任务挤掉几乎整个池，普通请求拿不到连接。
+    hikari:
+      maximum-pool-size: 20
   data:
     redis:
       # ACL 账号名：配了 ACL 就填（deploy/redis.conf.example 里的 blog-app）。

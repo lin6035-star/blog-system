@@ -37,8 +37,24 @@ public class AiJudgeModelSupport {
         }
     }
 
-    /** 判断链专用：配了 judge-model 时覆盖 model，否则原样返回 builder */
+    /**
+     * 判断链专用：**固定 temperature=0**；配了 judge-model 时再覆盖 model。
+     *
+     * <p><b>为什么必须显式设 0</b>：判断型任务要的是<b>确定性</b>——同一句话必须判出同一个结果。
+     * 而之前这里只设 model、不设 temperature，走的是服务端默认（OpenAI 兼容 API 默认 1.0），
+     * 于是**同一个模型、同一句话也会飘**：
+     * <ul>
+     *   <li>压测实测：40 个并发发同一句「我想系统学 Redis」，只有 15 个判成 LEARNING_PLAN</li>
+     *   <li>评测实测：37 例里 8 例失败，且失败模式高度一致（边界 case 塌陷到 GENERAL_CHAT 兜底）</li>
+     * </ul>
+     * 本类注释原先把这个现象归因于「换模型就是换把尺子」——模型确实是因素之一，
+     * 但**同一模型内的随机性来自 temperature**，这一半当时漏了。
+     *
+     * <p>生成链（大纲/草稿/计划内容）**不受影响**：那些调用点不走本方法，
+     * 保留默认温度，用户要的正是文字上的多样性。
+     */
     public OpenAiChatOptions.Builder applyTo(OpenAiChatOptions.Builder builder) {
+        builder = builder.temperature(0.0);
         return judgeModel.isBlank() ? builder : builder.model(judgeModel);
     }
 

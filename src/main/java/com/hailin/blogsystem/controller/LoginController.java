@@ -9,8 +9,8 @@ import com.hailin.blogsystem.service.LoginService;
 import com.hailin.blogsystem.utils.ClientIpUtils;
 import com.hailin.blogsystem.utils.Result;
 import jakarta.servlet.http.HttpServletRequest;
+import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
-import org.springframework.util.StringUtils;
 import org.springframework.web.bind.annotation.*;
 
 @RestController
@@ -21,29 +21,13 @@ public class LoginController {
     private final LoginService loginService;
 
     @PostMapping("/auth/register") //注册
-    public Result<AuthVO> register(@RequestBody RegisterDTO registerDTO){
+    public Result<AuthVO> register(@Valid @RequestBody RegisterDTO registerDTO) {
 
-        if (registerDTO == null) {
-            return Result.error(BlogConstants.ErrorCode.BAD_REQUEST, "请求参数不能为空");
-        }
-
-        if (!StringUtils.hasText(registerDTO.getUsername())) {
-            return Result.error(BlogConstants.ErrorCode.BAD_REQUEST, "用户名不能为空");
-        }
-
-        if (!StringUtils.hasText(registerDTO.getNickname())) {
-            return Result.error(BlogConstants.ErrorCode.BAD_REQUEST, "昵称不能为空");
-        }
-
-        if(!StringUtils.hasText(registerDTO.getPassword())){
-            return Result.error(BlogConstants.ErrorCode.BAD_REQUEST, "密码不能为空!!!");
-        }
-
-        if (!StringUtils.hasText(registerDTO.getConfirmPassword())) {
-            return Result.error(BlogConstants.ErrorCode.BAD_REQUEST, "确认密码不能为空");
-        }
-
-        if(!registerDTO.getPassword().equals(registerDTO.getConfirmPassword())){
+        // 跨字段校验只能留在这里：@Valid 的注解作用在**单个字段**上，
+        // 「两次密码是否一致」依赖两个字段的关系，注解表达不了（为它写自定义校验器不值当）。
+        // 其余「非空 / 长度」已由 RegisterDTO 上的注解承担，失败时走 GlobalExceptionHandler，
+        // 返回的同样是 200 + 40001 —— 对前端完全无感。
+        if (!registerDTO.getPassword().equals(registerDTO.getConfirmPassword())) {
             return Result.error(BlogConstants.ErrorCode.BAD_REQUEST, "两次密码不一致！");
         }
 
@@ -53,19 +37,7 @@ public class LoginController {
     }
 
     @PostMapping("/auth/login")  //登录
-    public Result<AuthVO> login(@RequestBody LoginDTO loginDTO, HttpServletRequest request){
-        if (loginDTO == null) {
-            return Result.error(BlogConstants.ErrorCode.BAD_REQUEST, "请求参数不能为空");
-        }
-
-        if (!StringUtils.hasText(loginDTO.getUsername())) {
-            return Result.error(BlogConstants.ErrorCode.BAD_REQUEST, "用户名不能为空");
-        }
-
-        if (!StringUtils.hasText(loginDTO.getPassword())) {
-            return Result.error(BlogConstants.ErrorCode.BAD_REQUEST, "密码不能为空");
-        }
-
+    public Result<AuthVO> login(@Valid @RequestBody LoginDTO loginDTO, HttpServletRequest request) {
         AuthVO authVO = loginService.login(loginDTO, ClientIpUtils.getClientIp(request));
 
         return Result.success(authVO);

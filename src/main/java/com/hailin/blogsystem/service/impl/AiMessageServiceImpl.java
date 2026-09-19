@@ -504,7 +504,9 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         } else if (isClassifierDegraded(intent)) {
             statusType = "CLASSIFIER_DEGRADED";
             retrievalMode = "NONE";
-            text = "这次没理解准，先按普通回答处理...";
+            // 文案要**可行动**：降级多因供应商限流/超时（重试过仍失败），
+            // 用户重说一遍往往就好了——只说"没理解准"，用户不知道下一步该做什么。
+            text = "这次没理解准，先按普通问答处理——你可以把问题再说一遍试试";
         } else {
             return Flux.empty();
         }

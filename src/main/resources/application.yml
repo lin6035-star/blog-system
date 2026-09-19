@@ -35,6 +35,14 @@ spring:
     # 本地默认值；生产由 application-prod.yml 覆盖为 ${DB_PASSWORD}（无默认值，缺失即失败）
     password: ${DB_PASSWORD:123456}
     driver-class-name: com.mysql.cj.jdbc.Driver
+    # 连接池必须**明显大于 AI 准入的 workerCount**（blog.ai.task.worker-count，默认 8）。
+    # 走准入的 Workflow 任务是在 @Transactional 里跑 LLM 的（runInitialSteps 含分析 / 生成，
+    # 几十秒），也就是 8 个并发任务会长时间占住 8 个连接——HikariCP 默认 10 只剩 2 个给
+    # 全局所有普通请求（页面 / 列表 / SSE 流里的查询 / 缓存回源），高峰期直接卡到拿不到连接。
+    # 20 是给「8 个长事务 + 常规请求 + 定时任务（秒杀消费 / 对账 / 浏览量同步）」留的余量。
+    # 改动前先确认 MySQL 的 max_connections（默认 151，够用）。
+    hikari:
+      maximum-pool-size: 20
 
   data:
     redis:
@@ -78,6 +86,32 @@ spring:
         options:
           model: text-embedding-v3
           dimensions: 1024
+
+    # LLM 调用重试策略（**只作用于非流式的 .call()**，流式路径见 LlmStreamCaller）。
+    #
+    # Spring AI 自带 RetryTemplate 一直在 classpath 上生效，但它的错误映射把 4xx 判成
+    # NonTransientAiException → 不重试，而供应商限流恰恰是 429。压测实证：40 并发下
+    # 30 个分类调用被 429 打挂，日志 `Retry error. Retry count: 1` 出现 35 次且只有 count=1
+    # —— 一次都没重试过，然后静默降级成闲聊。
+    #
+    # 只放 429、不开 on-client-errors：后者会把 400/401/403 也变成可重试，
+    # 但那类错误重试多少次结果都一样（参数错了就是错了），纯烧钱。
+    #
+    # ⚠️ 应用层（分类器）**不重复实现非流式重试**，否则会变成 3×3=9 次调用、
+    # 退避层层叠加，用户等到超时。职责划分：非流式交给这里，流式在 LlmStreamCaller 里自己做。
+    #
+    # max-attempts 从 3 调到 2 的依据：40 并发复测时 rate limit 日志从 30 涨到 84，
+    # 说明**第三轮重试基本是在撞限流**（供应商压下不去，多打一次只是多一次失败记录），
+    # 而代价是首字节 P50 从 7.6s 涨到 34s。2 次（首次 + 1 次重试）保留救回能力、砍掉最贵的一轮。
+    # ⚠️ 这个值基于"第三次多在撞限流"的推断，未单独实测 2 次的表现。
+    retry:
+      max-attempts: 2
+      on-http-codes: 429
+      # 默认 multiplier=5（2s→10s→50s…），对交互式场景太长
+      backoff:
+        initial-interval: 1s
+        multiplier: 2
+        max-interval: 8s
 
     vectorstore:
       elasticsearch:
@@ -132,7 +166,16 @@ management:
   endpoints:
     web:
       exposure:
-        exclude: "*"              # 零暴露：本刀只要 traceId，不需要任何 actuator 端点
+        # 只暴露 health，其余端点仍然全部屏蔽（原先写的是 exclude: "*" 零暴露，
+        # 但 include 与 exclude 同时存在时 **exclude 优先**，所以那行必须删掉而不是并存）。
+        #
+        # 为什么现在要暴露它：探活 / 监控 / 容器编排都需要一个「服务还活着吗」的入口，
+        # 而它**默认只返回 {"status":"UP"}**，不泄漏数据库地址之类的细节。
+        include: health
+  endpoint:
+    health:
+      # 显式写出来（默认就是 never）：防止将来有人顺手改成 always 把内部组件细节暴露到公网
+      show-details: never
 
 logging:
   pattern:

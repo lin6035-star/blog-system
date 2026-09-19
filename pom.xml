@@ -48,6 +48,14 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>
         </dependency>
+
+        <!-- 参数校验（@Valid）：把散落在 controller 里的手写 if 校验收口到 DTO 注解上。
+             校验失败的响应格式**与手写校验完全一致**（HTTP 200 + code 40001），
+             见 GlobalExceptionHandler 的 MethodArgumentNotValidException 分支。 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
         <dependency>
             <groupId>com.baomidou</groupId>
             <artifactId>mybatis-plus-spring-boot3-starter</artifactId>

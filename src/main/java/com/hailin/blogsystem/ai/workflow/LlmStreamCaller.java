@@ -38,6 +38,9 @@ public class LlmStreamCaller {
     public record LlmStreamResult(String content, TokenUsageAccumulator usage) {
     }
 
+    /** 流式重试上限：首次 + 2 次重试。用户在等进度，不适合拖太久。 */
+    private static final int STREAM_MAX_ATTEMPTS = 3;
+
     private final ChatClient.Builder chatClientBuilder;
     private final ObjectProvider<Tracer> tracerProvider;
 
@@ -85,6 +88,80 @@ public class LlmStreamCaller {
             String userPrompt,
             Integer maxTokens,
             boolean jsonMode
+    ) {
+        // 已输出字符数：跨重试持有，用来判定「还能不能重试」（见 shouldRetryStream）
+        AtomicInteger emittedChars = new AtomicInteger();
+
+        for (int attempt = 1; ; attempt++) {
+            try {
+                return callOnce(stepPrefix, step, field, emitter,
+                        systemPrompt, userPrompt, maxTokens, jsonMode, emittedChars);
+            } catch (RuntimeException e) {
+                if (!shouldRetryStream(step, attempt, emittedChars, e)) {
+                    throw e;
+                }
+                sleepBeforeRetry(step, attempt, e);
+            }
+        }
+    }
+
+    /**
+     * 流式调用能不能重试。
+     *
+     * <p><b>唯一的硬约束：已经吐出过内容就不再重试</b>——重试会把前面的内容重发一遍，
+     * 用户看到重复输出。首字节之前失败是「用户什么都还没看到」，重试无痕；
+     * 首字节之后失败就只能到此为止（调用方记 FAILED，用户手动 retry）。
+     *
+     * <p><b>为什么这里要自己实现</b>：Spring AI 自带的 RetryTemplate 只作用于 {@code .call()}，
+     * {@code stream()} 路径完全没有重试（字节码里 retryTemplate 只在 internalCall 中被引用）。
+     * 而本项目 Workflow 的生成步骤（大纲 / 草稿 / 重写 / 计划 / 拆解）**全是流式**——
+     * 恰恰是最需要重试的地方。
+     *
+     * <p>为什么重试次数不配置化：这个值是「用户愿意等多久」的体现而不是环境差异，
+     * 3 次（首次 + 2 次重试）配合下面的退避最长约 6 秒，是「等待」和「放弃」之间的折中。
+     */
+    private boolean shouldRetryStream(AiWorkflowStep step, int attempt,
+                                      AtomicInteger emittedChars, RuntimeException e) {
+        if (emittedChars.get() > 0) {
+            log.warn("[LLM-RETRY] step={} 不重试：已输出 {} 字符，重试会产生重复内容",
+                    step, emittedChars.get());
+            return false;
+        }
+        if (attempt >= STREAM_MAX_ATTEMPTS) {
+            return false;
+        }
+        if (!LlmErrorClassifier.isRetryable(e)) {
+            log.warn("[LLM-RETRY] step={} 不重试：失败类型 {} 重试无意义",
+                    step, LlmErrorClassifier.classify(e));
+            return false;
+        }
+        return true;
+    }
+
+    private void sleepBeforeRetry(AiWorkflowStep step, int attempt, RuntimeException e) {
+        LlmErrorClassifier.FailureKind kind = LlmErrorClassifier.classify(e);
+        long delayMs = LlmErrorClassifier.backoffMillis(attempt, kind);
+        log.warn("[LLM-RETRY] step={} 第 {} 次失败（{}），退避 {}ms 后重试 error={}",
+                step, attempt, kind, delayMs, e.getMessage());
+        try {
+            Thread.sleep(delayMs);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            throw e;
+        }
+    }
+
+    /** 单次流式调用（不含重试）。原 call 的方法体原样搬入，唯一改动是累加 emittedChars。 */
+    private LlmStreamResult callOnce(
+            String stepPrefix,
+            AiWorkflowStep step,
+            String field,
+            AiWorkflowStepEmitter emitter,
+            String systemPrompt,
+            String userPrompt,
+            Integer maxTokens,
+            boolean jsonMode,
+            AtomicInteger emittedChars
     ) {
         AiWorkflowStepEmitter safeEmitter = emitter == null ? AiWorkflowStepEmitter.noop() : emitter;
 
@@ -197,6 +274,8 @@ public class LlmStreamCaller {
                                         field,
                                         chunk
                                 );
+                                // 记录已输出字符数：重试判定用它判断「是不是已经吐过内容了」
+                                emittedChars.addAndGet(chunk.length());
                             }
                         }).run();
                     })

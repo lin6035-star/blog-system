@@ -4,6 +4,9 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.UpdateWrapper;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.hailin.blogsystem.ai.task.AiOrchestrationTaskAdmission;
+import com.hailin.blogsystem.ai.task.AiTaskRequest;
+import com.hailin.blogsystem.ai.task.AiTaskType;
 import com.hailin.blogsystem.ai.workflow.WorkflowActionIdempotency;
 import com.hailin.blogsystem.ai.workflow.WorkflowActionLock;
 import com.hailin.blogsystem.ai.workflow.WorkflowRunManager;
@@ -65,6 +68,8 @@ public class AgentRunSuggestionService {
     private final WorkflowActionIdempotency idempotency;
     private final AiWorkflowRunService aiWorkflowRunService;
     private final WorkflowRunManager workflowRunManager;
+    /** 确认即启动 Workflow（同步跑初始步骤，含 LLM），必须占并发名额——否则是绕过每用户上限的后门。 */
+    private final AiOrchestrationTaskAdmission admission;
     private final LearningPlansService learningPlansService;
     /** V3.12：结论锚写点 B（用户确认时刻）。 */
     private final ArticleSessionAnchorService anchorService;
@@ -192,7 +197,19 @@ public class AgentRunSuggestionService {
         // Handler.create 抛异常则整体回滚（无残留）；runInitialSteps 内部失败则事务已提交（锚保留）。
         markConclusionIfOptimize(run, suggestion);
 
-        AiWorkflowRunVO vo = createWorkflow(run, suggestion);
+        // 准入：确认即启动 Workflow，而 createXxxWorkflow 内部会同步跑 runInitialSteps
+        // （LOAD → ANALYZE(LLM) → MEMORY → RAG → GENERATE_PLAN(LLM)，几十秒），全程在这个 HTTP 线程上。
+        // 它不进专用池（必须同步返回 VO 给前端渲染卡片），但**必须占并发名额**——
+        // 只做 precheck 是假保护：precheck 只读计数不加计数，用户连点确认每次都通过，上限完全失效。
+        // 被拒时抛 RuntimeException → @Transactional 整体回滚 → run 自然回到 WAITING_WORKFLOW_CONFIRM 可重试。
+        AiTaskRequest taskRequest = AiTaskRequest.of(
+                userId,
+                AiTaskType.WORKFLOW_CREATE,
+                agentRunId + ":confirm",
+                // runAdmitted 在当前线程执行，不跨线程、无需恢复 MDC，日志上下文在此用不上
+                null
+        );
+        AiWorkflowRunVO vo = admission.runAdmitted(taskRequest, () -> createWorkflow(run, suggestion));
         markConfirmed(run, vo.getId());
         // 同步关联消息的 workflowRunId：刷新后按消息补拉 Workflow 卡（建议卡闭环）
         // 用非 lambda UpdateWrapper：纯 mock 单测环境无 MyBatis-Plus TableInfo 缓存，lambda wrapper 会炸

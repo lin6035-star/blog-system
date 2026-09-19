@@ -16,6 +16,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Supplier;
 
 /**
  * 准入实现：每用户内存计数 + 专用有界池 + 统一观测。
@@ -91,6 +92,31 @@ public class AiOrchestrationTaskAdmissionImpl implements AiOrchestrationTaskAdmi
             log.warn("[AI-TASK] submit rejected reason=POOL_FULL taskType={} businessRef={} userId={} executorShutdown={} running={} queued={}",
                     request.taskType(), request.businessRef(), userId, shutdown, activeCount(), queuedCount());
             throw new AiTaskRejectedException(Reason.POOL_FULL);
+        }
+    }
+
+    @Override
+    public <T> T runAdmitted(AiTaskRequest request, Supplier<T> task) {
+        Long userId = request.userId();
+
+        // 权威判定同上：只有真正占住名额，每用户上限才对这条路径成立。
+        if (userId != null && !acquireUserSlot(userId)) {
+            log.info("[AI-TASK] runAdmitted rejected reason=USER_LIMIT taskType={} businessRef={} userId={} inFlightOfUser={}",
+                    request.taskType(), request.businessRef(), userId, currentOf(userId));
+            throw new AiTaskRejectedException(Reason.USER_LIMIT);
+        }
+
+        long start = System.currentTimeMillis();
+        log.info("[AI-TASK] start mode=sync taskType={} businessRef={} userId={} inFlightOfUser={}",
+                request.taskType(), request.businessRef(), userId, currentOf(userId));
+        try {
+            return task.get();
+        } finally {
+            // finally 释放：正常返回、抛业务异常、抛准入异常都覆盖
+            long executionMs = System.currentTimeMillis() - start;
+            releaseUserSlot(userId);
+            log.info("[AI-TASK] done mode=sync taskType={} businessRef={} userId={} executionMs={} inFlightOfUser={}",
+                    request.taskType(), request.businessRef(), userId, executionMs, currentOf(userId));
         }
     }
 

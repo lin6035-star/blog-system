@@ -2,6 +2,7 @@ package com.hailin.blogsystem.config;
 
 import com.hailin.blogsystem.interceptor.JwtInterceptor;
 import com.hailin.blogsystem.interceptor.OptionalJwtInterceptor;
+import com.hailin.blogsystem.interceptor.RequestTimingInterceptor;
 import com.hailin.blogsystem.security.AiRateLimitInterceptor;
 import lombok.RequiredArgsConstructor;
 import org.springframework.context.annotation.Configuration;
@@ -18,9 +19,15 @@ public class WebMvcConfig implements WebMvcConfigurer {
     private final JwtInterceptor jwtInterceptor;
     private final OptionalJwtInterceptor optionalJwtInterceptor;
     private final AiRateLimitInterceptor aiRateLimitInterceptor;
+    private final RequestTimingInterceptor requestTimingInterceptor;
 
     @Override
     public void addInterceptors(InterceptorRegistry registry) {
+        // 耗时统计必须**最先注册**：它量的是端到端时间，
+        // 排在鉴权/限流后面就只剩片段，量的不是用户实际等的那个时长。
+        registry.addInterceptor(requestTimingInterceptor)
+                .addPathPatterns("/**");
+
         registry.addInterceptor(optionalJwtInterceptor)
                 .addPathPatterns(
                         "/api/articles/**",
