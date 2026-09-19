@@ -15,7 +15,9 @@ import com.hailin.blogsystem.service.AiConversationSummaryService;
 import com.hailin.blogsystem.utils.UserContext;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import com.hailin.blogsystem.ai.LlmResponseSupport;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
@@ -262,7 +264,7 @@ public class AiConversationSummaryServiceImpl extends ServiceImpl<AiConversation
     }
 
     private String compressByLlm(String oldSummaryJson, List<AiMessages> messages) {
-        String response = chatClientBuilder.build()
+        ChatResponse chatResponse = chatClientBuilder.build()
                 .prompt()
                 .system("""
                         你是一个会话滚动摘要压缩器。
@@ -300,7 +302,10 @@ public class AiConversationSummaryServiceImpl extends ServiceImpl<AiConversation
                         formatMessages(messages)
                 ))
                 .call()
-                .content();
+                .chatResponse();
+        // 副产品调用：不落库，只在日志留痕（钱包计费只算主链路）
+        LlmResponseSupport.logUsage("summary_compress", chatResponse);
+        String response = LlmResponseSupport.textOf(chatResponse);
 
         return normalizeSummaryJson(response);
     }

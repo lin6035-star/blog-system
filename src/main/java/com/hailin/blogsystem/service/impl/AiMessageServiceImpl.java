@@ -5,6 +5,8 @@ import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hailin.blogsystem.ai.TokenUsageAccumulator;
+import com.hailin.blogsystem.ai.billing.BillingHandle;
+import com.hailin.blogsystem.ai.billing.ChatReserveCalculator;
 import com.hailin.blogsystem.ai.agent.AgentFollowUpResolver;
 import com.hailin.blogsystem.ai.agent.AgentRunResult;
 import com.hailin.blogsystem.ai.agent.AgentRuntime;
@@ -100,6 +102,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
     private final LearningProgressHandoffResolver learningProgressHandoffResolver;
     private final ArticleQaTargetResolver articleQaTargetResolver;
     private final ObjectProvider<Tracer> tracerProvider;
+    private final AiBillingService aiBillingService;
+    private final ChatReserveCalculator chatReserveCalculator;
 
     private static final String ROLE_USER = "user";
     private static final String ROLE_ASSISTANT = "assistant";
@@ -254,12 +258,16 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         // 不满足条件返回 null，下面照常分类，行为与改动前一致。
         AgentFollowUpResolver.Resolution followUp = agentFollowUpResolver.resolve(sessionId, userId, message);
 
+        // 分类器的消耗也是「这条消息」的成本：分类与后续回答共用一个累加器，
+        // 按落点消费（普通聊天 / CTA 落 ai_messages.token_count，Agent 落 message + ai_agent_runs）。
+        TokenUsageAccumulator routeUsage = new TokenUsageAccumulator();
+
         // 统一使用 LLM 分类结果 + Agent Planner 决策。
         // 这一轮开始，文章创作、文章优化、学习 Workflow
         // 都先经过同一个 AgentDecision。
         AiIntent intent = followUp != null
                 ? followUp.intent()
-                : aiIntentClassifier.classify(message, pageContext, userId);
+                : aiIntentClassifier.classify(message, pageContext, userId, routeUsage);
 
         // 命中续答：Agent 的 goal 用"原诉求 + 本句回答"的合并文本。
         // **不能重新赋值 message**——下面的 Flux.defer lambda 捕获它，重新赋值会破坏 effectively final；
@@ -297,7 +305,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                     userId,
                     rawPageContextJson,
                     message,
-                    routeDecision
+                    routeDecision,
+                    routeUsage
             );
         }
 
@@ -363,7 +372,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                         userId,
                         rawPageContextJson,
                         message,
-                        routeDecision
+                        routeDecision,
+                        routeUsage
                 );
             }
 
@@ -421,7 +431,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             MdcContext.LogContext agentLogContext = captureAgentLogContext(mdcSnapshot);
             return dispatchAgentRuntime(
                     intent, message, agentGoal, pageContext, rawPageContextJson,
-                    userId, sessionId, session, requestId, agentLogContext
+                    userId, sessionId, session, requestId, agentLogContext, routeUsage
             );
         }
 
@@ -436,7 +446,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 buildChatStatusFlux(routeDecision, intent),
                 Flux.defer(() -> streamNormalChatFlow(
                         message, pageContext, rawPageContextJson, userId,
-                        sessionId, session, routeDecision, intent, requestId
+                        sessionId, session, routeDecision, intent, requestId, routeUsage
                 ))
         );
     }
@@ -522,7 +532,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             AiSessions session,
             AgentDecision routeDecision,
             AiIntent intent,
-            String requestId
+            String requestId,
+            TokenUsageAccumulator routeUsage
     ) {
 
 
@@ -598,6 +609,24 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         userMessage.setCreatedAt(LocalDateTime.now());
         save(userMessage);
 
+        /*
+         * AI 计费预扣（设计稿 §5.5 事务 A）。
+         *
+         * 位置：放在用户消息落库之后、模型调用之前。计费键必须**在调用前就存在**，
+         * 而这条用户消息是此刻唯一已落库、能唯一标识「本次调用」的记录。
+         *
+         * 此刻 prompt 已经拼完（含 RAG / 记忆 / 会话摘要 / 页面上下文），
+         * 所以预扣按**真实输入长度**算，不靠估算分布去猜（见 ChatReserveCalculator）。
+         *
+         * 余额不足会抛 InsufficientBalanceException——它在流构建之前抛出，
+         * 由 GlobalExceptionHandler 映射成 HTTP 402，不会变成流中间的错误事件。
+         */
+        BillingHandle billingHandle = aiBillingService.reserve(
+                ChatReserveCalculator.BIZ_TYPE,
+                String.valueOf(userMessage.getId()),
+                userId,
+                chatReserveCalculator.estimate(prompt.getFinalPromptContext()));
+
         StringBuilder fullReply = new StringBuilder();
 
         AiChatEventVO paramEvent = AiChatEventVO.builder()
@@ -608,9 +637,15 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 ))
                 .build();
 
-        TokenUsageAccumulator usage = new TokenUsageAccumulator();
+        /*
+         * 正文生成的用量 = **计费依据**，因此这里不复用 routeUsage（设计稿 §5.2）。
+         *
+         * 意图分类是平台为选路产生的固定开销，不向用户收费；而 ai_messages.token_count
+         * 的口径保持不变（分类器 + 正文，供成本观测），落库时再把两者相加。
+         */
+        TokenUsageAccumulator replyUsage = new TokenUsageAccumulator();
         AtomicBoolean timingLogged = new AtomicBoolean(false);
-        Flux<AiChatEventVO> dataEvents = aiModelService.streamChat(prompt,requestId,usage)
+        Flux<AiChatEventVO> dataEvents = aiModelService.streamChat(prompt,requestId,replyUsage)
                 .doOnNext(chunk -> {
                     if (timingLogged.compareAndSet(false, true)) {
                         // §4.0 的量测目的已达成（防抖 250ms 判定合理、记忆召回串行问题已定位并修复），
@@ -628,11 +663,17 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
 
         Mono<AiChatEventVO> stopEvent = Mono.fromSupplier(() -> {
             AiMessages assistantMessage = saveStreamAssistantMessage(sessionId,userId,rawPageContextJson, fullReply.toString());
-            //token 用量落库（含工具调用多轮累计）
-            if (usage.getTotalTokens() > 0) {
-                assistantMessage.setTokenCount((long) usage.getTotalTokens());
+            //token 用量落库（含工具调用多轮累计）。口径 = 正文生成 + 意图分类，仅供成本观测
+            long messageTokens = replyUsage.getTotalTokens()
+                    + (routeUsage == null ? 0 : routeUsage.getTotalTokens());
+            if (messageTokens > 0) {
+                assistantMessage.setTokenCount(messageTokens);
                 updateById(assistantMessage);
             }
+
+            // 结算：按**正文生成**的实际用量扣，退回预扣差额（设计稿 §5.5 事务 B）
+            aiBillingService.settle(billingHandle, replyUsage);
+            aiBillingService.bindResource(billingHandle, String.valueOf(assistantMessage.getId()));
 
             // 异步提取候选记忆（规则预筛命中才写入，不会阻塞 SSE）
             aiMemoryCandidateExtractorService.extractAfterChat(
@@ -712,6 +753,19 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 dataEvents,
                 stopEvent
         ).doFinally(signalType -> {
+            /*
+             * 计费释放：用户取消 / 流异常时全额退回预扣。
+             *
+             * 正常完成走到这里时结算已经做过，release 会因 status 不再是 RESERVED 而空转，
+             * 不会重复退款——结算和释放各有一道 CAS 兜住自己那一半。
+             *
+             * ⚠️ V1 的政策是「取消也全额退」，代价是承认一个窗口：用户可以在模型已经产出
+             * token 之后取消、拿回预扣、恢复正余额，再发起下一次。这是产品取舍不是 bug，
+             * 升级路径（按已产生用量部分结算）见设计稿 §3。
+             */
+            if (signalType == SignalType.CANCEL || signalType == SignalType.ON_ERROR) {
+                aiBillingService.release(billingHandle);
+            }
             if(signalType == SignalType.CANCEL
             && fullReply.length() > 0
             && assistantSaved.compareAndSet(false,true)){
@@ -754,7 +808,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             Long sessionId,
             AiSessions session,
             String requestId,
-            MdcContext.LogContext logContext
+            MdcContext.LogContext logContext,
+            TokenUsageAccumulator routeUsage
     ) {
         String intentName = intent == null ? null : intent.getIntent();
         AgentRuntime runtime = agentRuntimeRouteRegistry.resolve(intentName);
@@ -778,7 +833,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 session,
                 requestId,
                 fallbackReply,
-                logContext
+                logContext,
+                routeUsage
         );
     }
 
@@ -801,7 +857,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             AiSessions session,
             String requestId,
             String fallbackReply,
-            MdcContext.LogContext logContext
+            MdcContext.LogContext logContext,
+            TokenUsageAccumulator routeUsage
     ) {
         // 用户消息落库（同步，立即可见）——用原话，用户发的什么就存什么、显示什么
         AiMessages userMessage = new AiMessages();
@@ -891,8 +948,20 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
 
                     // V2.1/V2.3：所有 Agent run 都绑定 agentRunId（建议卡 + 思考步骤刷新恢复）
                     AgentWorkflowSuggestion suggestion = result.pendingWorkflowSuggestion();
+                    boolean needUpdate = false;
                     if (result.agentRunId() != null) {
                         assistantMessage.setAgentRunId(result.agentRunId());
+                        needUpdate = true;
+                    }
+                    // token 落 message = Agent 循环消耗 + 意图分类消耗（这条消息的完整成本）。
+                    // ai_agent_runs.total_tokens 只是循环内部成本，不含分类器，两者口径不同不重复
+                    long messageTokens = result.totalTokens()
+                            + (routeUsage == null ? 0 : routeUsage.getTotalTokens());
+                    if (messageTokens > 0) {
+                        assistantMessage.setTokenCount(messageTokens);
+                        needUpdate = true;
+                    }
+                    if (needUpdate) {
                         updateById(assistantMessage);
                     }
 
@@ -2190,10 +2259,12 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
          */
         String requestId = UUID.randomUUID().toString();
 
+        TokenUsageAccumulator routeUsage = new TokenUsageAccumulator();
         AiIntent intent = aiIntentClassifier.classify(
                 message,
                 pageContext,
-                userId
+                userId,
+                routeUsage
         );
 
         AgentDecision routeDecision = agentPlannerSupport.decide(
@@ -2224,7 +2295,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                     userId,
                     rawPageContextJson,
                     userMessage,
-                    routeDecision
+                    routeDecision,
+                    routeUsage
             );
         }
 
@@ -2240,7 +2312,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             // 这条是 Workflow 回退路径，不经过追问续答 → 目标就是用户原话（两个参数相同）
             return dispatchAgentRuntime(
                     intent, message, message, pageContext, rawPageContextJson,
-                    userId, sessionId, session, requestId, captureAgentLogContext(mdcSnapshot)
+                    userId, sessionId, session, requestId, captureAgentLogContext(mdcSnapshot),
+                    routeUsage
             );
         }
 
@@ -2309,7 +2382,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                         userId,
                         rawPageContextJson,
                         userMessage,
-                        routeDecision
+                        routeDecision,
+                        routeUsage
                 );
             }
 
@@ -2373,7 +2447,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 buildChatStatusFlux(routeDecision, intent),
                 Flux.defer(() -> streamFallbackChatFlow(
                         message, pageContext, rawPageContextJson, userId, sessionId,
-                        routeDecision, intent, requestId, userMessage
+                        routeDecision, intent, requestId, userMessage, routeUsage
                 ))
         );
     }
@@ -2392,7 +2466,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             AgentDecision routeDecision,
             AiIntent intent,
             String requestId,
-            AiMessages userMessage
+            AiMessages userMessage,
+            TokenUsageAccumulator routeUsage
     ) {
         AiPrompt prompt = aiPromptService.buildPrompt(message, pageContext, sessionId);
         prompt.setArticleToolsEnabled(shouldEnableArticleTools(routeDecision));
@@ -2456,7 +2531,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 ))
                 .build();
 
-        TokenUsageAccumulator usage = new TokenUsageAccumulator();
+        // 复用调用方传来的累加器，让意图分类的消耗也算进这条消息；没传就自己开一个
+        TokenUsageAccumulator usage = routeUsage == null ? new TokenUsageAccumulator() : routeUsage;
         Flux<AiChatEventVO> dataEvents = aiModelService.streamChat(prompt, requestId, usage)
                 .doOnNext(fullReply::append)
                 .map(chunk -> AiChatEventVO.builder()
@@ -2531,7 +2607,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             Long userId,
             String rawPageContextJson,
             AiMessages userMessage,
-            AgentDecision decision
+            AgentDecision decision,
+            TokenUsageAccumulator routeUsage
     ) {
         String content = buildPlannerCtaContent(decision);
 
@@ -2541,6 +2618,12 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 rawPageContextJson,
                 content
         );
+
+        // CTA 正文由规则生成、不调 LLM，但意图分类是真花钱的——把那份消耗记在这条消息上
+        if (routeUsage != null && routeUsage.getTotalTokens() > 0) {
+            assistantMessage.setTokenCount((long) routeUsage.getTotalTokens());
+            updateById(assistantMessage);
+        }
 
         return buildSimpleStopFlux(
                 sessionId,
@@ -2557,7 +2640,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             Long userId,
             String rawPageContextJson,
             String userMessageText,
-            AgentDecision decision
+            AgentDecision decision,
+            TokenUsageAccumulator routeUsage
     ) {
         AiMessages userMessage = new AiMessages();
         userMessage.setSessionId(sessionId);
@@ -2575,6 +2659,12 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 rawPageContextJson,
                 content
         );
+
+        // CTA 正文由规则生成、不调 LLM，但意图分类是真花钱的——把那份消耗记在这条消息上
+        if (routeUsage != null && routeUsage.getTotalTokens() > 0) {
+            assistantMessage.setTokenCount((long) routeUsage.getTotalTokens());
+            updateById(assistantMessage);
+        }
 
         return buildSimpleStopFlux(sessionId, userId, userMessage, assistantMessage, null);
     }
@@ -2856,10 +2946,12 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         // 游客也先经过统一 Planner。
         // 但游客不能真正执行 Workflow 或学习查询 Tool。
         // userId 传 null：游客没有学习计划列表，分类器不注入、learningPlanIndex 无意义
+        TokenUsageAccumulator routeUsage = new TokenUsageAccumulator();
         AiIntent intent = aiIntentClassifier.classify(
                 message,
                 pageContext,
-                null
+                null,
+                routeUsage
         );
 
         String requestId = UUID.randomUUID().toString();

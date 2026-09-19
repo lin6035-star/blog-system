@@ -150,7 +150,23 @@ public class AiWorkflowStreamServiceImpl implements AiWorkflowStreamService {
                     AiWorkflowStepEmitter emitter = new AiWorkflowStepEmitter() {
                         @Override
                         public void emit(String step, String status, String message) {
-                            safeNext(sink, workflowStepEvent(id, action, step, status, message));
+                            // RUNNING 等无耗时/用量的阶段走这条
+                            safeNext(sink, workflowStepEvent(id, action, step, status, message,
+                                    null, null, null));
+                        }
+
+                        /**
+                         * 带耗时与 token 的步骤事件（runStep 的 SUCCESS / FAILED 走这条）。
+                         *
+                         * 前端实时日志原先只有 message，于是把「步骤完成，耗时 61515ms」塞进
+                         * inputSummary、耗时栏显示 `—`、token 行不渲染，要等 STOP 拼数据库日志才正常。
+                         * 这里把三者作为结构化字段下发，实时即可正确展示。
+                         */
+                        @Override
+                        public void emit(String step, String status, String message,
+                                         Long durationMs, Integer inputTokens, Integer outputTokens) {
+                            safeNext(sink, workflowStepEvent(id, action, step, status, message,
+                                    durationMs, inputTokens, outputTokens));
                         }
 
                         @Override
@@ -243,7 +259,8 @@ public class AiWorkflowStreamServiceImpl implements AiWorkflowStreamService {
                 .build();
     }
 
-    private AiChatEventVO workflowStepEvent(Long id, String action, String step, String status, String message) {
+    private AiChatEventVO workflowStepEvent(Long id, String action, String step, String status, String message,
+                                            Long durationMs, Integer inputTokens, Integer outputTokens) {
         Map<String, Object> data = new HashMap<>();
         data.put("workflowRunId", String.valueOf(id));
         data.put("action", action);
@@ -251,6 +268,17 @@ public class AiWorkflowStreamServiceImpl implements AiWorkflowStreamService {
         data.put("message", message);
         if (step != null) {
             data.put("step", step);
+        }
+        // 结构化元数据：前端实时步骤日志据此显示耗时与 token，不必等 SSE STOP 再拼数据库日志。
+        // 只在有值时下发（RUNNING 事件这三项都为空）
+        if (durationMs != null) {
+            data.put("durationMs", durationMs);
+        }
+        if (inputTokens != null) {
+            data.put("inputTokens", inputTokens);
+        }
+        if (outputTokens != null) {
+            data.put("outputTokens", outputTokens);
         }
 
         return AiChatEventVO.builder()

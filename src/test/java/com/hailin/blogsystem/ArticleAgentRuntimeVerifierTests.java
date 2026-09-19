@@ -89,7 +89,7 @@ class ArticleAgentRuntimeVerifierTests {
     @Test
     void needMoreInterceptsThenSupplementedAnswerCompletes() {
         // 决策：FINAL_ANSWER（草案被拦）→ QUERY_ARTICLE（补查）→ FINAL_ANSWER（验证过）
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(finalAnswer("缓存击穿那段写得不错"))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
                 .thenReturn(finalAnswer("缓存击穿那段用互斥锁兜底，逻辑清晰，建议补充重试策略"));
@@ -124,7 +124,7 @@ class ArticleAgentRuntimeVerifierTests {
 
     @Test
     void askUserVerdictConvertsToWaitingUserWithSingleAskStep() {
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
                 .thenReturn(finalAnswer("这篇的优点是节奏快"));
         when(executor.execute(any(), any(), any()))
@@ -148,7 +148,7 @@ class ArticleAgentRuntimeVerifierTests {
     @Test
     void unresolvedRejectionAtMaxStepsShutsDownConservatively() {
         // 决策器固执地反复 FINAL_ANSWER，验证器恒 NEED_MORE → 5 步全拦 → 到顶保守收尾
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(finalAnswer("这篇不错"));
         when(verifier.verify(any(), any(), any(), any()))
                 .thenReturn(Verdict.needMore(Verdict.MissingEvidence.RAG,
@@ -161,13 +161,13 @@ class ArticleAgentRuntimeVerifierTests {
         assertThat(result.usedSteps()).isEqualTo(6);
         // 保守收尾文案（不走 summarize 硬答）
         assertThat(result.finalAnswer()).contains("不足以让我给出可靠结论");
-        verify(decider, never()).summarize(any(), any());
+        verify(decider, never()).summarize(any(), any(), any());
     }
 
     @Test
     void maxStepsWithArticleNeverReadShutsDownConservatively() {
         // 全程只 SEARCH_RAG（从没 QUERY_ARTICLE 目标文章）→ 到顶 S1 保守收尾
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SEARCH_RAG));
         when(executor.execute(any(), any(), any()))
                 .thenReturn("站内文章知识检索结果：\n1. 《缓存穿透》...");
@@ -178,13 +178,13 @@ class ArticleAgentRuntimeVerifierTests {
         assertThat(result.status()).isEqualTo(AiAgentRunStatus.COMPLETED);
         assertThat(result.usedSteps()).isEqualTo(6);
         assertThat(result.finalAnswer()).contains("不足以让我给出可靠结论");
-        verify(decider, never()).summarize(any(), any());
+        verify(decider, never()).summarize(any(), any(), any());
     }
 
     @Test
     void rejectionFollowedBySuccessfulSupplementAtTopUsesSummarize() {
         // 2026-09-10 手测修正：拦后补查成功（材料已在手）→ 到顶不保守，走 summarize 基于新证据收尾
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(finalAnswer("草案一"))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
                 .thenReturn(finalAnswer("草案二"))
@@ -203,13 +203,13 @@ class ArticleAgentRuntimeVerifierTests {
         assertThat(result.status()).isEqualTo(AiAgentRunStatus.COMPLETED);
         assertThat(result.usedSteps()).isEqualTo(6);
         assertThat(result.finalAnswer()).doesNotContain("不足以让我给出可靠结论");
-        verify(decider, org.mockito.Mockito.atLeastOnce()).summarize(any(), any());
+        verify(decider, org.mockito.Mockito.atLeastOnce()).summarize(any(), any(), any());
     }
 
     @Test
     void verifierNullKeepsOriginalPath() {
         // 验证器返回 null（默认/未接线）→ 收敛门放行，行为与 V3.10 一致
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(finalAnswer("直接回答"));
         when(verifier.verify(any(), any(), any(), any())).thenReturn(null);
 

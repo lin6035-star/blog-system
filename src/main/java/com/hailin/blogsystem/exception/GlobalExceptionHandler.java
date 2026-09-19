@@ -31,6 +31,18 @@ public class GlobalExceptionHandler {
         return Result.error(e.getCode(), e.getMessage());
     }
 
+    //额度不足：同样不能走默认的 200。前端聊天的 SSE 请求在 200 时只认 `data:` 前缀的行，
+    //JSON 错误体会被静默忽略，流读完仍未收到 STOP → 用户看到的是「连接意外中断」，
+    //完全指不到"该充值了"这个真实原因。402 与语义也正好对应
+    @ExceptionHandler(InsufficientBalanceException.class)
+    public Result<Void> handleInsufficientBalance(
+            InsufficientBalanceException e,
+            HttpServletResponse response
+    ) {
+        response.setStatus(HttpStatus.PAYMENT_REQUIRED.value());
+        return Result.error(e.getCode(), e.getMessage());
+    }
+
     @ExceptionHandler(IllegalArgumentException.class)
     public Result<Void> handleIllegalArgumentException(IllegalArgumentException e) {
         return Result.error(BlogConstants.ErrorCode.BAD_REQUEST, e.getMessage());

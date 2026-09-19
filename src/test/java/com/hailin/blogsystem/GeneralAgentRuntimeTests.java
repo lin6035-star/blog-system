@@ -62,7 +62,7 @@ class GeneralAgentRuntimeTests {
 
     @Test
     void queryMemoryThenFinalAnswerCompletesRun() {
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_MEMORY)
                         .withInput(Map.of("question", "最近学习进展")))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
@@ -84,7 +84,7 @@ class GeneralAgentRuntimeTests {
     @Test
     void directFinalAnswerWithoutAnyQuery() {
         // 「能不查就不查」：已有信息足够时直接终态回答，执行器零调用
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
                         .withInput(Map.of("answer", "这个是纯概念问题，直接回答")));
 
@@ -100,7 +100,7 @@ class GeneralAgentRuntimeTests {
     @Test
     void searchRagAsEvidenceAfterMemory() {
         // 记忆为主、RAG 补证据：QUERY_MEMORY → SEARCH_RAG → FINAL_ANSWER
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_MEMORY))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SEARCH_RAG)
                         .withInput(Map.of("keyword", "缓存设计")))
@@ -120,7 +120,7 @@ class GeneralAgentRuntimeTests {
 
     @Test
     void askUserWhenInfoMissing() {
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.ASK_USER)
                         .withInput(Map.of("question", "你想了解或解决什么？")));
 
@@ -135,7 +135,7 @@ class GeneralAgentRuntimeTests {
     @Test
     void suggestWorkflowRejectedByWhitelist() {
         // 通用域白名单无 SUGGEST_WORKFLOW：非法动作直接 FAILED（无域内 Workflow 可建议）
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WORKFLOW)
                         .withInput(Map.of("workflowType", "OPTIMIZE_ARTICLE")));
 
@@ -149,7 +149,7 @@ class GeneralAgentRuntimeTests {
 
     @Test
     void suggestWriteRejectedByWhitelist() {
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
                         .withInput(Map.of("taskTitle", "缓存击穿")));
 
@@ -163,7 +163,7 @@ class GeneralAgentRuntimeTests {
 
     @Test
     void emitterReceivesStepEventsInOrder() {
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_MEMORY))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
                         .withInput(Map.of("answer", "已结合你的情况回答")));
@@ -187,7 +187,7 @@ class GeneralAgentRuntimeTests {
     @Test
     void maxStepsReachedProducesSummaryAtThree() {
         // 通用域 maxSteps=3（比学习/文章域 5 收紧）：到顶汇总，不再多轮决策
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_MEMORY));
         when(executor.execute(any(), any(), any())).thenReturn("第 X 条观察数据");
 
@@ -201,7 +201,7 @@ class GeneralAgentRuntimeTests {
 
     @Test
     void createRunCancelsStalePendingSuggestions() {
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
                         .withInput(Map.of("answer", "好的")));
 
@@ -216,7 +216,7 @@ class GeneralAgentRuntimeTests {
     @Test
     void executorFailureContinuesLoopAndFailsStep() {
         // 临时故障（非终局失败）：FAILED step 落库，循环继续由下一轮决策收尾
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_MEMORY))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
                         .withInput(Map.of("answer", "记忆查询失败，但先这样回答")));

@@ -10,7 +10,13 @@ import org.springframework.web.bind.annotation.RequestParam;
 import java.util.List;
 
 public interface ArticlesService extends IService<Articles>{
-    ArticleDetailVO getPublicArticleById(Long id);
+    /**
+     * 获取公开文章详情。
+     *
+     * @param clientIp 客户端 IP，仅用于游客的独立访客（UV）统计。由 Controller 层传入，
+     *                 不在这里读 request——Service 层不该依赖 Web 上下文
+     */
+    ArticleDetailVO getPublicArticleById(Long id, String clientIp);
 
     PageVO<ArticleDetailVO> getArticles(Long page, Long pageSize, String keyword, Long categoryId, String sort);
 

@@ -14,6 +14,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import com.hailin.blogsystem.utils.UserContext;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.metadata.Usage;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.ai.tool.ToolCallback;
@@ -25,6 +26,8 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 @Slf4j
 @Service
@@ -42,6 +45,15 @@ public class AiModelServiceImpl implements AiModelService {
     private final AiIntentClassifier aiIntentClassifier;
     private final AiLearningDashboardTool aiLearningDashboardTool;
 
+    /**
+     * 普通聊天的输出上限。
+     *
+     * <p>除了防跑飞，它还是<b>计费预扣的依据</b>——没有显式 maxTokens 时
+     * 「本次调用最多花多少」就是不可知的，预扣只能靠猜（设计稿 §5.3 明确反对按 P95 估）。
+     * 见 {@code AiChatBillingSupport}。
+     */
+    private final int chatMaxTokens;
+
 
     public AiModelServiceImpl(ChatClient.Builder chatClientBuilder, BlogAiProperties blogAiProperties, AiArticleTools aiArticleTools, AiNavigationToolsFactory aiNavigationToolsFactory, AiEditorToolFactory aiEditorToolFactory, AiArticleActionToolsFactory aiArticleActionToolsFactory, AiUserProfileTools aiUserProfileTools, AiIntentClassifier aiIntentClassifier, AiLearningDashboardTool aiLearningDashboardTool) {
         this.aiArticleTools = aiArticleTools;
@@ -54,6 +66,7 @@ public class AiModelServiceImpl implements AiModelService {
                 .defaultSystem(blogAiProperties.getSystemPrompt())
                 .build();
         this.aiNavigationToolsFactory = aiNavigationToolsFactory;
+        this.chatMaxTokens = blogAiProperties.getBilling().getChatMaxTokens();
     }
 
 
@@ -65,6 +78,16 @@ public class AiModelServiceImpl implements AiModelService {
         AiArticleActionTools aiArticleActionTools = aiArticleActionToolsFactory.create(requestId);
 
         TokenUsageAccumulator usage = usageAccumulator == null ? new TokenUsageAccumulator() : usageAccumulator;
+
+        // 单次流式调用的 usage 跟踪：只记峰值，流结束时统一提交一次（原因见 TokenUsageAccumulator.trackPeak）
+        AtomicReference<Usage> peakUsage = new AtomicReference<>();
+        // 提交只做一次：doOnComplete 负责正常路径，doFinally 兜底 cancel
+        AtomicBoolean usageCommitted = new AtomicBoolean(false);
+        Runnable commitUsage = () -> {
+            if (usageCommitted.compareAndSet(false, true)) {
+                usage.add(peakUsage.get());
+            }
+        };
 
         //工具执行在 Spring AI 内部线程池（boundedElastic），ThreadLocal 的 UserContext 拿不到。
         // 在这里（请求线程）读一次 userId，通过 ToolContext 显式传给工具；重跑路径复用同一份。
@@ -83,14 +106,17 @@ public class AiModelServiceImpl implements AiModelService {
                 .toolCallbacks(buildToolCallbacks(prompt))
                 .toolContext(toolContext)
                 .options(OpenAiChatOptions.builder()
+                        .maxTokens(chatMaxTokens)
                         .streamUsage(true)
                         .build())
                 .stream()
                 .chatResponse()
                 .timeout(Duration.ofSeconds(60))
                 .map(response -> {
-                    //工具调用是多轮请求，每轮一个 usage，跨轮累计
-                    usage.add(response.getMetadata().getUsage());
+                    // 只记峰值，**不在这里累加**：同一个"累计 usage"会出现在多个 chunk 里
+                    // （OpenAI 规范只在流末尾补一个收尾 chunk，兼容实现常常多给一个），
+                    // 逐 chunk 累加会把结果成倍放大（实测 ×2）。累计值单调不减，取峰值即取最终值
+                    TokenUsageAccumulator.trackPeak(peakUsage, usageOf(response));
                     // 工具调用轮 result 可能没有文本（getText() 为 null），
                     // Reactor map 不允许 null 值，必须归一为 ""（后续 filter 会去掉）。
                     String text = response.getResult() == null
@@ -106,11 +132,29 @@ public class AiModelServiceImpl implements AiModelService {
                         // toolName/toolInput 为空触发断言炸流。此时 LLM 尚未输出任何文本（第一轮全是工具调用），
                         // 降级非流式重跑：工具循环在非流式路径正常，最终文本切块模拟流式，用户无感知。
                         log.warn("流式工具调用聚合失败，降级非流式重跑: {}", e.getMessage());
-                        return retryNonStreamingWithTools(prompt, requestId, usage, toolContext);
+                        return retryNonStreamingWithTools(prompt, requestId, peakUsage, toolContext);
                     }
                     log.error("AI 流式调用失败", e);
                     return Flux.just(fallbackMessage(e));
-                });
+                })
+                // **提交必须挂 doOnComplete**：它的回调在 onComplete **传播给下游之前**执行，
+                // 这样 `Flux.concat(前置事件, dataStream, stopEvent)` 里那个负责落库的
+                // stopEvent 才读得到。
+                //
+                // ⚠️ 只挂 doFinally 会静默失效：`doFinally` 的回调在 onComplete **传播之后**才跑，
+                // 落库那一刻读到的永远是 0。实测踩过——而且同步流的单测会**假绿**
+                // （同步路径下 doFinally 恰好赶在前面），线上两条消息的 token_count 直接变 0。
+                //
+                // doFinally 保留作 cancel 兜底：用户中途关页面时 token 已经消耗，也该计上。
+                // 两者靠 AtomicBoolean 保证只提交一次
+                .doOnComplete(commitUsage)
+                .doFinally(signalType -> commitUsage.run());
+    }
+
+    /** 安全取 usage：metadata 可能为 null（原先直接 .getMetadata().getUsage() 会 NPE） */
+    private Usage usageOf(ChatResponse response) {
+        return response == null || response.getMetadata() == null
+                ? null : response.getMetadata().getUsage();
     }
 
     /**
@@ -143,7 +187,8 @@ public class AiModelServiceImpl implements AiModelService {
 
     //非流式重跑：tool_calls 在非流式响应里是完整 JSON，无分片聚合问题。
     // 拿到最终全文后按固定长度切块 emit，保持 SSE 流式输出形态（前端无感知）。
-    private Flux<String> retryNonStreamingWithTools(AiPrompt prompt, String requestId, TokenUsageAccumulator usage, Map<String, Object> toolContext) {
+    private Flux<String> retryNonStreamingWithTools(AiPrompt prompt, String requestId,
+                                                    AtomicReference<Usage> peakUsage, Map<String, Object> toolContext) {
         AiNavigationTools aiNavigationTools = aiNavigationToolsFactory.create(requestId);
         AiEditorTools aiEditorTools = aiEditorToolFactory.create(requestId);
         AiArticleActionTools aiArticleActionTools = aiArticleActionToolsFactory.create(requestId);
@@ -161,10 +206,15 @@ public class AiModelServiceImpl implements AiModelService {
                     .tools(tools)
                     .toolCallbacks(buildToolCallbacks(prompt))
                     .toolContext(toolContext)
+                    .options(OpenAiChatOptions.builder()
+                            .maxTokens(chatMaxTokens)
+                            .build())
                     .call()
                     .chatResponse();
 
-            usage.add(response.getMetadata() == null ? null : response.getMetadata().getUsage());
+            // 只记峰值，由外层的 doFinally 统一提交。
+            // **这里不能直接 add**：降级重跑的 Flux 会正常完成，外层 doFinally 也会执行，那样就加两次
+            TokenUsageAccumulator.trackPeak(peakUsage, usageOf(response));
 
             String content = response.getResult() == null || response.getResult().getOutput() == null
                     ? "" : response.getResult().getOutput().getText();

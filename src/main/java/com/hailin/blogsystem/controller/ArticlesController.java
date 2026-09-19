@@ -3,8 +3,10 @@ package com.hailin.blogsystem.controller;
 import com.hailin.blogsystem.entity.vo.PageVO;
 import com.hailin.blogsystem.service.ArticlesService;
 import com.hailin.blogsystem.constants.BlogConstants;
+import com.hailin.blogsystem.utils.ClientIpUtils;
 import com.hailin.blogsystem.utils.Result;
 import com.hailin.blogsystem.entity.vo.ArticleDetailVO;
+import jakarta.servlet.http.HttpServletRequest;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.*;
 
@@ -27,8 +29,9 @@ public class ArticlesController {
     }
 
     @GetMapping("/articles/{id}")  //2.获取公开文章详情
-    public Result getArticlesById(@PathVariable Long id){
-        ArticleDetailVO article = articlesService.getPublicArticleById(id);
+    public Result getArticlesById(@PathVariable Long id, HttpServletRequest request){
+        // 游客的 UV 统计需要 IP；登录用户的身份在 Service 层从 UserContext 取
+        ArticleDetailVO article = articlesService.getPublicArticleById(id, ClientIpUtils.getClientIp(request));
         if (article == null) {
             return Result.error(BlogConstants.ErrorCode.NOT_FOUND, "article not found");
         }

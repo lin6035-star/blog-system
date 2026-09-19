@@ -8,7 +8,9 @@ import com.hailin.blogsystem.entity.dto.MemoryRagContext;
 import com.hailin.blogsystem.service.AiMemoryDecisionService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import com.hailin.blogsystem.ai.LlmResponseSupport;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
@@ -35,7 +37,7 @@ public class AiMemoryDecisionServiceImpl implements AiMemoryDecisionService {
         }
 
         try {
-            String response = chatClientBuilder.build()
+            ChatResponse chatResponse = chatClientBuilder.build()
                     .prompt()
                     .system("""
                             你是一个长期记忆更新决策器。
@@ -78,7 +80,10 @@ public class AiMemoryDecisionServiceImpl implements AiMemoryDecisionService {
                             formatCandidateMemories(safeCandidates)
                     ))
                     .call()
-                    .content();
+                    .chatResponse();
+            // 副产品调用：不落库，只在日志留痕（钱包计费只算主链路）
+            LlmResponseSupport.logUsage("memory_decision", chatResponse);
+            String response = LlmResponseSupport.textOf(chatResponse);
 
             AiMemoryDecisionResult decision = parseDecision(response);
             return aiMemoryDecisionSanitizer.sanitize(decision, safeCandidates);

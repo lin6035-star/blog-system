@@ -1,0 +1,77 @@
+# 生产 Redis 配置片段（Redis 工程化第三刀）
+# 用法：把下面各项合并进服务器的 /etc/redis/redis.conf（或用 include 引入）。
+# 设计依据与取舍理由：docs/redis/redis-capability-design.md §5.8
+# 排查手法：docs/redis/redis-ops-runbook.md
+#
+# 只列「与本项目取舍相关」的项，其余保持 Redis 默认值。
+
+# ===== 内存与淘汰 =====
+# 上限按实例实际内存确定，下面的值只是占位。60~70% 是起点而不是标准：
+# 要留出 RDB/AOF rewrite 时 fork 的写时复制、复制缓冲、客户端输出缓冲。
+# 设成 90% 的典型后果是 fork 时 OOM。
+maxmemory 512mb
+
+# 只淘汰「设了 TTL 的 key」。
+#
+# 前提是「所有允许丢失的数据都有 TTL」，本项目已逐 key 核实满足：
+# 缓存类 3~30 分钟、浏览量 30 分钟、用户集合 40 分钟、热度榜 2 小时、
+# 限流窗口 / 分布式锁 / 幂等键全部自带 TTL。
+#
+# 为什么不用 allkeys-lru：Redis 里除了可丢的缓存，还住着分布式锁、幂等键、
+# 限流计数这类「丢了会出错」的状态。allkeys-* 在内存压力下会一视同仁地把它们
+# 淘汰掉——缓存少一条只是慢一点，锁被淘汰则是并发正确性问题。
+maxmemory-policy volatile-lru
+
+# ===== 持久化 =====
+# 本项目 Redis 大部分是缓存或软状态，所以 AOF 属于「可以讲、不强制」：
+#   开：重启后少丢状态，代价是 fsync 开销与 rewrite 的 fork
+#   不开：重启后缓存全空，靠回源重建；锁 / 幂等失效由 TTL + DB 状态兜底
+# 它不解决 Redis 与 MySQL 的跨系统一致性，也不替代任何补偿逻辑——
+# 不要把它当成「缓存和数据库一致」的答案。
+appendonly yes
+appendfsync everysec
+
+# RDB 保留默认策略即可；如果需要定期备份，改成显式 save 点并配 cron 拷贝。
+
+# ===== 危险命令：用 ACL 按账号限制，不用 rename-command =====
+# 为什么不用 rename-command KEYS ""：它是全局的、不可逆的，而且管理员和迁移脚本
+# 也需要 KEYS；一旦改名，所有调用点（包括运维手册上的命令）跟着失效。
+# ACL 按账号授权，管理员账号不受影响。
+#
+# 应用账号：能跑所有普通命令，但不能跑 @dangerous
+# （KEYS / FLUSHALL / FLUSHDB / CONFIG / DEBUG / SHUTDOWN ...）。
+#
+# 密码推荐写成 SHA256，配置文件里不出现明文：
+#   echo -n '你的应用密码' | sha256sum
+# 写成明文也可以，把 #<hash> 换成 >你的应用密码：
+user blog-app on #<sha256-of-app-password> ~* +@all -@dangerous
+
+# default 用户：设强密码，或直接禁用（应用与运维各用独立账号）
+requirepass <admin-password>
+# 禁用 default：把上一行换成 —— user default off
+
+# 关于 Lettuce 的握手命令 CLIENT SETINFO（Redis 7.2+ 才有）：
+# 在 Redis 6.x 上 CLIENT 归属 @dangerous，会被这条规则拒掉（NOPERM）。
+# 这不影响连接——Lettuce 的 RedisHandshake.applyConnectionMetadataSafely()
+# 用 handle((v,t) -> { log.debug(...); return null; }) 把元数据命令的失败整个吞掉。
+# 依据与出处见设计稿 §5.8；回归测试见 RedisAclRuleTests。
+#
+# 可以进一步按 key 前缀收敛（~article:* ~ai:rate:* ...），代价是每新增一个
+# key 家族都要同步改这里，漏改的症状是运行期 NOPERM。当前用 ~* 换取可维护性，
+# 真正的护栏是「禁掉危险命令」。
+
+# ===== 慢查询日志 =====
+# 超过 10ms 记一条：本项目最重的 Redis 操作是 SCAN(COUNT 200) 和
+# ZREVRANGE(取 10 个成员)，正常都是毫秒级，10ms 足够灵敏又不至于刷屏。
+slowlog-log-slower-than 10000
+slowlog-max-len 128
+
+# ===== 网络 =====
+# 只监听内网/本机。Redis 直接暴露公网是常见的被入侵入口，
+# 公网访问一律走应用层，不要靠 requirepass 兜底。
+bind 127.0.0.1
+protected-mode yes
+
+# 连接数上限：本项目 Lettuce 共享单连接（无 commons-pool2），
+# 但每个应用实例仍会开 1 条连接，加上运维排查的连接，留足余量。
+maxclients 128

@@ -2,6 +2,7 @@ package com.hailin.blogsystem;
 
 import com.baomidou.mybatisplus.core.conditions.update.UpdateWrapper;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.hailin.blogsystem.ai.TokenUsageAccumulator;
 import com.hailin.blogsystem.ai.agent.AgentRunResult;
 import com.hailin.blogsystem.ai.agent.AgentStepDecision;
 import com.hailin.blogsystem.ai.agent.AgentStepEmitter;
@@ -24,6 +25,7 @@ import com.hailin.blogsystem.service.ArticlesService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.springframework.ai.chat.metadata.Usage;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -101,7 +103,7 @@ class ArticleAgentRuntimeTests {
 
     @Test
     void queryArticleThenFinalAnswerCompletesRun() {
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE)
                         .withInput(Map.of("articleId", "12")))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
@@ -122,7 +124,7 @@ class ArticleAgentRuntimeTests {
 
     @Test
     void suggestionWithObservationCarriesArticleId() {
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WORKFLOW)
                         .withInput(Map.of(
@@ -147,7 +149,7 @@ class ArticleAgentRuntimeTests {
 
     @Test
     void zeroObservationSuggestionRejectedThenContinues() {
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WORKFLOW)
                         .withInput(Map.of("workflowType", "OPTIMIZE_ARTICLE")))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
@@ -165,7 +167,7 @@ class ArticleAgentRuntimeTests {
 
     @Test
     void nonOptimizeWorkflowTypeFailsRun() {
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WORKFLOW)
                         .withInput(Map.of("workflowType", "CREATE_ARTICLE", "reason", "想写文章")));
@@ -182,7 +184,7 @@ class ArticleAgentRuntimeTests {
     @Test
     void suggestWriteWithoutObservationRejectedThenContinues() {
         // V3.4：SUGGEST_WRITE 已进文章域白名单，但零观察提案被拒（没查就提案 = 拍脑袋）→ 循环继续
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
                         .withInput(Map.of("actionType", AgentWriteProposal.TYPE_UPDATE_ARTICLE_TITLE,
                                 "newTitle", "Redis 缓存实战")))
@@ -203,7 +205,7 @@ class ArticleAgentRuntimeTests {
     void suggestArticleTitleProposalReachesWaitingConfirm() {
         // V3.4 成功路径：QUERY_ARTICLE 观察 → SUGGEST_WRITE(UPDATE_ARTICLE_TITLE) →
         // 提案端查库拿权威旧标题 → WAITING_WRITE_CONFIRM + pendingWriteAction（articleId 锚 + articleTitle 锚 + newTitle）
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
                         .withInput(Map.of("actionType", AgentWriteProposal.TYPE_UPDATE_ARTICLE_TITLE,
@@ -233,7 +235,7 @@ class ArticleAgentRuntimeTests {
     @Test
     void suggestWriteUnknownActionTypeFailsRun() {
         // V3.4：文章域只认 UPDATE_ARTICLE_TITLE——学习域动作/幻觉动作一律 FAILED 终局，绝不回落到任何动作
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
                         .withInput(Map.of("actionType", AgentWriteProposal.TYPE_UPDATE_TASK_DONE,
@@ -254,7 +256,7 @@ class ArticleAgentRuntimeTests {
 
     @Test
     void suggestWriteMissingNewTitleFailsRun() {
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
                         .withInput(Map.of("actionType", AgentWriteProposal.TYPE_UPDATE_ARTICLE_TITLE)));
@@ -273,7 +275,7 @@ class ArticleAgentRuntimeTests {
     void suggestWriteWithoutPageContextFailsRun() {
         // V3.8：无页面上下文且会话锚 resolve 为空（无决议目标）→ 提案 FAILED；LLM input 摘录不作数
         when(anchorService.resolveReadable(200L, 100L)).thenReturn(null);
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
                         .withInput(Map.of("actionType", AgentWriteProposal.TYPE_UPDATE_ARTICLE_TITLE,
@@ -297,7 +299,7 @@ class ArticleAgentRuntimeTests {
         // 2026-09-10：锚读改可读语义 resolveReadable（返回实体），他人公开文章也可入锚
         when(anchorService.resolveReadable(200L, 100L))
                 .thenReturn(article(12L, 100L, "Java 后端面试突围", 1));
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE)
                         .withInput(Map.of("anchorMode", "SESSION_LAST")))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
@@ -324,7 +326,7 @@ class ArticleAgentRuntimeTests {
         // anchorMode=SESSION_LAST → 提案目标是 12（不是当前页 99，不会被页面上下文抢走）
         when(anchorService.resolveReadable(200L, 100L))
                 .thenReturn(article(12L, 100L, "Java 后端面试突围", 1));
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE)
                         .withInput(Map.of("anchorMode", "SESSION_LAST")))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
@@ -344,7 +346,7 @@ class ArticleAgentRuntimeTests {
     @Test
     void pageContextArticleIsDefaultTargetWhenNoAnchorMode() {
         // V3.8 回归：详情页无 anchorMode（缺省 CURRENT_PAGE）→ 目标 = 当前页文章，提案针对当前页
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
                         .withInput(Map.of("actionType", AgentWriteProposal.TYPE_HIDE_ARTICLE)));
@@ -363,7 +365,7 @@ class ArticleAgentRuntimeTests {
     @Test
     void suggestWriteOtherUsersArticleEndsTerminally() {
         // V3.4：归属失败 → 终局失败（COMPLETED + 友好文案，不误写、不继续循环）
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
                         .withInput(Map.of("actionType", AgentWriteProposal.TYPE_UPDATE_ARTICLE_TITLE,
@@ -386,7 +388,7 @@ class ArticleAgentRuntimeTests {
     @Test
     void suggestWriteSameTitleRejectedThenContinues() {
         // V3.4：新标题 == 当前标题（无变化）→ FAILED step + observation，不弹卡，循环继续由 LLM 告知
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
                         .withInput(Map.of("actionType", AgentWriteProposal.TYPE_UPDATE_ARTICLE_TITLE,
@@ -410,7 +412,7 @@ class ArticleAgentRuntimeTests {
 
     @Test
     void emitterReceivesStepEventsInOrder() {
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
                         .withInput(Map.of("answer", "建议补充小标题")));
@@ -433,7 +435,7 @@ class ArticleAgentRuntimeTests {
 
     @Test
     void maxStepsReachedProducesArticleSummary() {
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE));
         when(executor.execute(any(), any(), any())).thenReturn("第 X 条观察数据");
 
@@ -447,7 +449,7 @@ class ArticleAgentRuntimeTests {
 
     @Test
     void createRunCancelsStalePendingSuggestions() {
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
                         .withInput(Map.of("answer", "好的")));
 
@@ -463,7 +465,7 @@ class ArticleAgentRuntimeTests {
     void terminalFailureEndsRunImmediately() {
         // V2.5 终局失败：文章归属校验失败 → 失败 step 落库后直接结束，
         // 不再走下一轮决策（老大验收：第 1 步结束即可）
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE));
         when(executor.execute(any(), any(), any()))
                 .thenThrow(new com.hailin.blogsystem.ai.agent.ArticleNotOwnedException(
@@ -482,12 +484,12 @@ class ArticleAgentRuntimeTests {
         assertThat(steps.get(0).getActionType()).isEqualTo("QUERY_ARTICLE");
         assertThat(steps.get(0).getStatus()).isEqualTo("FAILED");
         // 决策器只被调用一次（循环已终止）
-        org.mockito.Mockito.verify(decider, org.mockito.Mockito.times(1)).decide(any(), any(), anyInt(), anyInt());
+        org.mockito.Mockito.verify(decider, org.mockito.Mockito.times(1)).decide(any(), any(), anyInt(), anyInt(), any());
     }
 
     @Test
     void executorFailureContinuesLoopAndFailsStep() {
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
                         .withInput(Map.of("answer", "这篇文章不是你的，无法分析")));
@@ -509,7 +511,7 @@ class ArticleAgentRuntimeTests {
     @Test
     void suggestHideArticleProposalReachesWaitingConfirm() {
         // V3.7：已发布文章提隐藏 → 提案（前置 PUBLISHED 满足）→ WAITING_WRITE_CONFIRM
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
                         .withInput(Map.of("actionType", "HIDE_ARTICLE")));
@@ -532,7 +534,7 @@ class ArticleAgentRuntimeTests {
     @Test
     void suggestPublishArticleProposalReachesWaitingConfirm() {
         // V3.7：隐藏中文章提公开 → 提案（前置 HIDDEN 满足）
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
                         .withInput(Map.of("actionType", "PUBLISH_ARTICLE")));
@@ -551,7 +553,7 @@ class ArticleAgentRuntimeTests {
     @Test
     void suggestVisibilityChangeOnDraftFailsRun() {
         // V3.7：草稿拒绝——Agent 不从详情页把草稿发布/隐藏（编辑器人工闸保留）
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
                         .withInput(Map.of("actionType", "HIDE_ARTICLE")));
@@ -571,7 +573,7 @@ class ArticleAgentRuntimeTests {
     @Test
     void suggestHideAlreadyHiddenArticleRejectedThenContinues() {
         // V3.7：已是目标状态（已隐藏再提隐藏）→ FAILED step 不弹卡，循环继续由 LLM 告知
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
                         .withInput(Map.of("actionType", "HIDE_ARTICLE")))
@@ -598,7 +600,7 @@ class ArticleAgentRuntimeTests {
     @Test
     void finalAnswerAfterReadingArticleWritesConclusionAnchor() {
         // 主路径：读过文章 + FINAL_ANSWER → 写结论锚（存 finalAnswer 原文）
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
                         .withInput(Map.of("answer", "建议补充缓存击穿原理")));
@@ -617,7 +619,7 @@ class ArticleAgentRuntimeTests {
     void finalAnswerWithoutReadingArticleSkipsAnchor() {
         // 证据边界：目标文章已决议但没成功读过 → 不把无证据回答存成结论锚。
         // （V3.11 R1 正常会拦，但验证器 fail-open 时本条件是唯一防线）
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SEARCH_RAG)
                         .withInput(Map.of("keyword", "缓存")))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
@@ -634,7 +636,7 @@ class ArticleAgentRuntimeTests {
     @Test
     void anchorWriteFailureDoesNotBreakAnswer() {
         // fail-open：写锚抛异常不能影响用户看到回答
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
                         .withInput(Map.of("answer", "建议补充示例")));
@@ -654,7 +656,7 @@ class ArticleAgentRuntimeTests {
 
     @Test
     void firstStepPlanIsPersistedBySingleColumnUpdateAndEmitted() {
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(new AgentStepDecision(
                         AgentStepActionType.QUERY_ARTICLE,
                         Map.of("articleId", "12"),
@@ -682,7 +684,7 @@ class ArticleAgentRuntimeTests {
     @Test
     void planNeverEntersObservations() {
         // 关键隔离锁：计划一旦进 observations，Verifier 会把它当证据
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(new AgentStepDecision(
                         AgentStepActionType.QUERY_ARTICLE,
                         Map.of("articleId", "12"),
@@ -703,7 +705,7 @@ class ArticleAgentRuntimeTests {
     @Test
     void invalidPlanIsDroppedWithoutEmitting() {
         // 1 项不是多目标 → 整条丢弃（零修补），不发事件、不影响流程
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(new AgentStepDecision(
                         AgentStepActionType.QUERY_ARTICLE,
                         Map.of("articleId", "12"),
@@ -724,7 +726,7 @@ class ArticleAgentRuntimeTests {
     @Test
     void planSkippedWhenFirstStepIsTerminal() {
         // 首步即终态/需澄清 → 没有实际执行基线，计划无法用于观测，且可能在澄清前误导用户
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(new AgentStepDecision(
                         AgentStepActionType.ASK_USER,
                         Map.of("question", "你指的是哪篇？"),
@@ -741,7 +743,7 @@ class ArticleAgentRuntimeTests {
     @Test
     void planFromNonFirstStepIsIgnored() {
         // 只在首步采集；第二步即使带 plan 也忽略
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE)
                         .withInput(Map.of("articleId", "12")))
                 .thenReturn(new AgentStepDecision(
@@ -760,7 +762,7 @@ class ArticleAgentRuntimeTests {
     @Test
     void planNotEmittedWhenPersistMissesRunRow() {
         // 落库影响行数≠1 → 只记日志不发事件（防「实时有计划、库里没有」分叉），且不影响流程
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(new AgentStepDecision(
                         AgentStepActionType.QUERY_ARTICLE,
                         Map.of("articleId", "12"),
@@ -784,7 +786,7 @@ class ArticleAgentRuntimeTests {
     @Test
     void duplicatedQueryIsRejectedWithoutExecuting() {
         // 同一动作 + 同一参数第二次出现 → 不执行、落 SKIPPED step、观察带可执行的下一步
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_MEMORY)
                         .withInput(Map.of("question", "写作偏好")))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_MEMORY)
@@ -825,7 +827,7 @@ class ArticleAgentRuntimeTests {
         //
         // 注意：判据里的「动作 + 参数 + 曾成功」由 SQL WHERE 完成，纯单测环境无法回放
         // （mock 只能验证"检查发生过"）。参数匹配的正确性靠手测覆盖。
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE)
                         .withInput(Map.of("articleId", "12")))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
@@ -844,7 +846,7 @@ class ArticleAgentRuntimeTests {
     void observationsCarrySourceTagWithoutInternalIds() {
         // 治本契约：模型必须看得见「做过什么动作、用什么参数」——
         // 否则它无法确认某段结果是不是「我要查的那个查询」的产物，只能用重复查询试探。
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE)
                         .withInput(Map.of("articleId", "2085208555163787287", "focus", "缓存击穿")))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
@@ -874,6 +876,87 @@ class ArticleAgentRuntimeTests {
                 sink.add(plan);
             }
         };
+    }
+
+    // ==================== token 统计（2026-09-17） ====================
+
+    /**
+     * 决策器消耗的 token 要同时落到 **run 级**（各步之和）和 **step 级**（谁花的算谁的）。
+     *
+     * 真实 LlmAgentStepDecider 会把 usage 写进 decide 的第 5 个出参，这里用 thenAnswer 模拟。
+     * usage 对象在 stub 之前构造好——在 answer 里调 mock(...) 会打断 Mockito 的 stubbing 状态机。
+     */
+    @Test
+    void tokensAreAccumulatedIntoRunAndStep() {
+        Usage firstStepUsage = mockUsage(100, 10, 110);
+        Usage secondStepUsage = mockUsage(200, 20, 220);
+
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
+                .thenAnswer(inv -> {
+                    inv.getArgument(4, TokenUsageAccumulator.class).add(firstStepUsage);
+                    return AgentStepDecision.of(AgentStepActionType.QUERY_ARTICLE)
+                            .withInput(Map.of("articleId", "12"));
+                })
+                .thenAnswer(inv -> {
+                    inv.getArgument(4, TokenUsageAccumulator.class).add(secondStepUsage);
+                    return AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
+                            .withInput(Map.of("answer", "看完了"));
+                });
+        when(executor.execute(any(), any(), any())).thenReturn("当前文章分析：\n- 标题：《Redis》");
+
+        AgentRunResult result = runtime.run(100L, 200L, "帮我看看这篇文章",
+                articleContext("12"), AgentStepEmitter.noop());
+
+        assertThat(result.totalTokens())
+                .as("AgentRunResult 要带回 run 的 token——聊天链路拿它写 ai_messages.token_count")
+                .isEqualTo(330);
+
+        // run 级 = 各步之和
+        AiAgentRun saved = captureRun();
+        assertThat(saved.getTotalTokens()).isEqualTo(330);
+        assertThat(saved.getInputTokens()).isEqualTo(300);
+        assertThat(saved.getOutputTokens()).isEqualTo(30);
+
+        // step 级 = 各步自己的用量
+        List<AiAgentStep> steps = captureSteps();
+        assertThat(steps).hasSize(2);
+        assertThat(steps.get(0).getInputTokens()).isEqualTo(100);
+        assertThat(steps.get(0).getOutputTokens()).isEqualTo(10);
+        assertThat(steps.get(1).getInputTokens()).isEqualTo(200);
+        assertThat(steps.get(1).getOutputTokens()).isEqualTo(20);
+    }
+
+    /**
+     * finally 兜底：token 还要走一次**单列更新**落库。
+     *
+     * run 的出口有 8 个，各自的 updateById 顺带写入；兜底这一道防的是
+     * 「某个出口走的是不带全字段的单列 UPDATE」——那种情况下 token 会丢。
+     */
+    @Test
+    void tokensArePersistedByDedicatedSingleColumnUpdate() {
+        Usage singleStepUsage = mockUsage(100, 10, 110);
+
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
+                .thenAnswer(inv -> {
+                    inv.getArgument(4, TokenUsageAccumulator.class).add(singleStepUsage);
+                    return AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
+                            .withInput(Map.of("answer", "好的"));
+                });
+
+        runtime.run(100L, 200L, "好的", articleContext("12"), AgentStepEmitter.noop());
+
+        ArgumentCaptor<UpdateWrapper<AiAgentRun>> captor = ArgumentCaptor.forClass(UpdateWrapper.class);
+        verify(runMapper, atLeastOnce()).update(any(), captor.capture());
+        assertThat(captor.getAllValues())
+                .anyMatch(w -> w.getSqlSet() != null && w.getSqlSet().contains("total_tokens"));
+    }
+
+    private static Usage mockUsage(int prompt, int completion, int total) {
+        Usage usage = mock(Usage.class);
+        when(usage.getPromptTokens()).thenReturn(prompt);
+        when(usage.getCompletionTokens()).thenReturn(completion);
+        when(usage.getTotalTokens()).thenReturn(total);
+        return usage;
     }
 
     private AiAgentRun captureRun() {

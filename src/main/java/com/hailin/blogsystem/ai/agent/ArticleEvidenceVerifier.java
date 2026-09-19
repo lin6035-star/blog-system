@@ -3,11 +3,14 @@ package com.hailin.blogsystem.ai.agent;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hailin.blogsystem.ai.AiJudgeModelSupport;
+import com.hailin.blogsystem.ai.LlmResponseSupport;
+import com.hailin.blogsystem.ai.TokenUsageAccumulator;
 import com.hailin.blogsystem.entity.AiAgentRun;
 import com.hailin.blogsystem.entity.dto.AgentStepActionType;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.stereotype.Component;
 
@@ -86,26 +89,34 @@ public class ArticleEvidenceVerifier {
             return Verdict.sufficient();
         }
 
+        // 语义闸的用量算进 run：它不是某一步的成本，而是收尾前的独立校验
         String context = clipContext(observations);
-        String json = callVerify(run.getGoal(), context, answer, false);
-        Verdict verdict = parseVerdict(json);
-        if (verdict != null) {
-            return verdict;
+        TokenUsageAccumulator usage = new TokenUsageAccumulator();
+        try {
+            String json = callVerify(run.getGoal(), context, answer, false, usage);
+            Verdict verdict = parseVerdict(json);
+            if (verdict != null) {
+                return verdict;
+            }
+            // JSON 解析失败修复一次
+            String repaired = callVerify(run.getGoal(), context, answer, true, usage);
+            verdict = parseVerdict(repaired);
+            if (verdict != null) {
+                log.info("Verifier JSON 修复成功");
+                return verdict;
+            }
+            log.warn("Verifier JSON 两次解析均失败，fail-open 放行。runId={}", run.getId());
+            return Verdict.sufficient();
+        } finally {
+            // 放行 / 拦截 / 抛异常——token 都已经消耗了，先记上再走
+            AgentTokenRecorder.accumulate(run, usage);
         }
-        // JSON 解析失败修复一次
-        String repaired = callVerify(run.getGoal(), context, answer, true);
-        verdict = parseVerdict(repaired);
-        if (verdict != null) {
-            log.info("Verifier JSON 修复成功");
-            return verdict;
-        }
-        log.warn("Verifier JSON 两次解析均失败，fail-open 放行。runId={}", run.getId());
-        return Verdict.sufficient();
     }
 
-    private String callVerify(String goal, String context, String answer, boolean repair) {
+    private String callVerify(String goal, String context, String answer, boolean repair,
+                              TokenUsageAccumulator usage) {
         try {
-            return chatClientBuilder.build()
+            ChatResponse response = chatClientBuilder.build()
                     .prompt()
                     .system(buildSystemPrompt(repair))
                     .user(buildUserPrompt(goal, context, answer))
@@ -114,7 +125,9 @@ public class ArticleEvidenceVerifier {
                             .temperature(TEMPERATURE))
                             .build())
                     .call()
-                    .content();
+                    .chatResponse();
+            TokenUsageAccumulator.addTo(usage, LlmResponseSupport.usageOf(response));
+            return LlmResponseSupport.textOf(response);
         } catch (Exception e) {
             log.warn("Verifier 调用失败，fail-open 放行。goal={}", truncate(goal, 100), e);
             return null;

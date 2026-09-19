@@ -81,6 +81,7 @@ public class UserSetCache {
             """, Long.class);
 
     private final StringRedisTemplate stringRedisTemplate;
+    private final AfterCommitExecutor afterCommitExecutor;
 
     /**
      * 读取已加载的集合。
@@ -161,18 +162,26 @@ public class UserSetCache {
         maintain(setKey, element, "REMOVE");
     }
 
+    /**
+     * 集合维护走 {@link AfterCommitExecutor}：调用方（点赞 / 取消点赞）在事务里，
+     * 提交前动集合会出现"事务回滚了、集合却已经改了"的错位——
+     * 最坏是取消最后一项把状态写成 EMPTY，而那条取消根本没生效。
+     * 读路径的 {@link #markLoaded} 不走它：回填必须立即生效给后续请求用，且读路径本就没有事务。
+     */
     private void maintain(String setKey, String element, String action) {
-        try {
-            stringRedisTemplate.execute(MAINTAIN_SCRIPT,
-                    List.of(setKey, loadedKey(setKey)),
-                    element,
-                    String.valueOf(TimeUnit.MINUTES.toSeconds(RedisConstants.USER_SET_TTL_MINUTES)),
-                    String.valueOf(TimeUnit.MINUTES.toSeconds(RedisConstants.USER_SET_LOADED_TTL_MINUTES)),
-                    action);
-        } catch (Exception e) {
-            // 集合维护失败不影响业务结果：点赞本身已落库，下次读集合时从 DB 重建
-            log.warn("用户集合缓存维护失败，setKey={} element={} action={}", setKey, element, action, e);
-        }
+        afterCommitExecutor.execute(() -> {
+            try {
+                stringRedisTemplate.execute(MAINTAIN_SCRIPT,
+                        List.of(setKey, loadedKey(setKey)),
+                        element,
+                        String.valueOf(TimeUnit.MINUTES.toSeconds(RedisConstants.USER_SET_TTL_MINUTES)),
+                        String.valueOf(TimeUnit.MINUTES.toSeconds(RedisConstants.USER_SET_LOADED_TTL_MINUTES)),
+                        action);
+            } catch (Exception e) {
+                // 集合维护失败不影响业务结果：点赞本身已落库，下次读集合时从 DB 重建
+                log.warn("用户集合缓存维护失败，setKey={} element={} action={}", setKey, element, action, e);
+            }
+        });
     }
 
     private String loadedKey(String setKey) {

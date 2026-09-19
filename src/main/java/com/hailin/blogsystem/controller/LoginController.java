@@ -6,7 +6,9 @@ import com.hailin.blogsystem.entity.vo.AuthVO;
 import com.hailin.blogsystem.entity.vo.UsersVO;
 import com.hailin.blogsystem.constants.BlogConstants;
 import com.hailin.blogsystem.service.LoginService;
+import com.hailin.blogsystem.utils.ClientIpUtils;
 import com.hailin.blogsystem.utils.Result;
+import jakarta.servlet.http.HttpServletRequest;
 import lombok.RequiredArgsConstructor;
 import org.springframework.util.StringUtils;
 import org.springframework.web.bind.annotation.*;
@@ -51,7 +53,7 @@ public class LoginController {
     }
 
     @PostMapping("/auth/login")  //登录
-    public Result<AuthVO> login(@RequestBody LoginDTO loginDTO){
+    public Result<AuthVO> login(@RequestBody LoginDTO loginDTO, HttpServletRequest request){
         if (loginDTO == null) {
             return Result.error(BlogConstants.ErrorCode.BAD_REQUEST, "请求参数不能为空");
         }
@@ -64,13 +66,20 @@ public class LoginController {
             return Result.error(BlogConstants.ErrorCode.BAD_REQUEST, "密码不能为空");
         }
 
-        AuthVO authVO = loginService.login(loginDTO);
+        AuthVO authVO = loginService.login(loginDTO, ClientIpUtils.getClientIp(request));
 
         return Result.success(authVO);
     }
 
     @PostMapping("/auth/logout")  //退出登录
-    public Result logout(){
+    public Result logout(HttpServletRequest request){
+        // /api/auth/** 不在任何拦截器的路径里，token 需要在这里手动取。
+        // 幂等：没带 token 或 token 已失效也返回成功——登出要达成的状态本来就是"未登录"
+        String authHeader = request.getHeader("Authorization");
+        if (authHeader != null && authHeader.startsWith("Bearer ")) {
+            loginService.logout(authHeader.substring(7));
+        }
+
         return Result.success();
     }
 }

@@ -322,6 +322,9 @@ CREATE TABLE IF NOT EXISTS ai_agent_runs (
     context_json CLOB,
     plan_json CLOB,
     final_answer CLOB,
+    input_tokens INT NOT NULL DEFAULT 0,
+    output_tokens INT NOT NULL DEFAULT 0,
+    total_tokens INT NOT NULL DEFAULT 0,
     error_message VARCHAR(1000),
     created_at TIMESTAMP NOT NULL,
     updated_at TIMESTAMP NOT NULL
@@ -340,6 +343,8 @@ CREATE TABLE IF NOT EXISTS ai_agent_steps (
     output_json CLOB,
     status VARCHAR(32) NOT NULL,
     duration_ms BIGINT,
+    input_tokens INT NOT NULL DEFAULT 0,
+    output_tokens INT NOT NULL DEFAULT 0,
     error_message VARCHAR(1000),
     created_at TIMESTAMP NOT NULL
 );
@@ -366,3 +371,103 @@ CREATE UNIQUE INDEX IF NOT EXISTS uk_ai_conversation_summary_session
 
 CREATE INDEX IF NOT EXISTS idx_ai_conversation_summary_user_session
     ON ai_conversation_summaries (user_id, session_id);
+
+
+-- ============================================
+-- 钱包与秒杀（设计稿：docs/redis/钱包与秒杀计划.md）
+-- 与 db/init.sql 第 21-26 节保持一致；这里是 H2 语法（无 COMMENT/ENGINE，DATETIME→TIMESTAMP）
+-- ============================================
+
+CREATE TABLE IF NOT EXISTS user_wallet (
+    id BIGINT PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    balance BIGINT NOT NULL DEFAULT 0,
+    balance_seq BIGINT NOT NULL DEFAULT 0,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uk_wallet_user_id UNIQUE (user_id),
+    CONSTRAINT chk_wallet_balance_floor CHECK (balance >= -1000000)
+);
+
+CREATE TABLE IF NOT EXISTS wallet_transaction (
+    id BIGINT PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    amount BIGINT NOT NULL,
+    balance_after BIGINT NOT NULL,
+    balance_seq BIGINT NOT NULL,
+    type VARCHAR(32) NOT NULL,
+    biz_type VARCHAR(32) NOT NULL,
+    biz_id VARCHAR(128) NOT NULL,
+    idempotency_key VARCHAR(128) NOT NULL,
+    remark VARCHAR(255),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uk_wallet_tx_user_idem UNIQUE (user_id, idempotency_key),
+    CONSTRAINT uk_wallet_tx_user_seq UNIQUE (user_id, balance_seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_wallet_tx_user ON wallet_transaction (user_id, id);
+
+CREATE TABLE IF NOT EXISTS wallet_recharge_order (
+    id BIGINT PRIMARY KEY,
+    order_no VARCHAR(64) NOT NULL,
+    user_id BIGINT NOT NULL,
+    package_code VARCHAR(32) NOT NULL,
+    pay_amount BIGINT NOT NULL,
+    credit_amount BIGINT NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    version INT NOT NULL DEFAULT 0,
+    paid_at TIMESTAMP,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uk_recharge_order_no UNIQUE (order_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_recharge_user ON wallet_recharge_order (user_id, created_at);
+
+CREATE TABLE IF NOT EXISTS ai_billing_order (
+    id BIGINT PRIMARY KEY,
+    order_no VARCHAR(64) NOT NULL,
+    user_id BIGINT NOT NULL,
+    biz_type VARCHAR(32) NOT NULL,
+    biz_id VARCHAR(128) NOT NULL,
+    resource_id VARCHAR(128),
+    status VARCHAR(16) NOT NULL,
+    reserved_credit BIGINT NOT NULL,
+    actual_credit BIGINT,
+    prompt_tokens INT,
+    completion_tokens INT,
+    total_tokens INT,
+    version INT NOT NULL DEFAULT 0,
+    expire_at TIMESTAMP NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    settled_at TIMESTAMP,
+    CONSTRAINT uk_billing_biz UNIQUE (biz_type, biz_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_billing_status_expire ON ai_billing_order (status, expire_at);
+CREATE INDEX IF NOT EXISTS idx_billing_user_status ON ai_billing_order (user_id, status);
+
+CREATE TABLE IF NOT EXISTS seckill_activity (
+    id BIGINT PRIMARY KEY,
+    name VARCHAR(64) NOT NULL,
+    total_stock INT NOT NULL,
+    sold_count INT NOT NULL DEFAULT 0,
+    credit_amount BIGINT NOT NULL,
+    start_at TIMESTAMP NOT NULL,
+    end_at TIMESTAMP NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_seckill_activity_status ON seckill_activity (status, start_at, end_at);
+
+CREATE TABLE IF NOT EXISTS seckill_order (
+    id BIGINT PRIMARY KEY,
+    activity_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    credit_amount BIGINT NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uk_seckill_user_activity UNIQUE (user_id, activity_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_seckill_order_activity ON seckill_order (activity_id, status);

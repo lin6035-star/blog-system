@@ -2,6 +2,7 @@ package com.hailin.blogsystem.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.hailin.blogsystem.component.AfterCommitExecutor;
 import com.hailin.blogsystem.component.UserSetCache;
 import com.hailin.blogsystem.constants.RedisConstants;
 import com.hailin.blogsystem.entity.ArticleLikes;
@@ -11,6 +12,7 @@ import com.hailin.blogsystem.mapper.ArticlesMapper;
 import com.hailin.blogsystem.service.ArticleLikesService;
 import com.hailin.blogsystem.utils.UserContext;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -18,12 +20,14 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.LocalDateTime;
 
 @Service
+@Slf4j
 @RequiredArgsConstructor
 public class ArticleLikesServiceImpl extends ServiceImpl<ArticleLikesMapper, ArticleLikes> implements ArticleLikesService {
 
     private final ArticlesMapper articlesMapper;
     private final StringRedisTemplate stringRedisTemplate;
     private final UserSetCache userSetCache;
+    private final AfterCommitExecutor afterCommitExecutor;
 
     @Override  //1.点赞文章
     @Transactional
@@ -98,7 +102,23 @@ public class ArticleLikesServiceImpl extends ServiceImpl<ArticleLikesMapper, Art
         userSetCache.removeIfLoaded(
                 RedisConstants.ARTICLE_LIKED_USER_KEY_PREFIX + userId, String.valueOf(articleId));
 
-        stringRedisTemplate.delete(RedisConstants.ARTICLE_DETAIL_KEY_PREFIX + articleId);
+        evictArticleDetailCache(articleId);
+    }
+
+    /**
+     * 点赞数展示在文章详情页，点赞/取消要失效详情缓存。
+     * **这两个方法都在 `@Transactional` 里**：提交前删会让"删完到提交之间"的读请求
+     * 读到库里的旧点赞数并回填，缓存一直脏到 TTL——所以交给 {@link AfterCommitExecutor}。
+     */
+    private void evictArticleDetailCache(Long articleId) {
+        String key = RedisConstants.ARTICLE_DETAIL_KEY_PREFIX + articleId;
+        afterCommitExecutor.execute(() -> {
+            try {
+                stringRedisTemplate.delete(key);
+            } catch (Exception e) {
+                log.warn("[CACHE-EVICT-FAIL] 文章详情缓存删除失败，将靠 TTL 兜底: key={}", key, e);
+            }
+        });
     }
 
 }

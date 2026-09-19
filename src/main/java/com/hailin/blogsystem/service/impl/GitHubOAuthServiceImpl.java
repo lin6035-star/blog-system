@@ -6,6 +6,7 @@ import com.hailin.blogsystem.entity.Users;
 import com.hailin.blogsystem.exception.BusinessException;
 import com.hailin.blogsystem.mapper.LoginMapper;
 import com.hailin.blogsystem.service.GitHubOAuthService;
+import com.hailin.blogsystem.service.WalletService;
 import com.hailin.blogsystem.utils.JwtUtil;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
@@ -22,6 +23,7 @@ public class GitHubOAuthServiceImpl extends ServiceImpl<LoginMapper, Users>
         implements GitHubOAuthService {
 
     private final JwtUtil jwtUtil;
+    private final WalletService walletService;
     private final RestClient restClient;
 
     @Value("${github.oauth.client-id}")
@@ -33,8 +35,9 @@ public class GitHubOAuthServiceImpl extends ServiceImpl<LoginMapper, Users>
     @Value("${github.oauth.redirect-uri}")
     private String redirectUri;
 
-    public GitHubOAuthServiceImpl(JwtUtil jwtUtil) {
+    public GitHubOAuthServiceImpl(JwtUtil jwtUtil, WalletService walletService) {
         this.jwtUtil = jwtUtil;
+        this.walletService = walletService;
         this.restClient = RestClient.builder().build();
     }
 
@@ -153,6 +156,11 @@ public class GitHubOAuthServiceImpl extends ServiceImpl<LoginMapper, Users>
         user.setCreatedAt(LocalDateTime.now());
         user.setUpdatedAt(LocalDateTime.now());
         save(user);
+        // 这里没有外层事务（handleCallback 在此之前有两次调 GitHub 的 HTTP 请求，
+        // 包进事务就成了「长事务 + 事务内远程调用」），所以送礼是独立事务。
+        // 极端情况下会留下一个「账号建好了但没额度」的用户——赠品本就是白送的，
+        // 他去钱包页充值即可补上，不值得为此引入自注入 + 事务方法拆分。
+        walletService.grantInitialCredit(user.getId());
 
         return user;
     }

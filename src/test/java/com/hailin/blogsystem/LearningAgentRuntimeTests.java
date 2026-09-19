@@ -71,7 +71,7 @@ class LearningAgentRuntimeTests {
 
     @Test
     void finalAnswerCompletesRun() {
-        when(decider.decide(any(), any(), anyInt(), anyInt())).thenReturn(
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any())).thenReturn(
                 AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
                         .withInput(Map.of("answer", "今天建议学 Redis 持久化"))
         );
@@ -95,7 +95,7 @@ class LearningAgentRuntimeTests {
 
     @Test
     void askUserMarksWaitingUser() {
-        when(decider.decide(any(), any(), anyInt(), anyInt())).thenReturn(
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any())).thenReturn(
                 AgentStepDecision.of(AgentStepActionType.ASK_USER)
                         .withInput(Map.of("question", "你有多个 Redis 相关计划，想学哪个？"))
         );
@@ -111,7 +111,7 @@ class LearningAgentRuntimeTests {
 
     @Test
     void queryDashboardThenFinalAnswer() {
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_LEARNING_DASHBOARD))
                 .thenReturn(
                         AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
@@ -140,7 +140,7 @@ class LearningAgentRuntimeTests {
 
     @Test
     void nullDecisionFailsRun() {
-        when(decider.decide(any(), any(), anyInt(), anyInt())).thenReturn(null);
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any())).thenReturn(null);
 
         AgentRunResult result = runtime.run(100L, 200L, "今天学什么");
 
@@ -151,7 +151,7 @@ class LearningAgentRuntimeTests {
 
     @Test
     void deciderExceptionFailsRun() {
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenThrow(new RuntimeException("LLM 调用失败"));
 
         AgentRunResult result = runtime.run(100L, 200L, "今天学什么");
@@ -163,7 +163,7 @@ class LearningAgentRuntimeTests {
     @Test
     void maxStepsReachedProducesSummary() {
         // 永远不终态，只查询，跑满 maxSteps(5)
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_LEARNING_DASHBOARD));
         when(executor.execute(any(), any(), any())).thenReturn("第 X 条观察数据");
 
@@ -179,7 +179,7 @@ class LearningAgentRuntimeTests {
     void zeroObservationSuggestionRejectedThenContinues() {
         // V2.1 裁判：首轮零观察 SUGGEST_WORKFLOW 被拒（没查就拍脑袋），
         // 落 FAILED step + 拒绝提示进上下文，循环继续
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WORKFLOW)
                         .withInput(Map.of("workflowType", "LEARNING_PROGRESS", "reason", "学乱了")))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
@@ -202,7 +202,7 @@ class LearningAgentRuntimeTests {
     @Test
     void suggestionWithObservationMarksWaitingWorkflowConfirm() {
         // V2.1：先查询（有观察）再建议 → WAITING_WORKFLOW_CONFIRM + suggestion 透出 + context 落库
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_LEARNING_DASHBOARD))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WORKFLOW)
                         .withInput(Map.of(
@@ -235,7 +235,7 @@ class LearningAgentRuntimeTests {
     @Test
     void forbiddenWorkflowTypeFailsRun() {
         // V2.1：建议文章类 Workflow 不在 allowlist → FAILED
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_LEARNING_DASHBOARD))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WORKFLOW)
                         .withInput(Map.of("workflowType", "CREATE_ARTICLE", "reason", "想写文章")));
@@ -253,7 +253,7 @@ class LearningAgentRuntimeTests {
         // V2.3：思考面板事件序列——动作 RUNNING → SUCCESS，终态 SUCCESS
         // V3.10：thoughtSummary 携带断言——决策 1 带思考摘要，事件 RUNNING/SUCCESS 同一句（D4），
         // 终态 FINAL_ANSWER 无摘要 → null
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(new AgentStepDecision(AgentStepActionType.QUERY_LEARNING_DASHBOARD,
                         Map.of(), "先看看你今天的学习计划"))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
@@ -293,7 +293,7 @@ class LearningAgentRuntimeTests {
     @Test
     void writeProposalWithObservationMarksWaitingWriteConfirm() {
         // V2.4：先查询（有观察）再提案写动作 → WAITING_WRITE_CONFIRM + proposal 透出
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_LEARNING_DASHBOARD))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
                         .withInput(Map.of(
@@ -319,7 +319,7 @@ class LearningAgentRuntimeTests {
     @Test
     void addTaskProposalWithObservationMarksWaitingWriteConfirm() {
         // V3.1：内层 actionType=ADD_LEARNING_TASK（外层仍是 SUGGEST_WRITE，双层同名字段分层语义）
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_LEARNING_DASHBOARD))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
                         .withInput(Map.of(
@@ -345,7 +345,7 @@ class LearningAgentRuntimeTests {
     void addTaskProposalRejectedWhenDuplicateTaskExists() {
         // V3.1 补充：目标阶段已存在同名任务 → 提案前预检拒绝（FAILED step）→ LLM 直接告知，
         // 不弹确认卡（原来 confirm 才报「已存在」，用户确认了个寂寞）
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_LEARNING_DASHBOARD))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
                         .withInput(Map.of(
@@ -379,7 +379,7 @@ class LearningAgentRuntimeTests {
     @Test
     void renameProposalWithObservationMarksWaitingWriteConfirm() {
         // V3.3：内层 actionType=UPDATE_LEARNING_TASK → proposal 带 taskTitle(旧名) + newTitle(新名)，done 恒 false
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_LEARNING_DASHBOARD))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
                         .withInput(Map.of(
@@ -408,7 +408,7 @@ class LearningAgentRuntimeTests {
     @Test
     void renameProposalRejectedWhenNewTitleAlreadyExists() {
         // V3.3：新名与阶段内其他任务撞名 → 提案前预检拒绝（FAILED step）→ LLM 直接告知，不弹确认卡
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_LEARNING_DASHBOARD))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
                         .withInput(Map.of(
@@ -442,7 +442,7 @@ class LearningAgentRuntimeTests {
     @Test
     void renameProposalRejectedWhenNewTitleSameAsOld() {
         // V3.3 边界：同名改名（newTitle == taskTitle）——precheck 排除自身必漏，调用点显式拒绝
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_LEARNING_DASHBOARD))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
                         .withInput(Map.of(
@@ -470,7 +470,7 @@ class LearningAgentRuntimeTests {
     void renameProposalWithUnknownActionTypeFailsRun() {
         // V3.3（Codex 评审收紧）：非空但不认识的 actionType（模型幻觉 DELETE/MOVE 等）→ FAILED 不生成提案，
         // 绝不回落 UPDATE_TASK_DONE（回落 + done 缺省 true = 误勾选任务）
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_LEARNING_DASHBOARD))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
                         .withInput(Map.of(
@@ -517,7 +517,7 @@ class LearningAgentRuntimeTests {
 
     @Test
     void writeProposalWithoutTaskTitleFailsRun() {
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.QUERY_LEARNING_DASHBOARD))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
                         .withInput(Map.of("stageTitle", "阶段一")));
@@ -533,7 +533,7 @@ class LearningAgentRuntimeTests {
     @Test
     void zeroObservationWriteProposalRejectedThenContinues() {
         // V2.4：首轮零观察 SUGGEST_WRITE 被拒，循环继续
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SUGGEST_WRITE)
                         .withInput(Map.of("taskTitle", "缓存击穿")))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
@@ -551,7 +551,7 @@ class LearningAgentRuntimeTests {
     @Test
     void createRunCancelsStalePendingSuggestions() {
         // V2.1：新 run 创建时把同 session 旧的 WAITING_WORKFLOW_CONFIRM 置 CANCELLED
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
                         .withInput(Map.of("answer", "好的")));
 
@@ -564,7 +564,7 @@ class LearningAgentRuntimeTests {
 
     @Test
     void executorFailureContinuesLoopAndFailsStep() {
-        when(decider.decide(any(), any(), anyInt(), anyInt()))
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any()))
                 .thenReturn(AgentStepDecision.of(AgentStepActionType.SEARCH_RAG))
                 .thenReturn(
                         AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
@@ -595,7 +595,7 @@ class LearningAgentRuntimeTests {
         when(learningPlanAnchorService.resolve(200L, 100L)).thenReturn(anchor);
 
         AtomicReference<String> seenGoal = new AtomicReference<>();
-        when(decider.decide(any(), any(), anyInt(), anyInt())).thenAnswer(inv -> {
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any())).thenAnswer(inv -> {
             seenGoal.set(inv.getArgument(0));
             return AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
                     .withInput(Map.of("answer", "好的"));
@@ -615,7 +615,7 @@ class LearningAgentRuntimeTests {
         when(learningPlanAnchorService.resolve(200L, 100L)).thenReturn(null);
 
         AtomicReference<String> seenGoal = new AtomicReference<>();
-        when(decider.decide(any(), any(), anyInt(), anyInt())).thenAnswer(inv -> {
+        when(decider.decide(any(), any(), anyInt(), anyInt(), any())).thenAnswer(inv -> {
             seenGoal.set(inv.getArgument(0));
             return AgentStepDecision.of(AgentStepActionType.FINAL_ANSWER)
                     .withInput(Map.of("answer", "好的"));

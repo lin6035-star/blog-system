@@ -174,7 +174,7 @@ public class LearningAgentRuntime extends AbstractAgentRuntime implements AgentR
         if (observations.isEmpty()) {
             String rejectReason = "首轮零观察写动作提案被拒绝：必须先执行至少一个只读查询";
             emitter.emit(nextStepNo, "SUGGEST_WRITE", "FAILED", "提案被拒绝：需先完成一次查询", null);
-            recordRejectedStep(run, decision, nextStepNo, rejectReason);
+            recordRejectedStep(run, decision, nextStepNo, rejectReason, null);
             observations.add("系统提示：你在没有任何查询结果时尝试提案写动作，后端已拒绝。"
                     + "请先执行只读查询（QUERY_LEARNING_DASHBOARD / QUERY_MEMORY / SEARCH_RAG）再决策。");
             run.setCurrentStep(nextStepNo);
@@ -242,7 +242,7 @@ public class LearningAgentRuntime extends AbstractAgentRuntime implements AgentR
                 int nextStepNo = run.getUsedSteps() + 1;
                 String rejectReason = "目标阶段已存在同名任务「" + taskTitle + "」，追加提案被拒绝";
                 emitter.emit(nextStepNo, "SUGGEST_WRITE", "FAILED", rejectReason, null);
-                recordRejectedStep(run, decision, nextStepNo, rejectReason);
+                recordRejectedStep(run, decision, nextStepNo, rejectReason, null);
                 observations.add("系统提示：目标阶段「" + stageTitle + "」已存在同名任务「" + taskTitle
                         + "」，后端拒绝了追加提案。请直接告知用户该任务已存在（不要生成追加提案，"
                         + "如用户确实要加可建议换成其他任务名或先查看现有任务）。");
@@ -268,7 +268,7 @@ public class LearningAgentRuntime extends AbstractAgentRuntime implements AgentR
             if (rejectReason != null) {
                 int nextStepNo = run.getUsedSteps() + 1;
                 emitter.emit(nextStepNo, "SUGGEST_WRITE", "FAILED", rejectReason, null);
-                recordRejectedStep(run, decision, nextStepNo, rejectReason);
+                recordRejectedStep(run, decision, nextStepNo, rejectReason, null);
                 observations.add("系统提示：" + rejectReason
                         + "。请直接告知用户（不要生成改名提案，如用户确实要改可建议换成其他任务名）。");
                 run.setCurrentStep(nextStepNo);
@@ -313,7 +313,7 @@ public class LearningAgentRuntime extends AbstractAgentRuntime implements AgentR
 
         emitter.emit(run.getUsedSteps() + 1, "SUGGEST_WRITE", "SUCCESS", actionLabel,
                 decision.thoughtSummary());
-        recordTerminalStep(run, decision, run.getUsedSteps() + 1);
+        recordTerminalStep(run, decision, run.getUsedSteps() + 1, null);
         run.setStatus(AiAgentRunStatus.WAITING_WRITE_CONFIRM.name());
         run.setFinalAnswer(finalAnswer);
         run.setContextJson(toJson(Map.of(
@@ -329,6 +329,7 @@ public class LearningAgentRuntime extends AbstractAgentRuntime implements AgentR
                 AiAgentRunStatus.WAITING_WRITE_CONFIRM,
                 run.getFinalAnswer(),
                 run.getUsedSteps(),
+                run.getTotalTokens(),
                 null,
                 proposal
         );

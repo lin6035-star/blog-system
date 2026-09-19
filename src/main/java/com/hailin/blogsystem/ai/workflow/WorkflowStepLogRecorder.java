@@ -1,5 +1,6 @@
 package com.hailin.blogsystem.ai.workflow;
 
+import com.hailin.blogsystem.ai.TokenUsageAccumulator;
 import com.hailin.blogsystem.entity.dto.AiWorkflowStep;
 import com.hailin.blogsystem.service.AiWorkflowStepLogService;
 import lombok.RequiredArgsConstructor;
@@ -7,7 +8,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
 /**
- * 步骤级日志基础设施：记录每一步的成功/失败、耗时，日志失败不影响主流程。
+ * 步骤级日志基础设施：记录每一步的成功/失败、耗时、token 用量，日志失败不影响主流程。
  */
 @Slf4j
 @Component
@@ -16,15 +17,21 @@ public class WorkflowStepLogRecorder {
 
     private final AiWorkflowStepLogService aiWorkflowStepLogService;
 
-    //workflowRunId 为 null（create 时 run 还没入库）则跳过，由操作级日志兜底
+    /**
+     * @param stepUsage 本步的 LLM 用量（由 WorkflowTokenRecorder 暂存、WorkflowStepRunner 取走）。
+     *                  允许为 null = 该步没有 LLM 调用，记 0。
+     */
     public void recordStep(Long workflowRunId,
                            AiWorkflowStep step,
                            String runningMessage,
                            long durationMs,
-                           RuntimeException failure) {
+                           RuntimeException failure,
+                           TokenUsageAccumulator stepUsage) {
         if (workflowRunId == null) {
             return;
         }
+        int inputTokens = stepUsage == null ? 0 : stepUsage.getPromptTokens();
+        int outputTokens = stepUsage == null ? 0 : stepUsage.getCompletionTokens();
         try {
             if (failure == null) {
                 aiWorkflowStepLogService.recordSuccess(
@@ -33,7 +40,9 @@ public class WorkflowStepLogRecorder {
                         runningMessage,
                         "步骤完成，耗时 " + durationMs + "ms",
                         durationMs,
-                        AiWorkflowStepLogService.LOG_TYPE_STEP
+                        AiWorkflowStepLogService.LOG_TYPE_STEP,
+                        inputTokens,
+                        outputTokens
                 );
             } else {
                 aiWorkflowStepLogService.recordFailure(
@@ -42,7 +51,9 @@ public class WorkflowStepLogRecorder {
                         runningMessage,
                         failure,
                         durationMs,
-                        AiWorkflowStepLogService.LOG_TYPE_STEP
+                        AiWorkflowStepLogService.LOG_TYPE_STEP,
+                        inputTokens,
+                        outputTokens
                 );
             }
         } catch (Exception e) {

@@ -62,7 +62,9 @@ class ArticleOptimizeWorkflowHandlerTests {
         handler = new ArticleOptimizeWorkflowHandler(
                 workflowContextSupport,
                 new WorkflowStatusSupport(),
-                new WorkflowStepRunner(new WorkflowStepLogRecorder(mock(AiWorkflowStepLogService.class))),
+                new WorkflowStepRunner(
+                        new WorkflowStepLogRecorder(mock(AiWorkflowStepLogService.class)),
+                        new WorkflowTokenRecorder()),
                 articlesService,
                 new WorkflowTokenRecorder(),
                 llmStreamCaller,

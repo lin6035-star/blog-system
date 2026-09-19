@@ -10,6 +10,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.metadata.Usage;
 import org.springframework.ai.chat.model.Generation;
 import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.ai.openai.api.ResponseFormat;
@@ -108,6 +109,8 @@ public class LlmStreamCaller {
         try {
             StringBuilder content = new StringBuilder();
             TokenUsageAccumulator usage = new TokenUsageAccumulator();
+            // 单次流式调用只记峰值，流结束后提交一次（原因见 TokenUsageAccumulator.trackPeak）
+            AtomicReference<Usage> peakUsage = new AtomicReference<>();
 
             int systemPromptChars =
                     systemPrompt == null ? 0 : systemPrompt.length();
@@ -158,7 +161,9 @@ public class LlmStreamCaller {
                                 if (response.getMetadata().getModel() != null) {
                                     responseModel.set(response.getMetadata().getModel());
                                 }
-                                usage.add(response.getMetadata().getUsage());
+                                // 只记峰值，**不逐 chunk 累加**：同一个累计 usage 会出现在多个
+                                // chunk 里（兼容实现会在末尾多给一个），累加会把结果翻倍
+                                TokenUsageAccumulator.trackPeak(peakUsage, response.getMetadata().getUsage());
                             }
                             if (generation != null && generation.getMetadata() != null) {
                                 String finishReason = generation.getMetadata().getFinishReason();
@@ -196,6 +201,9 @@ public class LlmStreamCaller {
                         }).run();
                     })
                     .blockLast();
+
+            // 流已正常结束（blockLast 是同步阻塞的），提交本次调用含工具调用多轮的最终累计用量
+            usage.add(peakUsage.get());
 
             long llmDurationMs =
                     System.currentTimeMillis() - llmStart;

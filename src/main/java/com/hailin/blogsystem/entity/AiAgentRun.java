@@ -87,6 +87,19 @@ public class AiAgentRun {
     private Long targetArticleId;
 
     /**
+     * token 用量（本次 run 累计）：决策链（decide / repair）+ 证据收敛门（verify）的实际消耗。
+     *
+     * **不含意图分类器**——分类器属于「这条消息」的成本，计入 ai_messages.token_count。
+     * 三个口径语义不同、不重复计数（见 CLAUDE.md token 统计一节）。
+     * 流式路径的重复累计问题由 TokenUsageAccumulator.trackPeak 在计数侧处理。
+     */
+    private Integer inputTokens;
+
+    private Integer outputTokens;
+
+    private Integer totalTokens;
+
+    /**
      * 失败原因（FAILED 时记录，供排查与前端友好文案）。
      */
     private String errorMessage;

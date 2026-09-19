@@ -26,6 +26,14 @@ public class ArticleDetailVO {
     private Integer liked = 0;
     private Integer favorited = 0;
     private Integer shareCount = 0;
+    /**
+     * 今日独立访客数（HyperLogLog 近似值，非累计）。
+     *
+     * 注意与 {@link #viewCount} 的语义差别：viewCount 是**累计**浏览量，
+     * 这个是**当天**的独立访客——前端必须标清楚"今日访客"，不能让用户当成累计值。
+     * 实时计算、不进详情缓存（缓存 10 分钟会让它看起来不动）。
+     */
+    private Integer uvCount = 0;
 
     public static ArticleDetailVO from(Articles article) {
         if (article == null) {

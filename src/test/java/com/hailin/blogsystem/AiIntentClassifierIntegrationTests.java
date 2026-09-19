@@ -126,7 +126,7 @@ class AiIntentClassifierIntegrationTests {
         LearningPlans cppPlan = insertActivePlan("C++ 系统学习与工程化实践计划");
 
         AiIntent intent = aiIntentClassifier.classify(
-                "帮我把c++的第一阶段浓缩成四个小任务", null, PLAN_TEST_USER);
+                "帮我把c++的第一阶段浓缩成四个小任务", null, PLAN_TEST_USER, null);
 
         assertThat(intent.getLearningPlanId())
                 .as("用户说了 c++，应选中《C++ 系统学习与工程化实践计划》，而不是《C语言系统学习计划》")
@@ -139,7 +139,7 @@ class AiIntentClassifierIntegrationTests {
         insertActivePlan("C++ 系统学习与工程化实践计划");
 
         AiIntent intent = aiIntentClassifier.classify(
-                "帮我把第一阶段浓缩成四个小任务", null, PLAN_TEST_USER);
+                "帮我把第一阶段浓缩成四个小任务", null, PLAN_TEST_USER, null);
 
         assertThat(intent.getLearningPlanId())
                 .as("用户没点名计划、多候选下不得猜——宁可留给后端追问")
@@ -175,7 +175,7 @@ class AiIntentClassifierIntegrationTests {
         }
         // userId 传 null：固定样例集锁的是「分类器只看原话能理解到什么」（原有 22 例语义不变）；
         // 注入真实计划列表后的「别名选中」能力由 picksPlanFromInjectedListByAlias 单独验证
-        AiIntent intent = aiIntentClassifier.classify(c.message(), pageContext, null);
+        AiIntent intent = aiIntentClassifier.classify(c.message(), pageContext, null, null);
 
         if (c.expectedIntent() != null) {
             assertThat(intent.getIntent())

@@ -9,13 +9,16 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.HandlerInterceptor;
 
 /**
- * AI 接口限流拦截器：只拦会消耗 LLM / ES 的请求。
+ * 接口限流拦截器：只拦「贵」的或者「天然会被刷」的写入口。
  *
  * - 登录用户按 userId 限流，游客按 IP 限流（游客使用更低限额）
  * - 在 Controller 之前拦截（SSE 场景在进入业务流前就拒绝，不会等 LLM 开始生成）
  * - 超限抛 RateLimitExceededException，由 GlobalExceptionHandler 转 HTTP 429
  *
- * 不限制：查询历史消息 / Workflow 状态 / 取消 / 普通文章浏览 / 点赞收藏评论。
+ * 桶：chat / workflow / rag（消耗 LLM 与 ES）、seckill（发钱，且会被脚本盯上）。
+ *
+ * 不限制：查询历史消息 / Workflow 状态 / 取消 / **秒杀结果轮询** /
+ * 普通文章浏览 / 点赞收藏评论。
  */
 @Component
 public class AiRateLimitInterceptor implements HandlerInterceptor {
@@ -23,6 +26,7 @@ public class AiRateLimitInterceptor implements HandlerInterceptor {
     private static final String BUCKET_CHAT = "chat";
     private static final String BUCKET_WORKFLOW = "workflow";
     private static final String BUCKET_RAG = "rag";
+    private static final String BUCKET_SECKILL = "seckill";
 
     private final AiRateLimiter rateLimiter;
     private final BlogAiProperties properties;
@@ -55,6 +59,7 @@ public class AiRateLimitInterceptor implements HandlerInterceptor {
             case BUCKET_CHAT -> config.getChat();
             case BUCKET_WORKFLOW -> config.getWorkflow();
             case BUCKET_RAG -> config.getRag();
+            case BUCKET_SECKILL -> config.getSeckill();
             default -> null;
         };
 
@@ -123,6 +128,14 @@ public class AiRateLimitInterceptor implements HandlerInterceptor {
                 return null;
             }
             return BUCKET_WORKFLOW;
+        }
+
+        // 秒杀：只拦「抢购」这一个动作。结果查询是前端每秒轮询的正常行为，
+        // 把它也算进配额，等于用户还没抢到就先被 429 了
+        if ("POST".equalsIgnoreCase(method)
+                && uri.startsWith("/api/seckill/")
+                && uri.endsWith("/grab")) {
+            return BUCKET_SECKILL;
         }
 
         return null;

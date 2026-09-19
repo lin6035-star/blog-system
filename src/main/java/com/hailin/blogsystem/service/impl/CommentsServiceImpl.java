@@ -24,9 +24,12 @@ import com.hailin.blogsystem.service.CommentsService;
 import com.hailin.blogsystem.service.IpLocationService;
 import com.hailin.blogsystem.utils.UserContext;
 import lombok.RequiredArgsConstructor;
+import com.hailin.blogsystem.component.AfterCommitExecutor;
 import com.hailin.blogsystem.component.CacheTtlSupport;
 import com.hailin.blogsystem.component.RedisKeyScanner;
+import com.hailin.blogsystem.component.UserActivityTracker;
 import com.hailin.blogsystem.component.UserSetCache;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
@@ -37,6 +40,7 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 
 @Service
+@Slf4j
 @RequiredArgsConstructor
 public class CommentsServiceImpl extends ServiceImpl<CommentsMapper, ArticleComments> implements CommentsService {
 
@@ -47,8 +51,10 @@ public class CommentsServiceImpl extends ServiceImpl<CommentsMapper, ArticleComm
     private final StringRedisTemplate stringRedisTemplate;
     private final RedisKeyScanner redisKeyScanner;
     private final CacheTtlSupport cacheTtlSupport;
+    private final AfterCommitExecutor afterCommitExecutor;
     private final ObjectMapper objectMapper;
     private final UserSetCache userSetCache;
+    private final UserActivityTracker userActivityTracker;
 
     @Override  //1.获取文章评论列表，游客可访问，每条主评论带前几条回复
     public PageVO<CommentsVO> getComments(Long articleId, Long page, Long pageSize, String sort) {
@@ -247,9 +253,12 @@ public class CommentsServiceImpl extends ServiceImpl<CommentsMapper, ArticleComm
         stringRedisTemplate.opsForZSet().incrementScore(RedisConstants.ARTICLE_HOT_KEY,
                 String.valueOf(articleId),RedisConstants.ARTICLE_COMMENT_HOT_SCORE);
 
-        stringRedisTemplate.delete(RedisConstants.ARTICLE_DETAIL_KEY_PREFIX + articleId);
+        evictArticleDetailCache(articleId);
 
         deleteCommentListCache(articleId);
+
+        // 发表评论是强活跃信号（浏览可能只是路过，评论一定是有意为之）
+        userActivityTracker.markActiveToday();
     }
 
 
@@ -292,15 +301,29 @@ public class CommentsServiceImpl extends ServiceImpl<CommentsMapper, ArticleComm
         stringRedisTemplate.opsForZSet().incrementScore(RedisConstants.ARTICLE_HOT_KEY,
                 String.valueOf(article.getId()),deletedCount * RedisConstants.ARTICLE_DELETE_COMMENT_HOT_SCORE);
 
-        stringRedisTemplate.delete(RedisConstants.ARTICLE_DETAIL_KEY_PREFIX + article.getId());
+        evictArticleDetailCache(article.getId());
 
         deleteCommentListCache(article.getId());
     }
 
+    /** 评论数展示在文章详情页，发评论 / 删评论要失效详情缓存 */
+    private void evictArticleDetailCache(Long articleId) {
+        String key = RedisConstants.ARTICLE_DETAIL_KEY_PREFIX + articleId;
+        afterCommitExecutor.execute(() -> {
+            try {
+                stringRedisTemplate.delete(key);
+            } catch (Exception e) {
+                log.warn("[CACHE-EVICT-FAIL] 文章详情缓存删除失败，将靠 TTL 兜底: key={}", key, e);
+            }
+        });
+    }
 
     private void deleteCommentListCache(Long articleId) {
-        // SCAN 游标迭代 + UNLINK：原 KEYS 会阻塞 Redis 服务端单线程
-        redisKeyScanner.scanAndDelete(RedisConstants.COMMENT_LIST_KEY_PREFIX + articleId + ":*");
+        // SCAN 游标迭代 + UNLINK：原 KEYS 会阻塞 Redis 服务端单线程。
+        // 走 AfterCommitExecutor：本类当前无事务（等价于立即执行），
+        // 但"缓存的失效时机"这件事应该由统一的出口决定，而不是靠调用方自觉
+        afterCommitExecutor.execute(() ->
+                redisKeyScanner.scanAndDelete(RedisConstants.COMMENT_LIST_KEY_PREFIX + articleId + ":*"));
     }
 
 

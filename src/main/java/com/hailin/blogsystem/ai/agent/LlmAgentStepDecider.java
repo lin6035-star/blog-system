@@ -3,10 +3,13 @@ package com.hailin.blogsystem.ai.agent;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hailin.blogsystem.ai.AiJudgeModelSupport;
+import com.hailin.blogsystem.ai.LlmResponseSupport;
+import com.hailin.blogsystem.ai.TokenUsageAccumulator;
 import com.hailin.blogsystem.entity.dto.AgentStepActionType;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.stereotype.Component;
 
@@ -42,17 +45,18 @@ public class LlmAgentStepDecider implements AgentStepDecider {
             String goal,
             String clippedContext,
             int stepNo,
-            int maxSteps
+            int maxSteps,
+            TokenUsageAccumulator usage
     ) {
         // 主调用
-        String json = callDecide(goal, clippedContext, stepNo, maxSteps, false);
+        String json = callDecide(goal, clippedContext, stepNo, maxSteps, false, usage);
         AgentStepDecision decision = parseDecision(json);
         if (decision != null) {
             return decision;
         }
 
         // 修复一次
-        String repaired = callDecide(goal, clippedContext, stepNo, maxSteps, true);
+        String repaired = callDecide(goal, clippedContext, stepNo, maxSteps, true, usage);
         decision = parseDecision(repaired);
         if (decision != null) {
             log.info("Agent 决策 JSON 修复成功");
@@ -64,9 +68,9 @@ public class LlmAgentStepDecider implements AgentStepDecider {
     }
 
     @Override
-    public String summarize(String goal, String clippedContext) {
+    public String summarize(String goal, String clippedContext, TokenUsageAccumulator usage) {
         try {
-            String content = chatClientBuilder.build()
+            ChatResponse response = chatClientBuilder.build()
                     .prompt()
                     .system(buildSummarizeSystemPrompt())
                     .user(buildSummarizeUserPrompt(goal, clippedContext))
@@ -74,7 +78,9 @@ public class LlmAgentStepDecider implements AgentStepDecider {
                             .temperature(TEMPERATURE)
                             .build())
                     .call()
-                    .content();
+                    .chatResponse();
+            TokenUsageAccumulator.addTo(usage, LlmResponseSupport.usageOf(response));
+            String content = LlmResponseSupport.textOf(response);
             return content == null ? null : content.trim();
         } catch (Exception e) {
             log.warn("Agent 收尾总结失败，降级拼接。goal={}", truncate(goal, 100), e);
@@ -87,10 +93,11 @@ public class LlmAgentStepDecider implements AgentStepDecider {
             String clippedContext,
             int stepNo,
             int maxSteps,
-            boolean repair
+            boolean repair,
+            TokenUsageAccumulator usage
     ) {
         try {
-            return chatClientBuilder.build()
+            ChatResponse response = chatClientBuilder.build()
                     .prompt()
                     .system(buildSystemPrompt(repair))
                     .user(buildUserPrompt(goal, clippedContext, stepNo, maxSteps, repair))
@@ -99,7 +106,10 @@ public class LlmAgentStepDecider implements AgentStepDecider {
                             .temperature(TEMPERATURE))
                             .build())
                     .call()
-                    .content();
+                    .chatResponse();
+            // 出参累计：repair 轮共用同一个容器，两次调用都算进本步
+            TokenUsageAccumulator.addTo(usage, LlmResponseSupport.usageOf(response));
+            return LlmResponseSupport.textOf(response);
         } catch (Exception e) {
             log.warn("Agent 决策调用失败，goal={}", truncate(goal, 100), e);
             return null;

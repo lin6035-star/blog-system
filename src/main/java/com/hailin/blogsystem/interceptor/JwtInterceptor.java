@@ -2,6 +2,7 @@ package com.hailin.blogsystem.interceptor;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hailin.blogsystem.constants.BlogConstants;
+import com.hailin.blogsystem.security.TokenBlacklist;
 import com.hailin.blogsystem.utils.JwtUtil;
 import com.hailin.blogsystem.utils.Result;
 import com.hailin.blogsystem.utils.UserContext;
@@ -22,6 +23,7 @@ import java.io.IOException;
 public class JwtInterceptor implements HandlerInterceptor {
 
     private final JwtUtil jwtUtil;
+    private final TokenBlacklist tokenBlacklist;
     private static final ObjectMapper objectMapper = new ObjectMapper();
 
     @Override
@@ -36,8 +38,13 @@ public class JwtInterceptor implements HandlerInterceptor {
 
         String token = authHeader.substring(7);
         try {
-            Long userId = jwtUtil.parseToken(token);
-            UserContext.set(userId);
+            JwtUtil.Payload payload = jwtUtil.parsePayload(token);
+            // 签名与过期都对，但可能已经登出——JWT 无状态，这是唯一能提前作废的入口
+            if (tokenBlacklist.isRevoked(payload.jti())) {
+                writeUnauthorized(response, "登录已失效，请重新登录");
+                return false;
+            }
+            UserContext.set(payload.userId());
             return true;
         } catch (Exception e) {
             writeUnauthorized(response, "token 无效或已过期，请重新登录");

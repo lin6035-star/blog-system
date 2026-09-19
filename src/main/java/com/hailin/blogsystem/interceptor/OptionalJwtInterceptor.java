@@ -1,5 +1,6 @@
 package com.hailin.blogsystem.interceptor;
 
+import com.hailin.blogsystem.security.TokenBlacklist;
 import com.hailin.blogsystem.utils.JwtUtil;
 import com.hailin.blogsystem.utils.UserContext;
 import jakarta.servlet.http.HttpServletRequest;
@@ -16,6 +17,7 @@ import org.springframework.web.servlet.HandlerInterceptor;
 public class OptionalJwtInterceptor implements HandlerInterceptor {
 
     private final JwtUtil jwtUtil;
+    private final TokenBlacklist tokenBlacklist;
 
     @Override
     public boolean preHandle(HttpServletRequest request, HttpServletResponse response,
@@ -27,8 +29,13 @@ public class OptionalJwtInterceptor implements HandlerInterceptor {
 
         String token = authHeader.substring(7);
         try {
-            Long userId = jwtUtil.parseToken(token);
-            UserContext.set(userId);
+            JwtUtil.Payload payload = jwtUtil.parsePayload(token);
+            // 已登出的 token 按游客处理：公开接口不报错，但不能再以这个身份做写操作
+            if (tokenBlacklist.isRevoked(payload.jti())) {
+                UserContext.clear();
+            } else {
+                UserContext.set(payload.userId());
+            }
         } catch (Exception ignored) {
             UserContext.clear();
         }

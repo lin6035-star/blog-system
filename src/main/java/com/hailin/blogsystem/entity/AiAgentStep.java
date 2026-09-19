@@ -63,6 +63,16 @@ public class AiAgentStep {
     private Long durationMs;
 
     /**
+     * 本步决策（decide）的 LLM token 用量。
+     *
+     * 语义是「决定要走这一步」的成本，不是动作执行的成本——只读动作本身不调 LLM。
+     * JSON 解析失败触发 repair 时，两次调用的用量都计入本步。
+     */
+    private Integer inputTokens;
+
+    private Integer outputTokens;
+
+    /**
      * 失败原因。
      */
     private String errorMessage;

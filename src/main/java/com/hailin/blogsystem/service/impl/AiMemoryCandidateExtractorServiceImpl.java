@@ -13,7 +13,9 @@ import com.hailin.blogsystem.service.AiMemoryCandidateExtractorService;
 import com.hailin.blogsystem.service.AiMemoryDecisionService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import com.hailin.blogsystem.ai.LlmResponseSupport;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
@@ -110,7 +112,7 @@ public class AiMemoryCandidateExtractorServiceImpl implements AiMemoryCandidateE
     }
 
     private List<AiMemoryCandidateExtractResult> extractCandidatesByLlm(String userMessage, String assistantReply){
-        String response = chatClientBuilder.build()
+        ChatResponse chatResponse = chatClientBuilder.build()
                 .prompt()
                 .system(
                         """
@@ -161,7 +163,10 @@ public class AiMemoryCandidateExtractorServiceImpl implements AiMemoryCandidateE
                     """.formatted(limitText(userMessage, 1000), limitText(assistantReply, 1500))
                 )
                 .call()
-                .content();
+                .chatResponse();
+        // 副产品调用：不落库，只在日志留痕（钱包计费只算主链路）
+        LlmResponseSupport.logUsage("memory_extract", chatResponse);
+        String response = LlmResponseSupport.textOf(chatResponse);
 
         return parseExtractResul(response);
     }

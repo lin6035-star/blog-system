@@ -9,8 +9,10 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.hailin.blogsystem.ai.rag.ArticleRagIndexService;
 import com.hailin.blogsystem.ai.rag.ArticleRagSyncService;
+import com.hailin.blogsystem.component.AfterCommitExecutor;
 import com.hailin.blogsystem.component.CacheTtlSupport;
 import com.hailin.blogsystem.component.RedisKeyScanner;
+import com.hailin.blogsystem.component.UserActivityTracker;
 import com.hailin.blogsystem.component.UserSetCache;
 import com.hailin.blogsystem.constants.BlogConstants;
 import com.hailin.blogsystem.constants.RedisConstants;
@@ -23,13 +25,17 @@ import com.hailin.blogsystem.entity.vo.ArticleDetailVO;
 import com.hailin.blogsystem.utils.UserContext;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -90,6 +96,49 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
             String.class
     );
 
+    /** 记录独立访客 + 兜底 TTL（一次 Lua 完成）。
+     *  与 VIEW_INCR_SCRIPT 同构、理由也相同：PFADD 与 EXPIRE 分两次调用，中间故障会留下
+     *  **无 TTL 的 key**——而"允许丢失的数据都有 TTL"是 volatile-lru 能正常淘汰的前提。
+     *  判 TTL &lt; 0 而非"首次 PFADD"：补得上任何原因造成的无 TTL 残留。 */
+    private static final DefaultRedisScript<Long> UV_ADD_SCRIPT = new DefaultRedisScript<>(
+            """
+            redis.call('PFADD', KEYS[1], ARGV[1])
+            if redis.call('TTL', KEYS[1]) < 0 then
+                redis.call('EXPIRE', KEYS[1], ARGV[2])
+            end
+            return 1
+            """,
+            Long.class
+    );
+
+    /**
+     * 热度榜原子替换：EXISTS 检查 + RENAME + EXPIRE 一次完成。
+     *
+     * **为什么不能分三步写**：
+     * 1. `RENAME` 的源 key 不存在会直接抛错（`ERR no such key`）——两个执行者同时重建时，
+     *    先完成的那个已经把临时 key RENAME 走了，后一个就会炸。生产只有定时任务一个调用方
+     *    （调度池 size=1）撞不上，但测试 / 手工触发会成为第二个调用方——这个错就是这么暴露的
+     * 2. `EXPIRE` 必须跟在 `RENAME` **之后**：`RENAME` 会把目标 key 的 TTL 换成源 key 的，
+     *    而临时 key 每轮都是新建、无 TTL，写在前面等于白写
+     *
+     * 打包之后这两个约束都不再由调用方保证。
+     *
+     * KEYS[1] = 临时榜，KEYS[2] = 正式榜；ARGV[1] = TTL(秒)
+     *
+     * @return 1 = 替换成功；0 = 临时榜不存在（已有并发重建完成本轮），本次跳过
+     */
+    private static final DefaultRedisScript<Long> RENAME_HOT_RANK_SCRIPT = new DefaultRedisScript<>(
+            """
+            if redis.call('EXISTS', KEYS[1]) == 0 then
+                return 0
+            end
+            redis.call('RENAME', KEYS[1], KEYS[2])
+            redis.call('EXPIRE', KEYS[2], ARGV[1])
+            return 1
+            """,
+            Long.class
+    );
+
     private final UsersMapper usersMapper;
     private final CategoryMapper categoryMapper;
     private final ArticleLikesMapper articleLikesMapper;
@@ -106,6 +155,8 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
     private final RedisKeyScanner redisKeyScanner;
 
     private final UserSetCache userSetCache;
+    private final AfterCommitExecutor afterCommitExecutor;
+    private final UserActivityTracker userActivityTracker;
 
     @Override  //1.获取公开文章列表
     public PageVO<ArticleDetailVO> getArticles(Long page, Long pageSize, String keyword, Long categoryId, String sort) {  //1.获取公开文章列表
@@ -229,7 +280,7 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
     }
 
     @Override  //2.获取公开文章详情
-    public ArticleDetailVO getPublicArticleById(Long id) {  //2.获取公开文章详情
+    public ArticleDetailVO getPublicArticleById(Long id, String clientIp) {  //2.获取公开文章详情
 
         DetailCacheRead read = readArticleDetailCache(id);
 
@@ -245,13 +296,22 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
         ArticleDetailVO vo = result.value();
 
         Long userId = UserContext.get();
+
+        // 活跃统计的对象是"人"，不是"阅读行为"——所以这一句不在下面的分支里：
+        // 作者看自己的文章不计浏览量，但他本人**确实今天活跃了**。
+        // 未登录时内部直接返回，游客没有 userId 可做 offset
+        userActivityTracker.markActiveToday();
+
         if (userId == null || !userId.equals(vo.getAuthorId())) {
-            recordArticleView(id);
+            recordArticleView(id, clientIp);
         }
 
         fillArticleLiked(vo);
         fillArticleFavorited(vo);
         fillArticleViewCount(List.of(vo));
+        // UV 必须**在返回前现算**，不能进详情缓存：缓存 10 分钟内 UV 一直不动，
+        // 而它恰恰是"现在有多少人正在看"这个感觉的来源。与 fillArticleViewCount 同一位置
+        vo.setUvCount(readTodayUv(id));
 
         return vo;
     }
@@ -412,8 +472,9 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
         }
     }
 
-    /** 浏览量：自增 + 兜底 TTL 一次 Lua 完成（分两次调用会在中间故障 / 竞态时留下无 TTL 的 key） */
-    private void recordArticleView(Long id) {
+    /** 浏览量 + 独立访客：一次浏览记两项统计。
+     *  两项都是**可接受丢失的近似数据**，任何一项失败都不影响详情返回（外层统一兜底） */
+    private void recordArticleView(Long id, String clientIp) {
         try {
             stringRedisTemplate.execute(
                     VIEW_INCR_SCRIPT,
@@ -425,8 +486,56 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
                     .incrementScore(RedisConstants.ARTICLE_HOT_KEY,
                             String.valueOf(id),
                             RedisConstants.ARTICLE_VIEW_HOT_SCORE);
+
+            recordUniqueVisitor(id, clientIp);
         } catch (Exception e) {
             // Redis统计失败不影响文章详情返回
+        }
+    }
+
+    /**
+     * 记录独立访客（HyperLogLog）。
+     *
+     * **身份取法**：登录用户按 userId、游客按 IP，加前缀区分（`u:123` / `ip:1.2.3.4`）——
+     * 不加前缀的话，"userId = 1 的用户"和"IP 恰好是 1"会被 HLL 当成同一个人。
+     *
+     * **口径本身是近似的**，两层误差叠加：
+     * - 身份层：NAT 后面一群人算一个（偏低）、动态 IP 一个人算多个（偏高）
+     * - 算法层：HyperLogLog 自身 **0.81% 标准误差**
+     *
+     * **UV 是趋势指标，不是精确值**。要精确就得存全量集合，而那个内存代价
+     * （1 亿 UV 的 Set ≈ 800MB）正是这里用 HLL（固定 12KB）的原因。
+     */
+    private void recordUniqueVisitor(Long articleId, String clientIp) {
+        Long userId = UserContext.get();
+        String identity = userId != null
+                ? "u:" + userId
+                : (clientIp == null || clientIp.isBlank() ? null : "ip:" + clientIp);
+        if (identity == null) {
+            return;   // 两个身份都拿不到（理论上只在非 Web 线程发生），这次不计
+        }
+
+        stringRedisTemplate.execute(
+                UV_ADD_SCRIPT,
+                Collections.singletonList(buildUvKey(articleId)),
+                identity,
+                String.valueOf(TimeUnit.DAYS.toSeconds(RedisConstants.ARTICLE_UV_TTL_DAYS))
+        );
+    }
+
+    /** UV key 按天分：article:uv:{articleId}:{yyyyMMdd}（与活跃统计的日期格式保持一致） */
+    private String buildUvKey(Long articleId) {
+        return RedisConstants.ARTICLE_UV_KEY_PREFIX + articleId + ":"
+                + LocalDate.now().format(DateTimeFormatter.BASIC_ISO_DATE);
+    }
+
+    /** 读今日 UV。失败返回 0——UV 只是展示项，不能因为它让整个详情页失败 */
+    private int readTodayUv(Long articleId) {
+        try {
+            Long size = stringRedisTemplate.opsForHyperLogLog().size(buildUvKey(articleId));
+            return size == null ? 0 : size.intValue();
+        } catch (Exception e) {
+            return 0;
         }
     }
 
@@ -807,6 +916,9 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
         deleteArticleListCache();
 
         safelyIndexArticleRag(id);  //发布文章时自动同步 RAG 索引。
+
+        // 发布是强活跃信号（比浏览更能说明"这个人在用这个站"），与浏览、评论一起构成活跃口径
+        userActivityTracker.markActiveToday();
     }
 
 
@@ -1159,25 +1271,49 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
             return;
         }
 
-        for(Articles article : articles){
-            String viewKey = RedisConstants.ARTICLE_VIEW_KEY_PREFIX + article.getId();
-            String redisViewCount = stringRedisTemplate.opsForValue().get(viewKey);
+        // 批量取浏览量增量：原实现逐篇 GET，N 篇文章 N 次网络往返。
+        // MGET 一次拿回全部，不存在的 key 在结果里对应 null（顺序与入参一一对应）
+        List<String> viewKeys = articles.stream()
+                .map(article -> RedisConstants.ARTICLE_VIEW_KEY_PREFIX + article.getId())
+                .toList();
+        List<String> viewCounts = stringRedisTemplate.opsForValue().multiGet(viewKeys);
 
-            int redisViewIncrement = redisViewCount == null ? 0 : Integer.parseInt(redisViewCount);
+        // 批量写临时榜：原实现逐篇 ZADD，又是 N 次往返。pipeline 把 N 条命令打包成一次往返。
+        // 注意 pipeline **不保证原子性**（原子性是 Lua 的职责）——这里也不需要：
+        // 临时榜建完才 RENAME，中途状态没有任何读者能看到。
+        // 边界：文章数到万级时，MGET 结果与 pipeline 缓冲会一起堆在内存里，届时才需要分批
+        stringRedisTemplate.executePipelined((RedisCallback<Object>) connection -> {
+            for (int i = 0; i < articles.size(); i++) {
+                Articles article = articles.get(i);
+                String redisViewCount = viewCounts == null ? null : viewCounts.get(i);
+                int redisViewIncrement = redisViewCount == null ? 0 : Integer.parseInt(redisViewCount);
 
-            double score =
-                    safe(article.getViewCount()) * RedisConstants.ARTICLE_VIEW_HOT_SCORE
-                            + redisViewIncrement * RedisConstants.ARTICLE_VIEW_HOT_SCORE
-                            + safe(article.getLikeCount()) * RedisConstants.ARTICLE_LIKE_HOT_SCORE
-                            + safe(article.getFavoriteCount()) * RedisConstants.ARTICLE_FAVORITE_HOT_SCORE
-                            + safe(article.getCommentCount()) * RedisConstants.ARTICLE_COMMENT_HOT_SCORE;
+                double score =
+                        safe(article.getViewCount()) * RedisConstants.ARTICLE_VIEW_HOT_SCORE
+                                + redisViewIncrement * RedisConstants.ARTICLE_VIEW_HOT_SCORE
+                                + safe(article.getLikeCount()) * RedisConstants.ARTICLE_LIKE_HOT_SCORE
+                                + safe(article.getFavoriteCount()) * RedisConstants.ARTICLE_FAVORITE_HOT_SCORE
+                                + safe(article.getCommentCount()) * RedisConstants.ARTICLE_COMMENT_HOT_SCORE;
 
-            stringRedisTemplate.opsForZSet()
-                    .add(tmpKey, String.valueOf(article.getId()), score);
+                // pipeline 里拿到的是底层连接，不走模板的序列化器——key/value 需自行转字节。
+                // StringRedisTemplate 用的 StringRedisSerializer 就是 UTF-8，编码与模板其余部分一致
+                connection.zAdd(tmpKey.getBytes(StandardCharsets.UTF_8), score,
+                        String.valueOf(article.getId()).getBytes(StandardCharsets.UTF_8));
+            }
+            return null;
+        });
+
+        //检查 + RENAME + 补 TTL 打包成一次原子操作：
+        //读方要么看到旧榜、要么看到新榜，不会看到空榜；并发重建也不会撞 RENAME 报错。
+        //细节见 RENAME_HOT_RANK_SCRIPT 的注释
+        Long replaced = stringRedisTemplate.execute(RENAME_HOT_RANK_SCRIPT,
+                List.of(tmpKey, RedisConstants.ARTICLE_HOT_KEY),
+                String.valueOf(TimeUnit.HOURS.toSeconds(RedisConstants.ARTICLE_HOT_TTL_HOURS)));
+
+        if(replaced == null || replaced == 0){
+            //临时 key 不在 = 已有另一个执行者完成了本轮替换。它写进去的数据和本轮同源，跳过即可
+            log.info("热度榜临时 key 不存在，本轮替换跳过（可能已有并发重建完成）");
         }
-
-        //RENAME 原子：读方要么看到旧榜、要么看到新榜，不会看到空榜
-        stringRedisTemplate.rename(tmpKey, RedisConstants.ARTICLE_HOT_KEY);
     }
 
     private int safe(Integer value) {
@@ -1257,18 +1393,30 @@ public class ArticlesServiceImpl extends ServiceImpl<ArticlesMapper, Articles> i
         }
     }
 
-    //文章变更时删除缓存
+    /**
+     * 文章变更时删除详情缓存。走 {@link AfterCommitExecutor}：调用方里
+     * `updateArticleTitle` / `updateArticleVisibility` 带 `@Transactional`，
+     * 事务内删会留下"删完到提交之间读到旧值并回填"的窗口（详见该组件类注释）。
+     */
     private void deleteArticleDetailCache(Long id) {
-        try{
-            stringRedisTemplate.delete(RedisConstants.ARTICLE_DETAIL_KEY_PREFIX + id);
-        }catch(Exception e){
-            // Redis删除失败不影响文章变更本身
-        }
+        String key = RedisConstants.ARTICLE_DETAIL_KEY_PREFIX + id;
+        afterCommitExecutor.execute(() -> {
+            try {
+                stringRedisTemplate.delete(key);
+            } catch (Exception e) {
+                // 删不掉不影响文章变更本身，但必须留下可检索的痕迹——
+                // 静默吞掉的话，缓存会一直脏到 TTL（详情 10 分钟），排查时无迹可寻
+                log.warn("[CACHE-EVICT-FAIL] 文章详情缓存删除失败，将靠 TTL 兜底: key={}", key, e);
+            }
+        });
     }
+
     private void deleteArticleListCache() {
         // SCAN 游标迭代 + UNLINK 异步回收。原 KEYS 会阻塞 Redis 服务端单线程，
-        // 连带卡住同实例上的限流、分布式锁与其它缓存
-        redisKeyScanner.scanAndDelete(RedisConstants.ARTICLE_LIST_KEY_PREFIX + "*");
+        // 连带卡住同实例上的限流、分布式锁与其它缓存。
+        // SCAN 的失败日志在 RedisKeyScanner 内部
+        afterCommitExecutor.execute(() ->
+                redisKeyScanner.scanAndDelete(RedisConstants.ARTICLE_LIST_KEY_PREFIX + "*"));
     }
 
     //但如果 ES 没开、Embedding API 超时、额度没了，现在可能会导致“文章发布失败”

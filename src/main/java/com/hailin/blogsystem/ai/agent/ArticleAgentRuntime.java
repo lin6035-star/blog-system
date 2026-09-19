@@ -415,7 +415,7 @@ public class ArticleAgentRuntime extends AbstractAgentRuntime implements AgentRu
         if (observations.isEmpty()) {
             String rejectReason = "首轮零观察写动作提案被拒绝：必须先执行至少一个只读查询";
             emitter.emit(nextStepNo, "SUGGEST_WRITE", "FAILED", "提案被拒绝：需先完成一次查询", null);
-            recordRejectedStep(run, decision, nextStepNo, rejectReason);
+            recordRejectedStep(run, decision, nextStepNo, rejectReason, null);
             observations.add("系统提示：你在没有任何查询结果时尝试提案写动作，后端已拒绝。"
                     + "请先执行只读查询（QUERY_ARTICLE / QUERY_MEMORY / SEARCH_RAG）再决策。");
             run.setCurrentStep(nextStepNo);
@@ -476,7 +476,7 @@ public class ArticleAgentRuntime extends AbstractAgentRuntime implements AgentRu
             // 终局失败：文章不存在/不属于当前用户（对齐 QUERY_ARTICLE 归属语义，不继续循环）
             int nextStepNo = run.getUsedSteps() + 1;
             emitter.emit(nextStepNo, "SUGGEST_WRITE", "FAILED", "未找到这篇文章，或文章不属于你", null);
-            recordRejectedStep(run, decision, nextStepNo, "文章归属校验失败（SUGGEST_WRITE）");
+            recordRejectedStep(run, decision, nextStepNo, "文章归属校验失败（SUGGEST_WRITE）", null);
             throw new AgentRunTerminalException(
                     nextStepNo, "未找到这篇文章，或文章不属于你，无法继续处理。");
         }
@@ -534,7 +534,7 @@ public class ArticleAgentRuntime extends AbstractAgentRuntime implements AgentRu
                                               List<String> observations, String rejectReason, String advice) {
         int nextStepNo = run.getUsedSteps() + 1;
         emitter.emit(nextStepNo, "SUGGEST_WRITE", "FAILED", rejectReason, null);
-        recordRejectedStep(run, decision, nextStepNo, rejectReason);
+        recordRejectedStep(run, decision, nextStepNo, rejectReason, null);
         observations.add("系统提示：" + rejectReason + "。" + advice + "。");
         run.setCurrentStep(nextStepNo);
         run.setUsedSteps(nextStepNo);
@@ -550,7 +550,7 @@ public class ArticleAgentRuntime extends AbstractAgentRuntime implements AgentRu
                                               AgentWriteProposal proposal, String actionLabel, String finalAnswer) {
         emitter.emit(run.getUsedSteps() + 1, "SUGGEST_WRITE", "SUCCESS", actionLabel,
                 decision.thoughtSummary());
-        recordTerminalStep(run, decision, run.getUsedSteps() + 1);
+        recordTerminalStep(run, decision, run.getUsedSteps() + 1, null);
         run.setStatus(AiAgentRunStatus.WAITING_WRITE_CONFIRM.name());
         run.setFinalAnswer(finalAnswer);
         run.setContextJson(toJson(Map.of(
@@ -566,6 +566,7 @@ public class ArticleAgentRuntime extends AbstractAgentRuntime implements AgentRu
                 AiAgentRunStatus.WAITING_WRITE_CONFIRM,
                 run.getFinalAnswer(),
                 run.getUsedSteps(),
+                run.getTotalTokens(),
                 null,
                 proposal
         );

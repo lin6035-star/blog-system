@@ -40,10 +40,23 @@ spring:
     redis:
       host: localhost
       port: 6379
+      # ACL 账号名：留空 = 用 default 用户（本地无 ACL 时的行为）。
+      # 生产配 ACL 后填 blog-app，配合 deploy/redis.conf.example 的账号规则——
+      # 只设密码不分账号的话，应用拿到的仍是全权限，ACL 就等于没上。
+      username: ${REDIS_USERNAME:}
       # 本地默认值；生产覆盖为 ${REDIS_PASSWORD:}——空值是合法状态（无密码 Redis 不发 AUTH），
       # 所以这一项不 fail-fast
       password: ${REDIS_PASSWORD:01star}
       database: 1
+      # 命令超时：客户端放弃等待的时限。**注意它不是给 Redis 减负**——超时后命令仍在服务端跑完，
+      # 它保护的是应用线程（缓存读卡住时及时 fail-open 去查 DB，而不是把 Tomcat 线程一起拖死）。
+      # 项目里最重的 Redis 操作是 ZREVRANGE(10 个成员) / SCAN(COUNT 200)，都是毫秒级，3 秒很宽松。
+      timeout: 3s
+      # 建连超时：Redis 不可达时不要在 TCP 握手上耗太久，快速失败走 DB 兜底
+      connect-timeout: 2s
+      # 不要在这里加 lettuce.pool.*：pom.xml 没有 commons-pool2 依赖，配了会被静默忽略，
+      # 反而让人以为连接池已生效。当前全是非阻塞命令，Lettuce 共享单连接够用——
+      # 只有引入 BLPOP / MULTI / WATCH 这类独占连接的命令时才需要引依赖再配池
   servlet:
     multipart:
       max-file-size: 10MB
@@ -60,7 +73,7 @@ spring:
       read-timeout: 60s
       chat:
         options:
-          model: ${AI_CHAT_MODEL:qwen3.7-flash}
+          model: ${AI_CHAT_MODEL:qwen3.6-flash}
       embedding:
         options:
           model: text-embedding-v3
@@ -137,11 +150,55 @@ logging:
 blog:
   migration:
     enabled: false
+
+  # 钱包（设计稿：docs/redis/钱包与秒杀计划.md §4.5）
+  # ⚠️ 前端只传 packageCode，应付金额与到账额度都由后端按这里决定——让前端传金额等于自助发钱。
+  wallet:
+    # 注册赠送的初始额度（credit）。0 = 不送。
+    # 计费开关默认开启，不送的话新账号注册完立刻就是「额度不足」——注册可用性和计费上线本来是冲突的。
+    initial-credit: 10000
+    packages:
+      PACK_10:
+        pay-amount: 1000       # 单位：分（真实货币口径，虚拟支付下仅用于展示）
+        credit-amount: 10000   # 到账额度；1 元 = 1000 credit
+      PACK_30:
+        pay-amount: 3000
+        credit-amount: 33000   # 送 10%
+      PACK_98:
+        pay-amount: 9800
+        credit-amount: 118000  # 送 20%
+
+  # 秒杀（设计稿：docs/redis/钱包与秒杀计划.md §6）
+  seckill:
+    # 可调用预热接口的 userId 白名单。**默认空 = 谁都不能调**。
+    # 项目还没有角色体系，这是最小权限的临时方案；要用就填自己的 userId（见验证指南）。
+    admin-user-ids: []
+    # 启动完成后自动预热全部 ACTIVE 活动
+    preheat-on-startup: true
+
   ai:
     project-key: global
     # 判断链模型（分类器 / Agent 决策器 / 证据验证器）：这些环节判错会让整条路走偏，
     # 建议绑一个稳的模型；留空则跟随 spring.ai.openai.chat.options.model（生成链模型）。
-    judge-model: ${AI_JUDGE_MODEL:qwen3.6-plus}
+    judge-model: ${AI_JUDGE_MODEL:qwen-plus-2025-07-14}
+    # AI 计费（预扣 / 结算 / 退款）：docs/redis/钱包与秒杀计划.md §5
+    billing:
+      enabled: true
+      # 内部积分价：每 1000 token 折算多少 credit。不是供应商成本价，是稳定可解释的产品积分价。
+      credit-per-1k-tokens: 10
+      # 普通聊天的输出上限（maxTokens）。⚠️ 这是计费硬上限不是建议长度：调小会截断长回答
+      chat-max-tokens: 4000
+      # 工具调用最大轮数：每轮重发完整上下文，预扣按轮数放大
+      max-tool-rounds: 5
+      # 预扣单超时释放（分钟）：进程崩溃时的兜底，正常路径走不到
+      reserve-expire-minutes: 30
+      # 各 bizType 的单次预扣硬上限（credit）——动态算出的预扣会被它压顶，
+      # 保证再长的输入也撞不到 user_wallet 的 CHECK 下界
+      # ⚠️ 启动时由 BillingReserveLimitValidator 校验「最大值 × 2 < |CHECK 下界|」
+      max-reserve-per-biz-type:
+        CHAT: 5000
+        AGENT: 8000
+        WORKFLOW_ACTION: 10000
     memory:
       enabled: true
       max-messages: 40

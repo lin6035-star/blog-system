@@ -14,6 +14,7 @@ import com.hailin.blogsystem.mapper.LearningStageMapper;
 import com.hailin.blogsystem.service.LearningPlansService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import com.hailin.blogsystem.component.AfterCommitExecutor;
 import com.hailin.blogsystem.component.CacheTtlSupport;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
@@ -59,6 +60,7 @@ public class LearningPlansServiceImpl extends ServiceImpl<LearningPlanMapper, Le
     private final ObjectMapper objectMapper;
     private final StringRedisTemplate stringRedisTemplate;
     private final CacheTtlSupport cacheTtlSupport;
+    private final AfterCommitExecutor afterCommitExecutor;
 
     //幂等保存，两条覆盖路径：
     //  plan.id 非空（调整已有计划）→ 按 id 覆盖，目标必须存在且属于同一用户
@@ -235,17 +237,25 @@ public class LearningPlansServiceImpl extends ServiceImpl<LearningPlanMapper, Le
         return actives;
     }
 
-    //计划列表缓存失效：写计划 / 改任务状态（可能带动计划状态）后调用。
-    //失败无害——TTL 兜底；顺序上在写库之后删（Cache-Aside），极端并发下最坏是 TTL 内读到旧列表。
+    /**
+     * 计划列表缓存失效：写计划 / 改任务状态（可能带动计划状态）后调用。
+     *
+     * **5 条调用链全部在 `@Transactional` 内**（写计划 / 勾选任务 / 任务改名 / 追加任务 / 删计划），
+     * 提交前删会留下"删完到提交之间读到旧列表并回填"的窗口——交给 {@link AfterCommitExecutor}。
+     * 删不掉的后果轻（TTL 兜底），但日志要留痕，否则排查时无迹可寻。
+     */
     private void evictPlanListCache(Long userId) {
         if (userId == null) {
             return;
         }
-        try {
-            stringRedisTemplate.delete(RedisConstants.LEARNING_PLAN_LIST_KEY_PREFIX + userId);
-        } catch (Exception e) {
-            log.warn("学习计划列表缓存失效失败（TTL 兜底）: userId={}", userId, e);
-        }
+        String key = RedisConstants.LEARNING_PLAN_LIST_KEY_PREFIX + userId;
+        afterCommitExecutor.execute(() -> {
+            try {
+                stringRedisTemplate.delete(key);
+            } catch (Exception e) {
+                log.warn("[CACHE-EVICT-FAIL] 学习计划列表缓存删除失败，将靠 TTL 兜底: key={}", key, e);
+            }
+        });
     }
 
     //权限：plan.userId 必须等于当前用户；进度实时聚合（不存库）

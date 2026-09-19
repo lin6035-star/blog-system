@@ -9,7 +9,10 @@ import com.hailin.blogsystem.entity.vo.AuthVO;
 import com.hailin.blogsystem.entity.vo.UsersVO;
 import com.hailin.blogsystem.exception.BusinessException;
 import com.hailin.blogsystem.mapper.LoginMapper;
+import com.hailin.blogsystem.security.LoginAttemptLimiter;
+import com.hailin.blogsystem.security.TokenBlacklist;
 import com.hailin.blogsystem.service.LoginService;
+import com.hailin.blogsystem.service.WalletService;
 import com.hailin.blogsystem.utils.AliyunOSSOperator;
 import com.hailin.blogsystem.utils.JwtUtil;
 import com.hailin.blogsystem.utils.Result;
@@ -18,9 +21,12 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 import org.springframework.web.multipart.MultipartFile;
 
+import java.time.Duration;
+import java.time.Instant;
 import java.time.LocalDateTime;
 
 @Service
@@ -29,9 +35,19 @@ public class LoginServiceImpl extends ServiceImpl<LoginMapper, Users>
         implements LoginService {
 
     private final JwtUtil jwtUtil;
+    private final LoginAttemptLimiter loginAttemptLimiter;
+    private final TokenBlacklist tokenBlacklist;
+    private final WalletService walletService;
     private final PasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
 
+    /**
+     * 账号不存在时用来"陪跑"的 bcrypt hash：类加载时现算一个，
+     * 不硬编码，也不需要它对应任何真实密码。
+     */
+    private static final String DUMMY_HASH = new BCryptPasswordEncoder().encode("timing-equalizer");
+
     @Override
+    @Transactional
     public AuthVO register(RegisterDTO registerDTO) {
         validateRegisterDTO(registerDTO);
 
@@ -52,24 +68,68 @@ public class LoginServiceImpl extends ServiceImpl<LoginMapper, Users>
         user.setUpdatedAt(LocalDateTime.now());
 
         save(user);
+        // 与创建用户同一事务：送礼失败则用户一起回滚，用户能重新注册。
+        // 反过来「用户建出来了却报注册失败」会让用户名被自己占死，重试都重试不了。
+        walletService.grantInitialCredit(user.getId());
 
         return buildAuthVO(user);
     }
 
     @Override
-    public AuthVO login(LoginDTO loginDTO) {
+    public AuthVO login(LoginDTO loginDTO, String clientIp) {
         validateLoginDTO(loginDTO);
+
+        // 查库之前先拦：锁定时既不做 bcrypt 计算，也不让"是否被锁"成为账号存在性的探针
+        loginAttemptLimiter.checkBlocked(loginDTO.getUsername(), clientIp);
 
         Users users = lambdaQuery()
                 .eq(Users::getUsername, loginDTO.getUsername())
                 .eq(Users::getLoginType, "password")
                 .one();
 
-        if(users == null || !passwordEncoder.matches(loginDTO.getPassword(),users.getPasswordHash())){
-            throw new BusinessException(BlogConstants.ErrorCode.LOGIN_FAILED, "用户名或密码错误");
+        if (users == null) {
+            // 账号不存在时也跑一次 bcrypt：否则"立即返回"与"等 ~100ms"的时间差
+            // 本身就是账号是否存在的探针，与下面泛化的提示语自相矛盾
+            passwordEncoder.matches(loginDTO.getPassword(), DUMMY_HASH);
+            throw loginFailed(loginDTO.getUsername(), clientIp);
         }
 
+        if (!passwordEncoder.matches(loginDTO.getPassword(), users.getPasswordHash())) {
+            throw loginFailed(loginDTO.getUsername(), clientIp);
+        }
+
+        // 只清账号维度：IP 维度表达的是"这个来源可疑"，成功登录证明不了同一出口下的其他人（详见类注释）
+        loginAttemptLimiter.clear(loginDTO.getUsername());
+
         return buildAuthVO(users);
+    }
+
+    @Override
+    public void logout(String token) {
+        if (!StringUtils.hasText(token)) {
+            return;
+        }
+
+        JwtUtil.Payload payload;
+        try {
+            payload = jwtUtil.parsePayload(token);
+        } catch (Exception e) {
+            // token 无效或已过期：它本来就用不了了，不需要（也无法）拉黑
+            return;
+        }
+
+        // 黑名单只需活到 token 自然过期为止
+        long remainingSeconds = payload.expireAtSeconds() - Instant.now().getEpochSecond();
+        tokenBlacklist.revoke(payload.jti(), Duration.ofSeconds(remainingSeconds));
+    }
+
+    /**
+     * 登录失败：计数与提示语绑在一处，保证两个分支（账号不存在 / 密码错误）永远一致——
+     * 计数漏一个分支会变成账号存在性的探针，提示语不一致则等于直接告诉攻击者"这个账号有"。
+     */
+    private BusinessException loginFailed(String username, String clientIp) {
+        loginAttemptLimiter.recordFailure(username, clientIp);
+        return new BusinessException(BlogConstants.ErrorCode.LOGIN_FAILED, "用户名或密码错误");
     }
 
     private final AliyunOSSOperator aliyunOSSOperator;

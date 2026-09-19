@@ -40,7 +40,25 @@ public class AiWorkflowStepLogServiceImpl extends ServiceImpl<AiWorkflowStepLogM
                              long durationMs,
                              String logType){
 
-        AiWorkflowStepLog log = buildBaseLog(workflowRunId, step, STATUS_SUCCESS, durationMs, logType);
+        AiWorkflowStepLog log = buildBaseLog(workflowRunId, step, STATUS_SUCCESS, durationMs, logType, 0, 0);
+        log.setInputSummary(truncate(inputSummary, 2000));
+        log.setOutputSummary(truncate(outputSummary, 2000));
+        save(log);
+    }
+
+    @Override
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void recordSuccess(Long workflowRunId,
+                             String step,
+                             String inputSummary,
+                             String outputSummary,
+                             long durationMs,
+                             String logType,
+                             int inputTokens,
+                             int outputTokens){
+
+        AiWorkflowStepLog log = buildBaseLog(workflowRunId, step, STATUS_SUCCESS, durationMs, logType,
+                inputTokens, outputTokens);
         log.setInputSummary(truncate(inputSummary, 2000));
         log.setOutputSummary(truncate(outputSummary, 2000));
         save(log);
@@ -54,7 +72,18 @@ public class AiWorkflowStepLogServiceImpl extends ServiceImpl<AiWorkflowStepLogM
     @Override
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void recordFailure(Long workflowRunId, String step, String inputSummary, Exception e, long durationMs, String logType) {
-        AiWorkflowStepLog log = buildBaseLog(workflowRunId, step, STATUS_FAILED, durationMs, logType);
+        AiWorkflowStepLog log = buildBaseLog(workflowRunId, step, STATUS_FAILED, durationMs, logType, 0, 0);
+        log.setInputSummary(truncate(inputSummary, 2000));
+        log.setErrorMessage(truncate(e == null ? null : e.getMessage(), 1000));
+        save(log);
+    }
+
+    @Override
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void recordFailure(Long workflowRunId, String step, String inputSummary, Exception e,
+                              long durationMs, String logType, int inputTokens, int outputTokens) {
+        AiWorkflowStepLog log = buildBaseLog(workflowRunId, step, STATUS_FAILED, durationMs, logType,
+                inputTokens, outputTokens);
         log.setInputSummary(truncate(inputSummary, 2000));
         log.setErrorMessage(truncate(e == null ? null : e.getMessage(), 1000));
         save(log);
@@ -76,7 +105,9 @@ public class AiWorkflowStepLogServiceImpl extends ServiceImpl<AiWorkflowStepLogM
                                            String step,
                                            String status,
                                            long durationMs,
-                                           String logType){
+                                           String logType,
+                                           int inputTokens,
+                                           int outputTokens){
 
         LocalDateTime endedAt = LocalDateTime.now();
         long safeDurationMs = Math.max(durationMs, 0);
@@ -92,8 +123,10 @@ public class AiWorkflowStepLogServiceImpl extends ServiceImpl<AiWorkflowStepLogM
         log.setStartedAt(endedAt.minus(safeDurationMs, ChronoUnit.MILLIS));
         log.setEndedAt(endedAt);
         log.setDurationMs(safeDurationMs);
-        log.setInputTokens(0);
-        log.setOutputTokens(0);
+        // 真实用量由 WorkflowTokenRecorder 暂存、WorkflowStepRunner 取走后传入；
+        // 操作级日志不调 LLM，走旧签名时传 0
+        log.setInputTokens(inputTokens);
+        log.setOutputTokens(outputTokens);
         log.setCreatedAt(endedAt);
         return log;
     }

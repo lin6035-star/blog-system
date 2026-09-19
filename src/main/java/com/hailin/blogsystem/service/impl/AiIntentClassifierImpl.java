@@ -2,6 +2,8 @@ package com.hailin.blogsystem.service.impl;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hailin.blogsystem.ai.AiJudgeModelSupport;
+import com.hailin.blogsystem.ai.LlmResponseSupport;
+import com.hailin.blogsystem.ai.TokenUsageAccumulator;
 import com.hailin.blogsystem.entity.LearningPlans;
 import com.hailin.blogsystem.entity.dto.AiIntent;
 import com.hailin.blogsystem.entity.dto.PageContextDTO;
@@ -10,6 +12,7 @@ import com.hailin.blogsystem.service.LearningPlansService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.stereotype.Service;
 
@@ -26,14 +29,15 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
     private final AiJudgeModelSupport aiJudgeModelSupport;
 
     @Override  //判断分类，用户想要干什么，如果是要生成文章，单独拆一个实现类专门实现
-    public AiIntent classify(String message, PageContextDTO pageContextDTO, Long userId){
+    public AiIntent classify(String message, PageContextDTO pageContextDTO, Long userId,
+                             TokenUsageAccumulator usage){
         /*
          * 第一段：不带计划列表。
          *
          * 绝大多数消息（闲聊、文章问答、概念问答、创建计划）到此为止——
          * 不查库、user prompt 里也没有计划列表（普通聊天不该背这个包袱）。
          */
-        AiIntent aiIntent = callOnce(message, pageContextDTO, List.of());
+        AiIntent aiIntent = callOnce(message, pageContextDTO, List.of(), usage);
         if (aiIntent == null || aiIntent.getIntent() == null || aiIntent.getIntent().isBlank()) {
             log.warn("AI意图识别失败，降级为普通聊天");
             return generalChat();
@@ -52,7 +56,7 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
             plans = loadActivePlans(userId);
             if (!plans.isEmpty()) {
                 log.info("意图命中计划定位，二次分类带列表：planRef={}", aiIntent.getLearningPlanRef());
-                AiIntent located = callOnce(message, pageContextDTO, plans);
+                AiIntent located = callOnce(message, pageContextDTO, plans, usage);
                 if (located != null && located.getIntent() != null && !located.getIntent().isBlank()) {
                     aiIntent = located;
                 }
@@ -88,16 +92,20 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
         return aiIntent;
     }
 
-    private String callClassifier(String message, PageContextDTO pageContextDTO, List<LearningPlans> plans, boolean repair) {
+    private String callClassifier(String message, PageContextDTO pageContextDTO,
+                                  List<LearningPlans> plans, boolean repair,
+                                  TokenUsageAccumulator usage) {
         try {
-            return chatClientBuilder.build()
+            ChatResponse response = chatClientBuilder.build()
                     .prompt()
                     .system(buildSystemPrompt(repair))
                     .user(buildUserPrompt(message, pageContextDTO, plans))
                     //判断链：配了 judge-model 用强模型（换模型导致判分界线漂移的实测见 AiJudgeModelSupport）
                     .options(aiJudgeModelSupport.applyTo(OpenAiChatOptions.builder()).build())
                     .call()
-                    .content();
+                    .chatResponse();
+            TokenUsageAccumulator.addTo(usage, LlmResponseSupport.usageOf(response));
+            return LlmResponseSupport.textOf(response);
         } catch (Exception e) {
             log.warn("AI意图识别调用失败", e);
             return null;
@@ -110,13 +118,14 @@ public class AiIntentClassifierImpl implements AiIntentClassifier
      * repair 的理由：模型偶尔把规则/注释文字混进输出，一次失败就降级会让
      * 「点名单任务」这类诉求静默退化成无能力聊天。
      */
-    private AiIntent callOnce(String message, PageContextDTO pageContextDTO, List<LearningPlans> plans) {
-        String json = callClassifier(message, pageContextDTO, plans, false);
+    private AiIntent callOnce(String message, PageContextDTO pageContextDTO,
+                              List<LearningPlans> plans, TokenUsageAccumulator usage) {
+        String json = callClassifier(message, pageContextDTO, plans, false, usage);
         AiIntent intent = json == null ? null : tryParse(json);
         if (intent != null || json == null) {
             return intent;
         }
-        String repaired = callClassifier(message, pageContextDTO, plans, true);
+        String repaired = callClassifier(message, pageContextDTO, plans, true, usage);
         if (repaired == null) {
             return null;
         }

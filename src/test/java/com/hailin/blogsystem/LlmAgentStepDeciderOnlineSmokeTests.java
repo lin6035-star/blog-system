@@ -77,21 +77,21 @@ class LlmAgentStepDeciderOnlineSmokeTests {
     @Test
     void learningDomainDecisionSurvivesThoughtRequirement() {
         AgentStepDecision decision = llmAgentStepDecider.decide(
-                "帮我安排今天学什么 Redis", "（无）", 1, 5);
+                "帮我安排今天学什么 Redis", "（无）", 1, 5, null);
         assertDecisionOk(decision, LEARNING_ALLOWED);
     }
 
     @Test
     void generalDomainDecisionSurvivesThoughtRequirement() {
         AgentStepDecision decision = generalAgentStepDecider.decide(
-                "结合我最近的情况，给个学习建议", "（无）", 1, 3);
+                "结合我最近的情况，给个学习建议", "（无）", 1, 3, null);
         assertDecisionOk(decision, GENERAL_ALLOWED);
     }
 
     @Test
     void articleDomainDecisionSurvivesThoughtRequirement() {
         AgentStepDecision decision = articleAgentStepDecider.decide(
-                "帮我分析这篇文章的结构", "（无）", 1, 5);
+                "帮我分析这篇文章的结构", "（无）", 1, 5, null);
         assertDecisionOk(decision, ARTICLE_ALLOWED);
     }
 

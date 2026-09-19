@@ -139,7 +139,7 @@ class AgentRouteBaselineTests {
                     // 在线：分类器原始输出（这条链路上唯一的不确定来源）
                     // userId 传 null：基线对照实验不注入学习计划列表——注入会引入库数据依赖，
                     // 且会让「分类器原始输出」这个被观测对象多一个变量
-                    AiIntent intent = aiIntentClassifier.classify(message, pageContext, null);
+                    AiIntent intent = aiIntentClassifier.classify(message, pageContext, null, null);
                     // 离线：把同一份分类结果喂 Planner，拿最终消费路径
                     AgentDecision decision = planner.decide(message, intent, pageContext, 1L, session);
 
