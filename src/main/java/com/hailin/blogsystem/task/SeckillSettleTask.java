@@ -138,6 +138,17 @@ public class SeckillSettleTask {
 
     private void settleActivity(Long activityId) {
         String eventsKey = SeckillKeys.events(activityId);
+
+        // ⚠️ 这里必须先确认 key 存在，不能直接让 XGROUP 带着 MKSTREAM 去建。
+        // MKSTREAM 的语义是「stream 不存在就**创建**它」——这个任务每 2 秒跑一轮，
+        // 于是一个已经被清掉的活动（测试造的活动在 @AfterEach 里删了 Redis key，
+        // 但 DB 行还在、活动列表缓存也没过期）会被它一遍遍地把空 stream 建回来。
+        // 实测在本地积了 26 个永不消失的空 stream，占 db0 全部 key 的 86%。
+        // events 由抢购脚本的 XADD 创建，所以「key 不存在」就等于「没人抢过」= 没有东西要消费
+        if (!Boolean.TRUE.equals(redisTemplate.hasKey(eventsKey))) {
+            return;
+        }
+
         ensureGroup(eventsKey);
         drainNewMessages(eventsKey);
         reclaimStaleMessages(eventsKey);
@@ -146,13 +157,13 @@ public class SeckillSettleTask {
     /**
      * 确保消费组存在（幂等）。
      *
-     * <p>{@code MKSTREAM} 不能省：stream 不存在时如果不建，首轮永远创建不出组，
-     * 入账队列就一直是空的——而预热时我们**刻意不清 events**，
-     * 所以这个 stream 正常是由抢购脚本里的 XADD 创建的。
+     * <p>调用方已经确认过 key 存在，所以这里**不带 {@code MKSTREAM}**——见
+     * {@link #settleActivity} 的注释，那个参数正是孤儿 stream 的来源。
+     * 组不存在时创建失败，下一轮会再试，不影响正确性。
      */
     private void ensureGroup(String eventsKey) {
         try {
-            exec("XGROUP", "CREATE", eventsKey, GROUP, "0", "MKSTREAM");
+            exec("XGROUP", "CREATE", eventsKey, GROUP, "0");
         } catch (RuntimeException e) {
             // BUSYGROUP = 组已存在，是绝大多数情况下的正常路径。
             // 其他异常也吞掉：下一轮还会再来，不该因为建组失败把整轮任务掀了

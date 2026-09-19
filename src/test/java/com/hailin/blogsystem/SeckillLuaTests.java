@@ -7,6 +7,7 @@ import com.hailin.blogsystem.entity.vo.SeckillResultVO;
 import com.hailin.blogsystem.mapper.SeckillActivityMapper;
 import com.hailin.blogsystem.mapper.SeckillOrderMapper;
 import com.hailin.blogsystem.service.SeckillService;
+import com.hailin.blogsystem.task.SeckillSettleTask;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -53,6 +54,9 @@ class SeckillLuaTests {
 
     @Autowired
     private StringRedisTemplate redisTemplate;
+
+    @Autowired
+    private SeckillSettleTask seckillSettleTask;
 
     private SeckillActivity activity;
 
@@ -197,6 +201,91 @@ class SeckillLuaTests {
     }
 
     /** 让所有线程卡在同一个栅栏上再一起放行——不这么做就测不出并发交错 */
+    /**
+     * 预热建出来的 key 必须带 TTL。
+     *
+     * <p>部署模板用的是 `maxmemory-policy: volatile-lru`，而它**只淘汰设了 TTL 的 key**
+     * ——没 TTL 的碰都不碰，内存满了走 OOM 而不是淘汰。这个坑项目踩过一次
+     * （热度榜曾经是唯一无 TTL 的 key），秒杀这套不能重蹈，见 redis-ops-runbook.md §7.4。
+     */
+    @Test
+    void preheatPutsTtlOnTheKeysItCreates() {
+        assertThat(ttlSeconds(SeckillKeys.stock(activity.getId())))
+                .as("stock 由预热创建").isGreaterThan(0);
+        assertThat(ttlSeconds(SeckillKeys.meta(activity.getId())))
+                .as("meta 由预热创建").isGreaterThan(0);
+    }
+
+    /**
+     * {@code users} / {@code events} 是**抢购时才创建**的，预热时给它们设 TTL 是空操作
+     * （key 还不存在，{@code EXPIRE} 静默返回 false）——所以必须由抢购脚本补。
+     * 第一条断言锁的就是那个缺口本身，没有它这条用例会在修复前后都通过。
+     */
+    @Test
+    void grabPutsTtlOnTheKeysItCreates() {
+        assertThat(ttlSeconds(SeckillKeys.users(activity.getId())))
+                .as("本用例 setup 没有任何已入账用户，users 此时还不存在")
+                .isEqualTo(-2);
+
+        seckillService.grab(activity.getId(), userBase);
+
+        assertThat(ttlSeconds(SeckillKeys.users(activity.getId())))
+                .as("users 由 SADD 创建，TTL 由抢购脚本补").isGreaterThan(0);
+        assertThat(ttlSeconds(SeckillKeys.events(activity.getId())))
+                .as("events 由 XADD 创建，TTL 由抢购脚本补").isGreaterThan(0);
+    }
+
+    /**
+     * 消费者不能把已经删掉的 {@code events} key 凭空建回来。
+     *
+     * <p>这条锁的是孤儿 stream 的**根因**：{@code XGROUP CREATE ... MKSTREAM} 的语义是
+     * 「stream 不存在就**创建**它」，而这个任务每 2 秒跑一轮——于是一个被清掉的活动
+     * （测试删了 Redis key，但 DB 里的活动行还在、活动列表缓存也还没过期）
+     * 会被它一遍遍重建。实测在本地积了 26 个永不消失的空 stream，占 db0 全部 key 的 86%。
+     *
+     * <p>手动调 {@code consume()} 而不是等调度器：调度周期是 2 秒，靠等会让用例变得看运气。
+     */
+    @Test
+    void settleTaskDoesNotRecreateADeletedEventsKey() {
+        seckillService.grab(activity.getId(), userBase);
+        assertThat(redisTemplate.hasKey(SeckillKeys.events(activity.getId())))
+                .as("抢购会通过 XADD 创建 events").isTrue();
+
+        // 模拟「测试 @AfterEach 清完 Redis，但 DB 里的活动行还在」
+        redisTemplate.delete(SeckillKeys.events(activity.getId()));
+
+        seckillSettleTask.consume();
+
+        assertThat(redisTemplate.hasKey(SeckillKeys.events(activity.getId())))
+                .as("key 不存在 = 根本没人抢过 = 没有东西要消费，不该建它")
+                .isFalse();
+    }
+
+    /**
+     * 预热要覆盖**已经存在**的 {@code events} key。
+     *
+     * <p>它的 TTL 平时由抢购脚本补，但那个脚本只在「有人来抢」时才跑——存量 key
+     * （修复上线前就建好的）和「建完之后再没人抢」的活动都等不到那一次补救。
+     * 实测就是这么发现的：重启 + 预热之后 `stock`/`users`/`meta` 都拿到了 TTL，
+     * 只有 `events` 还是 -1。
+     */
+    @Test
+    void preheatBackfillsTtlOnAnExistingEventsKey() {
+        seckillService.grab(activity.getId(), userBase);
+        // 抹掉 TTL，模拟修复上线前建出来的存量 key
+        redisTemplate.persist(SeckillKeys.events(activity.getId()));
+        assertThat(ttlSeconds(SeckillKeys.events(activity.getId()))).isEqualTo(-1);
+
+        seckillService.preheat(activity.getId());
+
+        assertThat(ttlSeconds(SeckillKeys.events(activity.getId())))
+                .as("预热后所有秒杀 key 都必须有 TTL").isGreaterThan(0);
+    }
+
+    private long ttlSeconds(String key) {
+        return redisTemplate.getExpire(key, TimeUnit.SECONDS);
+    }
+
     private void runConcurrently(int threads, IntConsumer task) throws Exception {
         ExecutorService pool = Executors.newFixedThreadPool(threads);
         CountDownLatch start = new CountDownLatch(1);

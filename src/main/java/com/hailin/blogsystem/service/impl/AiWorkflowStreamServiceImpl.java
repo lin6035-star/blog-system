@@ -1,5 +1,8 @@
 package com.hailin.blogsystem.service.impl;
 
+import com.hailin.blogsystem.ai.task.AiOrchestrationTaskAdmission;
+import com.hailin.blogsystem.ai.task.AiTaskRequest;
+import com.hailin.blogsystem.ai.task.AiTaskType;
 import com.hailin.blogsystem.ai.workflow.AiWorkflowStepEmitter;
 import com.hailin.blogsystem.entity.AiChatEventType;
 import com.hailin.blogsystem.entity.vo.AiChatEventVO;
@@ -17,7 +20,6 @@ import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.FluxSink;
 import reactor.core.publisher.Mono;
-import reactor.core.scheduler.Schedulers;
 
 
 import java.util.HashMap;
@@ -34,6 +36,7 @@ public class AiWorkflowStreamServiceImpl implements AiWorkflowStreamService {
 
     private final AiWorkflowRunService aiWorkflowRunService;
     private final ObjectProvider<Tracer> tracerProvider;
+    private final AiOrchestrationTaskAdmission admission;
 
 
     @Override
@@ -108,11 +111,20 @@ public class AiWorkflowStreamServiceImpl implements AiWorkflowStreamService {
     ) {
         Long userId = UserContext.get();
 
-        // V4⑥ 可观测性：boundedElastic 的提交发生在订阅线程（无 MDC），
-        // 在请求线程先抓日志上下文，执行线程恢复（与 Agent / Workflow 创建路径同模式）。
-        // 这里必须同时恢复 Micrometer TraceContext；只恢复 MDC 会在后续 tracing scope 切换时丢 traceId。
+        // V4⑥ 可观测性：异步提交发生在订阅线程（无 MDC），
+        // 在请求线程先抓日志上下文，执行线程由准入模块统一恢复（MDC + TraceContext；
+        // 只恢复 MDC 会在后续 tracing scope 切换时丢 traceId）。
         MdcContext.LogContext logContext =
                 MdcContext.captureWithTrace(tracerProvider.getIfAvailable(), MdcContext.capture());
+
+        // 准入前置：在构造任何 SSE 事件之前拒绝，前端才能拿到 HTTP 429/503 而不是「连接意外中断」。
+        // （这条路径本身没有前置事件、订阅时抛也能返回状态码，见 SseAdmissionProbeTests；
+        //   前置是为了拒绝更早、日志更清晰。）
+        AiTaskType taskType = toTaskType(action);
+        String businessRef = id + ":" + action;
+        admission.precheck(userId, taskType, businessRef);
+
+        AiTaskRequest taskRequest = AiTaskRequest.of(userId, taskType, businessRef, logContext);
 
         return Flux.create(sink -> {
             long subscribeAt = System.currentTimeMillis();
@@ -128,10 +140,7 @@ public class AiWorkflowStreamServiceImpl implements AiWorkflowStreamService {
                     action
             );
 
-            Schedulers.boundedElastic().schedule(MdcContext.wrap(
-                    tracerProvider.getIfAvailable(),
-                    logContext,
-                    () -> {
+            admission.submit(taskRequest, () -> {
                 long workerStart = System.currentTimeMillis();
 
                 log.info(
@@ -140,8 +149,6 @@ public class AiWorkflowStreamServiceImpl implements AiWorkflowStreamService {
                         action,
                         workerStart - subscribeAt
                 );
-
-                UserContext.set(userId);
 
                 AtomicBoolean firstContentLogged =
                         new AtomicBoolean(false);
@@ -227,11 +234,18 @@ public class AiWorkflowStreamServiceImpl implements AiWorkflowStreamService {
                                 action
                         );
                     }
-                } finally {
-                    UserContext.clear();
                 }
-            }));
+            });
         });
+    }
+
+    /** Workflow 动作 → 任务类型（准入观测与拒绝文案用）。 */
+    private AiTaskType toTaskType(String action) {
+        return switch (action) {
+            case "REJECT" -> AiTaskType.WORKFLOW_REJECT;
+            case "RETRY" -> AiTaskType.WORKFLOW_RETRY;
+            default -> AiTaskType.WORKFLOW_APPROVE;
+        };
     }
 
     private void safeNext(FluxSink<AiChatEventVO> sink, AiChatEventVO event) {

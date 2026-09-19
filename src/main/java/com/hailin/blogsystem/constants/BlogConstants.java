@@ -45,6 +45,8 @@ public class BlogConstants {
         public static final int CONFLICT = 40900;  // 资源正在处理中
         public static final int RATE_LIMITED = 42900;   // 请求过于频繁
         public static final int INSUFFICIENT_BALANCE = 40200;  // 额度不足（HTTP 402）
+        public static final int AI_TASK_USER_LIMIT = 42901;   // 该用户 AI 长任务并发超限（HTTP 429）
+        public static final int AI_TASK_POOL_FULL = 50300;    // AI 长任务全局容量耗尽（HTTP 503）
 
         private ErrorCode() {
 

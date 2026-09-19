@@ -22,6 +22,9 @@ import com.hailin.blogsystem.ai.agent.LearningAgentRuntime;
 import com.hailin.blogsystem.ai.planner.AgentPlannerSupport;
 import com.hailin.blogsystem.ai.qa.ArticleQaTargetResolver;
 import com.hailin.blogsystem.ai.qa.ArticleQaTargetResolver.QaTarget;
+import com.hailin.blogsystem.ai.task.AiOrchestrationTaskAdmission;
+import com.hailin.blogsystem.ai.task.AiTaskRequest;
+import com.hailin.blogsystem.ai.task.AiTaskType;
 import com.hailin.blogsystem.ai.trace.AgentDecisionTrace;
 import com.hailin.blogsystem.ai.trace.AgentDecisionTraceSink;
 import com.hailin.blogsystem.ai.workflow.CreateArticleWorkflowHandler;
@@ -55,7 +58,6 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.FluxSink;
 import reactor.core.publisher.Mono;
 import reactor.core.publisher.SignalType;
-import reactor.core.scheduler.Schedulers;
 
 import java.time.LocalDateTime;
 import java.util.*;
@@ -68,6 +70,7 @@ import java.util.concurrent.atomic.AtomicReference;
 public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessages>
         implements AiMessageService {
 
+    private final AiOrchestrationTaskAdmission admission;
     private final AiSessionMapper aiSessionMapper;
     private final AiModelService aiModelService;
     private final AiPromptService aiPromptService;
@@ -842,10 +845,6 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
         return MdcContext.captureWithTrace(tracerProvider.getIfAvailable(), fallback);
     }
 
-    private Runnable wrapAgentLogContext(MdcContext.LogContext logContext, Runnable runnable) {
-        return MdcContext.wrap(tracerProvider.getIfAvailable(), logContext, runnable);
-    }
-
     private Flux<AiChatEventVO> streamAgentReply(
             AgentRuntime runtime,
             String message,        // 用户**原话**：落库 + 回传前端，必须原样（不能是续答合成文本）
@@ -860,6 +859,12 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             MdcContext.LogContext logContext,
             TokenUsageAccumulator routeUsage
     ) {
+        // 准入前置：放在方法最开头——既在任何 Flux 构造之前（响应一旦按 200 SSE 提交，
+        // 状态码就改不动了），也在下面 save(userMessage) 之前（否则拒绝后会留下孤立消息）。
+        String agentBusinessRef = requestId + ":" + sessionId;
+        admission.precheck(userId, AiTaskType.AGENT, agentBusinessRef);
+        AiTaskRequest agentTaskRequest =
+                AiTaskRequest.of(userId, AiTaskType.AGENT, agentBusinessRef, logContext);
         // 用户消息落库（同步，立即可见）——用原话，用户发的什么就存什么、显示什么
         AiMessages userMessage = new AiMessages();
         userMessage.setSessionId(sessionId);
@@ -922,8 +927,7 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 }
             };
 
-            Schedulers.boundedElastic().schedule(wrapAgentLogContext(logContext, () -> {
-                UserContext.set(userId);
+            admission.submit(agentTaskRequest, () -> {
                 try {
                     AgentRunResult result = runtime.run(
                             userId, sessionId, agentGoal, pageContext, emitter
@@ -1016,10 +1020,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                             .eventData(eventData)
                             .build());
                     completeIfOpen(sink);
-                } finally {
-                    UserContext.clear();
                 }
-            }));
+            });
         });
 
         return Flux.concat(
@@ -1095,6 +1097,11 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             Long userId,
             Long sessionId
     ) {
+        // 准入前置：放在方法最开头——既在任何 Flux 构造之前（响应一旦按 200 SSE 提交，
+        // 状态码就改不动了），也在下面 save(userMessage) 之前（否则拒绝后会留下孤立消息）。
+        String workflowBusinessRef = sessionId + ":optimize-article";
+        admission.precheck(userId, AiTaskType.WORKFLOW_CREATE, workflowBusinessRef);
+
         // V4⑥ 可观测性：Flux 惰性——boundedElastic 的提交发生在订阅线程，那里没有 MDC。
         // 在请求线程先抓日志上下文，执行线程恢复（与 streamAgentReply 同模式）。
         MdcContext.LogContext workflowLogContext = captureAgentLogContext(MdcContext.capture());
@@ -1121,9 +1128,11 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 ))
                 .build();
 
+        AiTaskRequest workflowTaskRequest = AiTaskRequest.of(
+                userId, AiTaskType.WORKFLOW_CREATE, workflowBusinessRef, workflowLogContext);
+
         Flux<AiChatEventVO> workflowEvents = Flux.create(sink ->
-                Schedulers.boundedElastic().schedule(wrapAgentLogContext(workflowLogContext, () -> {
-                    UserContext.set(userId);
+                admission.submit(workflowTaskRequest, () -> {
                     try {
                         AtomicReference<Long> workflowRunId = new AtomicReference<>();
                         AiWorkflowStepEmitter emitter = new AiWorkflowStepEmitter() {
@@ -1197,10 +1206,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                     } catch (Throwable e) {
                         emitRejectedOrError(sink, sessionId, userId, rawPageContextJson,
                                 AiWorkflowType.OPTIMIZE_ARTICLE.name(), e);
-                    } finally {
-                        UserContext.clear();
                     }
-                }))
+                })
         );
 
         return Flux.concat(Flux.just(paramEvent), workflowEvents);
@@ -1613,6 +1620,11 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             Long userId,
             Long sessionId
     ) {
+        // 准入前置：放在方法最开头——既在任何 Flux 构造之前（响应一旦按 200 SSE 提交，
+        // 状态码就改不动了），也在下面 save(userMessage) 之前（否则拒绝后会留下孤立消息）。
+        String workflowBusinessRef = sessionId + ":create-article";
+        admission.precheck(userId, AiTaskType.WORKFLOW_CREATE, workflowBusinessRef);
+
         AiMessages userMessage = new AiMessages();
         userMessage.setSessionId(sessionId);
         userMessage.setRole(ROLE_USER);
@@ -1651,9 +1663,11 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 ))
                 .build();
 
+        AiTaskRequest workflowTaskRequest = AiTaskRequest.of(
+                userId, AiTaskType.WORKFLOW_CREATE, workflowBusinessRef, workflowLogContext);
+
         Flux<AiChatEventVO> workflowEvents = Flux.create(sink ->
-                Schedulers.boundedElastic().schedule(wrapAgentLogContext(workflowLogContext, () -> {
-                    UserContext.set(userId);
+                admission.submit(workflowTaskRequest, () -> {
                     try {
                         AtomicReference<Long> workflowRunId = new AtomicReference<>();
                         AiWorkflowStepEmitter emitter = new AiWorkflowStepEmitter() {
@@ -1728,10 +1742,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                     } catch (Throwable e) {
                         emitRejectedOrError(sink, sessionId, userId, rawPageContextJson,
                                 AiWorkflowType.CREATE_ARTICLE.name(), e);
-                    } finally {
-                        UserContext.clear();
                     }
-                }))
+                })
         );
 
         return Flux.concat(Flux.just(paramEvent), workflowEvents);
@@ -1747,6 +1759,11 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             Long sessionId,
             String requestId
     ) {
+        // 准入前置：放在方法最开头——既在任何 Flux 构造之前（响应一旦按 200 SSE 提交，
+        // 状态码就改不动了），也在下面 save(userMessage) 之前（否则拒绝后会留下孤立消息）。
+        String workflowBusinessRef = sessionId + ":learning-plan";
+        admission.precheck(userId, AiTaskType.WORKFLOW_CREATE, workflowBusinessRef);
+
         AiMessages userMessage = new AiMessages();
         userMessage.setSessionId(sessionId);
         userMessage.setRole(ROLE_USER);
@@ -1770,9 +1787,11 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 ))
                 .build();
 
+        AiTaskRequest workflowTaskRequest = AiTaskRequest.of(
+                userId, AiTaskType.WORKFLOW_CREATE, workflowBusinessRef, workflowLogContext);
+
         Flux<AiChatEventVO> workflowEvents = Flux.create(sink ->
-                Schedulers.boundedElastic().schedule(wrapAgentLogContext(workflowLogContext, () -> {
-                    UserContext.set(userId);
+                admission.submit(workflowTaskRequest, () -> {
                     try {
                         AiWorkflowStepEmitter emitter = buildLearningWorkflowEmitter(AiWorkflowType.LEARNING_PLAN, sink);
 
@@ -1805,10 +1824,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                     } catch (Throwable e) {
                         emitRejectedOrError(sink, sessionId, userId, rawPageContextJson,
                                 AiWorkflowType.LEARNING_PLAN.name(), e);
-                    } finally {
-                        UserContext.clear();
                     }
-                }))
+                })
         );
 
         return Flux.concat(Flux.just(paramEvent), workflowEvents);
@@ -1867,6 +1884,11 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             Long sessionId,
             String requestId
     ) {
+        // 准入前置：放在方法最开头——既在任何 Flux 构造之前（响应一旦按 200 SSE 提交，
+        // 状态码就改不动了），也在下面 save(userMessage) 之前（否则拒绝后会留下孤立消息）。
+        String workflowBusinessRef = sessionId + ":learning-progress";
+        admission.precheck(userId, AiTaskType.WORKFLOW_CREATE, workflowBusinessRef);
+
         AiMessages userMessage = new AiMessages();
         userMessage.setSessionId(sessionId);
         userMessage.setRole(ROLE_USER);
@@ -1899,9 +1921,11 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 ))
                 .build();
 
+        AiTaskRequest workflowTaskRequest = AiTaskRequest.of(
+                userId, AiTaskType.WORKFLOW_CREATE, workflowBusinessRef, workflowLogContext);
+
         Flux<AiChatEventVO> workflowEvents = Flux.create(sink ->
-                Schedulers.boundedElastic().schedule(wrapAgentLogContext(workflowLogContext, () -> {
-                    UserContext.set(userId);
+                admission.submit(workflowTaskRequest, () -> {
                     try {
                         AiWorkflowStepEmitter emitter = buildLearningWorkflowEmitter(AiWorkflowType.LEARNING_PROGRESS, sink);
 
@@ -1934,10 +1958,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                     } catch (Throwable e) {
                         emitRejectedOrError(sink, sessionId, userId, rawPageContextJson,
                                 AiWorkflowType.LEARNING_PROGRESS.name(), e);
-                    } finally {
-                        UserContext.clear();
                     }
-                }))
+                })
         );
 
         return Flux.concat(Flux.just(paramEvent), workflowEvents);
@@ -1954,6 +1976,11 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
             Long sessionId,
             String requestId
     ) {
+        // 准入前置：放在方法最开头——既在任何 Flux 构造之前（响应一旦按 200 SSE 提交，
+        // 状态码就改不动了），也在下面 save(userMessage) 之前（否则拒绝后会留下孤立消息）。
+        String workflowBusinessRef = sessionId + ":learning-assist";
+        admission.precheck(userId, AiTaskType.WORKFLOW_CREATE, workflowBusinessRef);
+
         AiMessages userMessage = new AiMessages();
         userMessage.setSessionId(sessionId);
         userMessage.setRole(ROLE_USER);
@@ -1979,9 +2006,11 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                 ))
                 .build();
 
+        AiTaskRequest workflowTaskRequest = AiTaskRequest.of(
+                userId, AiTaskType.WORKFLOW_CREATE, workflowBusinessRef, workflowLogContext);
+
         Flux<AiChatEventVO> workflowEvents = Flux.create(sink ->
-                Schedulers.boundedElastic().schedule(wrapAgentLogContext(workflowLogContext, () -> {
-                    UserContext.set(userId);
+                admission.submit(workflowTaskRequest, () -> {
                     try {
                         AiWorkflowStepEmitter emitter = buildLearningWorkflowEmitter(AiWorkflowType.LEARNING_ASSIST, sink);
 
@@ -2014,10 +2043,8 @@ public class AiMessageServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage
                     } catch (Throwable e) {
                         emitRejectedOrError(sink, sessionId, userId, rawPageContextJson,
                                 AiWorkflowType.LEARNING_ASSIST.name(), e);
-                    } finally {
-                        UserContext.clear();
                     }
-                }))
+                })
         );
 
         return Flux.concat(Flux.just(paramEvent), workflowEvents);

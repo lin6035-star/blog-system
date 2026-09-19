@@ -18,6 +18,25 @@ public class BlogAiProperties {
     private RateLimit rateLimit = new RateLimit();
     private Inspection inspection = new Inspection();
     private Billing billing = new Billing();
+    private Task task = new Task();
+
+    /**
+     * AI 长任务（Agent / Workflow 编排）的准入与专用线程池。
+     *
+     * <p>⚠️ {@code workerCount} 是<b>成本闸门</b>不是容量结论：它等于「同时向模型供应商发起的
+     * 并发请求数上限」，直接决定花钱速率。定它看的是供应商并发限制 + 成本速率 + HTTP 连接池 +
+     * 可接受的排队延迟，<b>不能按 CPU 核数推导</b>——IO 密集任务的瓶颈在外部服务，不在本机。
+     */
+    @Data
+    public static class Task {
+        /** 专用池 worker 数。固定 core == max，保证「worker + queue」容量可预测。 */
+        private int workerCount = 8;
+        /** 有界队列容量。 */
+        private int queueCapacity = 32;
+        /** 每用户并发上限（硬上限：竞态结果是拒绝，不是多跑一个）。 */
+        private int maxConcurrentPerUser = 2;
+        private String threadNamePrefix = "ai-task-";
+    }
 
     @Data
     public static class Memory{

@@ -19,12 +19,14 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
 
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 秒杀实现：Redis 预占 + DB 最终裁决。
@@ -61,7 +63,7 @@ public class SeckillServiceImpl implements SeckillService {
     private static final DefaultRedisScript<List> GRAB_SCRIPT = new DefaultRedisScript<>(
             """
             -- KEYS[1]=stock  KEYS[2]=users  KEYS[3]=meta  KEYS[4]=events
-            -- ARGV[1]=userId  ARGV[2]=activityId
+            -- ARGV[1]=userId  ARGV[2]=activityId  ARGV[3]=events 的兜底 TTL（秒）
             local stockType = redis.call('TYPE', KEYS[1])['ok']
             local usersType = redis.call('TYPE', KEYS[2])['ok']
             local metaType  = redis.call('TYPE', KEYS[3])['ok']
@@ -91,6 +93,18 @@ public class SeckillServiceImpl implements SeckillService {
                                        'activityId', ARGV[2], 'userId', ARGV[1])
             redis.call('DECR', KEYS[1])
             redis.call('SADD', KEYS[2], ARGV[1])
+            -- users 和 events 都是**抢购时才创建**的，创建出来的 key 不带 TTL。
+            -- 而 volatile-lru **只淘汰设了 TTL 的 key**，没 TTL 的会一直占着内存，
+            -- 内存满了走 OOM 而不是淘汰——所以在这里补上。
+            -- 预热时建的那三个（stock/meta/users 回填）已经在 preheatOne 里设过，
+            -- 这里判 TTL < 0 只是兜底；**不能无条件 EXPIRE**，否则每次抢购都把
+            -- 过期时间往后推，等于永不过期
+            if redis.call('TTL', KEYS[2]) < 0 then
+                redis.call('EXPIRE', KEYS[2], ARGV[3])
+            end
+            if redis.call('TTL', KEYS[4]) < 0 then
+                redis.call('EXPIRE', KEYS[4], ARGV[3])
+            end
             return {1, eventId}
             """,
             List.class);
@@ -105,6 +119,24 @@ public class SeckillServiceImpl implements SeckillService {
     private static final int CODE_DUPLICATE = -1;
     private static final int CODE_NOT_ACTIVE = -2;
     private static final int CODE_BAD_KEY = -3;
+
+    /**
+     * 活动结束后，{@code stock} / {@code users} / {@code meta} 再保留多久。
+     *
+     * <p>活动一结束这三个 key 就没有读者了（结果查询和一人一单都以 DB 为准），
+     * 留一周纯属给对账任务和排查留窗口。
+     */
+    private static final long STATE_RETENTION_AFTER_END_SECONDS = Duration.ofDays(7).toSeconds();
+
+    /**
+     * {@code users} / {@code events} 的兜底 TTL——这两个 key 都是**抢购时才创建**的，
+     * 所以只能由抢购脚本补 TTL，且从它**被创建**的那一刻算起。
+     *
+     * <p>这里给固定时长而不是「到活动结束」：抢购脚本不打 DB、拿不到 {@code endAt}，
+     * 而为算 TTL 去查一次库等于把「抢购不打 DB」这条设计破了（那条链路的全部性能优势都在这）。
+     * 30 天远超任何合理的处理延迟——真正卡住的事件会在 5 分钟内走完 5 次重试进死信。
+     */
+    private static final long LAZY_KEY_TTL_SECONDS = Duration.ofDays(30).toSeconds();
 
     @Override
     public List<SeckillActivityVO> listActivities(Long userId) {
@@ -141,7 +173,8 @@ public class SeckillServiceImpl implements SeckillService {
                             SeckillKeys.users(activityId),
                             SeckillKeys.meta(activityId),
                             SeckillKeys.events(activityId)),
-                    String.valueOf(userId), String.valueOf(activityId));
+                    String.valueOf(userId), String.valueOf(activityId),
+                    String.valueOf(LAZY_KEY_TTL_SECONDS));
         } catch (RuntimeException e) {
             // **fail-closed，不能 fail-open**：整条链路依赖「预占 + 事件」都在 Redis 里完成，
             // Redis 没了就没有事件可发，消费者也不会入账——放行到 DB 只会让用户看到
@@ -269,8 +302,36 @@ public class SeckillServiceImpl implements SeckillService {
         meta.put("stockBase", String.valueOf(remaining));
         redisTemplate.opsForHash().putAll(SeckillKeys.meta(id), meta);
 
-        log.info("[SECKILL] 预热活动 {}（{}）：剩余 {} / 总 {}，已入账 {} 人",
-                id, activity.getName(), remaining, activity.getTotalStock(), granted.size());
+        // ⚠️ 这三个 key 必须带 TTL。部署模板用的是 maxmemory-policy: volatile-lru，
+        // 而 volatile-lru **只淘汰设了 TTL 的 key**——没 TTL 的它碰都不碰，
+        // 内存满了走 OOM 而不是淘汰。热度榜曾经是唯一无 TTL 的 key，补上之后
+        // 秒杀这套顶替了它的位置，实测确认过（见 redis-ops-runbook.md §7.4）
+        long stateTtl = ttlUntil(activity.getEndAt(), STATE_RETENTION_AFTER_END_SECONDS);
+        redisTemplate.expire(SeckillKeys.stock(id), stateTtl, TimeUnit.SECONDS);
+        redisTemplate.expire(SeckillKeys.users(id), stateTtl, TimeUnit.SECONDS);
+        redisTemplate.expire(SeckillKeys.meta(id), stateTtl, TimeUnit.SECONDS);
+        // events **不在这里创建**（它由抢购脚本的 XADD 创建），但**已经存在的要补 TTL**：
+        // 抢购脚本只在新用户来抢时才跑，管不到存量 key——没人抢的活动就永远等不到那一次补救。
+        // 判 == -1（存在但无 TTL）而不是无条件 EXPIRE，免得每次预热都把过期时间往后推
+        String eventsKey = SeckillKeys.events(id);
+        if (redisTemplate.getExpire(eventsKey, TimeUnit.SECONDS) == -1L) {
+            redisTemplate.expire(eventsKey, LAZY_KEY_TTL_SECONDS, TimeUnit.SECONDS);
+        }
+
+        log.info("[SECKILL] 预热活动 {}（{}）：剩余 {} / 总 {}，已入账 {} 人，TTL {} 秒",
+                id, activity.getName(), remaining, activity.getTotalStock(), granted.size(), stateTtl);
+    }
+
+    /**
+     * 「活动结束后再保留 {@code bufferSeconds}」对应的 TTL。
+     *
+     * <p>⚠️ 活动已经结束时，剩余时间是负数，而 <b>{@code EXPIRE} 收到负数会立即删除 key</b>
+     * ——预热一个刚过期的活动就把状态全清了，对账任务下一轮就会看到「Redis 预占数少于 DB 订单数」。
+     * 所以下限是 buffer 本身，不随剩余时间下沉。
+     */
+    private static long ttlUntil(LocalDateTime endAt, long bufferSeconds) {
+        long remaining = Duration.between(LocalDateTime.now(), endAt).getSeconds();
+        return Math.max(bufferSeconds, remaining + bufferSeconds);
     }
 
     /**

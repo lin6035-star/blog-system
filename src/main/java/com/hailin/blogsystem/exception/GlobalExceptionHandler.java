@@ -43,6 +43,21 @@ public class GlobalExceptionHandler {
         return Result.error(e.getCode(), e.getMessage());
     }
 
+    //AI 长任务准入拒绝：用户并发超限 429 / 全局容量耗尽 503。
+    //走 HTTP 非 2xx 的理由同限流与额度不足——前端 SSE 在 200 时只认 `data:` 行，JSON 错误体会被静默忽略。
+    //⚠️ 必须与其余 handler 同处一个 advice：跨 advice 的匹配按 advice 顺序、不按异常具体度，
+    //  另起一个 advice 会被下面 @ExceptionHandler(Exception.class) 兜底抢先，状态码被吞成 500。
+    @ExceptionHandler(AiTaskRejectedException.class)
+    public Result<Void> handleAiTaskRejected(
+            AiTaskRejectedException e,
+            HttpServletResponse response
+    ) {
+        response.setStatus(e.getReason() == AiTaskRejectedException.Reason.USER_LIMIT
+                ? HttpStatus.TOO_MANY_REQUESTS.value()
+                : HttpStatus.SERVICE_UNAVAILABLE.value());
+        return Result.error(e.getCode(), e.getMessage());
+    }
+
     @ExceptionHandler(IllegalArgumentException.class)
     public Result<Void> handleIllegalArgumentException(IllegalArgumentException e) {
         return Result.error(BlogConstants.ErrorCode.BAD_REQUEST, e.getMessage());
